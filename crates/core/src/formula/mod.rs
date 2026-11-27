@@ -3099,14 +3099,9 @@ impl<'a> Calc<'a> {
 
     fn resolve_sumif_amount<'n>(&self, args: &'n [Node], si: usize) -> Option<ResolvedRange<'n>> {
         let [criteria, _, amounts] = args else { return None };
-        let (height, width) = match criteria {
-            Node::Range(a, b) => (
-                (self.r_row(a) - self.r_row(b)).abs(),
-                (self.r_col(a) - self.r_col(b)).abs(),
-            ),
-            Node::Ref(_) => (0, 0),
-            _ => return self.resolve_range_node(amounts, si),
-        };
+        let criteria = self.resolve_range_node(criteria, si)?;
+        let height = criteria.r2() - criteria.r1();
+        let width = criteria.c2() - criteria.c1();
         let base = self.resolve_range_node(amounts, si)?;
         let r1 = base.r1();
         let c1 = base.c1();
@@ -4183,6 +4178,7 @@ impl<'a> Calc<'a> {
             // ============ 区域聚合缓存 + 零物化流式 COUNTIF / 单列及二维/多参聚合
             FuncId::Sum
             | FuncId::SumIf
+            | FuncId::CountBlank
             | FuncId::CountIf
             | FuncId::Count
             | FuncId::CountA
@@ -4208,7 +4204,7 @@ impl<'a> Calc<'a> {
                     }
                     return self.call_generic_id(id, name.as_str(), nodes, si);
                 }
-                let ok_arity = if simple { nodes.len() == 1 } else { nodes.len() >= 2 };
+                let ok_arity = if simple || id == FuncId::CountBlank { nodes.len() == 1 } else { nodes.len() >= 2 };
                 if ok_arity {
                     if let Some(rr) = self.resolve_range_node(&nodes[0], si) {
                         if rr.is_3d() || rr.is_ext() {
@@ -4227,26 +4223,33 @@ impl<'a> Calc<'a> {
                             if let Some(t) = start { prof_record("SUM#prefix", t.elapsed().as_secs_f64()); }
                             return result;
                         }
-                        let crit = if simple {
+                        let sum_spec = if id == FuncId::SumIf && nodes.len() >= 3 {
+                            match self.resolve_sumif_amount(nodes, si) {
+                                Some(sr) if !sr.is_3d() && !sr.is_ext() => {
+                                    match self.sheet_index(sr.sheet.as_deref(), si) {
+                                        Ok(sidx) => {
+                                            if let Some(watch) = self.deps_watch {
+                                                watch.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1),
+                                                    sidx, sr.r1(), sr.c1(), sr.r2(), sr.c2());
+                                            }
+                                            Some((sidx, sr.r1(), sr.c1(), sr.r2(), sr.c2()))
+                                        }
+                                        Err(e) => return FValue::Error(e),
+                                    }
+                                }
+                                _ => return self.sparse_computed_if(id, nodes, si)
+                                    .unwrap_or_else(|| self.call_generic_id(id, name.as_str(), nodes, si)),
+                            }
+                        } else {
+                            None
+                        };
+                        let crit = if simple || id == FuncId::CountBlank {
                             String::new()
                         } else {
                             match self.eval_node(&nodes[1], si).to_text() {
                                 Ok(value) => value,
                                 Err(error) => return FValue::Error(error),
                             }
-                        };
-                        let sum_spec = if id == FuncId::SumIf && nodes.len() >= 3 {
-                            match self.resolve_sumif_amount(nodes, si) {
-                                Some(sr) if !sr.is_3d() && !sr.is_ext() => {
-                                    match self.sheet_index(sr.sheet.as_deref(), si) {
-                                        Ok(sidx) => Some((sidx, sr.r1(), sr.c1(), sr.r2(), sr.c2())),
-                                        Err(e) => return FValue::Error(e),
-                                    }
-                                }
-                                _ => return self.call_generic_id(id, name.as_str(), nodes, si),
-                            }
-                        } else {
-                            None
                         };
                         let range_tuple = (si2, rr.r1(), rr.c1(), rr.r2(), rr.c2());
                         let key = AggCacheKey {
@@ -4255,7 +4258,7 @@ impl<'a> Calc<'a> {
                             func: match id {
                                 FuncId::Sum => 1u8,
                                 FuncId::SumIf => 2,
-                                FuncId::CountIf => 3,
+                                FuncId::CountIf | FuncId::CountBlank => 3,
                                 FuncId::CountA => 4,
                                 FuncId::Average => 5,
                                 FuncId::Max => 6,
@@ -4281,6 +4284,17 @@ impl<'a> Calc<'a> {
                             }
                             return streamed;
                         }
+                        // Clipping a range to its used cells loses matching blanks. Read
+                        // occupied criteria (COUNT) or occupied amounts (SUM) sparsely at
+                        // their original offsets and account for the implicit blank tail.
+                        if matches!(id, FuncId::CountIf | FuncId::CountBlank | FuncId::SumIf)
+                            && let Some(value) = self.sparse_single_if(id, range_tuple, sum_spec, &key.crit)
+                        {
+                            if self.requested.is_none() && !self.aborted {
+                                self.agg_cache.insert(key, value.clone());
+                            }
+                            return value;
+                        }
                         let out = match id {
                             FuncId::Sum
                             | FuncId::Count
@@ -4292,7 +4306,7 @@ impl<'a> Calc<'a> {
                                 let range = Arg::Range { values: data, rows, cols };
                                 functions::call_id_in(self.ctx, id, name.as_str(), &[range])
                             }
-                            FuncId::CountIf => {
+                            FuncId::CountIf | FuncId::CountBlank => {
                                 let c = functions::Crit::parse(&key.crit);
                                 let gk = self.grid_key_coords(si2, rr.r1(), rr.c1(), rr.r2(), rr.c2()).map(|mut g| {
                                     if g.2 == g.4 && (g.3 - g.1) >= 255 && !c.matches(&FValue::Empty) {
@@ -4398,6 +4412,10 @@ impl<'a> Calc<'a> {
                         if let Some(start) = t0 { prof_record(&format!("{name}#agg"), start.elapsed().as_secs_f64()); }
                         if self.requested.is_none() { self.agg_cache.insert(key, out.clone()); }
                         return out;
+                    } else if matches!(id, FuncId::CountBlank | FuncId::CountIf | FuncId::SumIf)
+                        && let Some(value) = self.sparse_computed_if(id, nodes, si)
+                    {
+                        return value;
                     }
                 }
                 self.call_generic_id(id, name.as_str(), nodes, si)
@@ -6452,22 +6470,15 @@ impl<'a> Calc<'a> {
                     Err(e) => return Some(FValue::Error(e)),
                 }
             } else {
-                let range = if id == FuncId::AverageIf {
-                    let rr = self.resolve_range_node(node, si)?;
-                    if rr.is_ext() || rr.is_3d() { return None; }
-                    let sheet = self.sheet_index(rr.sheet.as_deref(), si).ok()?;
-                    self.grid_key_coords(sheet, rr.r1(), rr.c1(), rr.r2(), rr.c2())?
-                } else {
-                    self.ifs_range_key(node, si)?
-                };
-                key.ranges.push(range);
+                key.ranges.push(self.ifs_range_key(node, si)?);
             }
         }
-        let skipped = if id == FuncId::AverageIf { 0 } else {
-            match self.align_ifs_ranges(&mut key.ranges) {
-                Ok(n) => n,
-                Err(e) => return Some(FValue::Error(e)),
-            }
+        if id == FuncId::AverageIf && let [criteria, amounts] = key.ranges.as_mut_slice() {
+            self.align_amount_anchor(criteria, amounts);
+        }
+        let skipped = match self.align_ifs_ranges(&mut key.ranges) {
+            Ok(n) => n,
+            Err(e) => return Some(FValue::Error(e)),
         };
         // Cached answers describe the materialized rectangle. Different logical
         // ranges can share it, but COUNTIFS must also count matching blank tails.
@@ -6526,6 +6537,12 @@ impl<'a> Calc<'a> {
             return Some(with_blank_tail(v));
         }
 
+        let sparse_average = if id == FuncId::AverageIf {
+            self.sparse_single_if(id, key.ranges[0], key.ranges.get(1).copied(), &key.criteria[0])
+        } else {
+            None
+        };
+
         // Pre-resolve single-column `SharedCondColumn`s once (supports O(1) FastScope + dirty overlay!)
         let all_single_cols_256 = key
             .ranges
@@ -6533,7 +6550,7 @@ impl<'a> Calc<'a> {
             .all(|r| r.2 == r.4 && (r.3 - r.1 + 1) >= 256);
         let mut resolved_cond_cols: Vec<(RangeKey, std::sync::Arc<lookup_cache::SharedCondColumn>)> =
             Vec::new();
-        if all_single_cols_256 {
+        if all_single_cols_256 && sparse_average.is_none() {
             let mut ok = true;
             for &rk in &key.ranges {
                 if let Some((_, sc)) = resolved_cond_cols.iter().find(|(k, _)| *k == rk) {
@@ -6562,7 +6579,9 @@ impl<'a> Calc<'a> {
         // 1. OrderedCriteria (<, <=, >, >=, <>)
         let &(_, r1, c1, r2, c2) = key.ranges.first()?;
         let area = ((r2 - r1 + 1) * (c2 - c1 + 1)) as usize;
-        let mut ans = if id != FuncId::AverageIf && c2 > c1 && area > 200_000 {
+        let mut ans = if sparse_average.is_some() {
+            sparse_average
+        } else if c2 > c1 && area > 200_000 {
             self.scan_sparse_ifs(&key, area)
         } else {
             let mut ordered = std::mem::take(&mut self.ordered_criteria);
@@ -6769,13 +6788,9 @@ impl<'a> Calc<'a> {
         let out = match ans {
             Some(v) => v,
             None => {
-                let args = if id == FuncId::AverageIf {
-                    self.function_args(id, nodes, si)
-                } else {
-                    match self.materialize_ifs_args(&key) {
-                        Ok(args) => args,
-                        Err(e) => return Some(FValue::Error(e)),
-                    }
+                let args = match self.materialize_ifs_args(&key) {
+                    Ok(args) => args,
+                    Err(e) => return Some(FValue::Error(e)),
                 };
                 if self.requested.is_some() {
                     return Some(FValue::Error(ErrKind::Ref));
@@ -7233,7 +7248,7 @@ impl<'a> Calc<'a> {
 
     fn function_args(&mut self, id: FuncId, nodes: &[Node], si: usize) -> Vec<Arg> {
         let mut args: Vec<Arg> = Vec::with_capacity(nodes.len());
-        let amounts = if id == FuncId::SumIf { self.sumif_amount_node_shifted(nodes) } else { None };
+        let amounts = if matches!(id, FuncId::SumIf | FuncId::AverageIf) { self.sumif_amount_node_shifted(nodes) } else { None };
         for (i, n) in nodes.iter().enumerate() {
             let n = if i == 2 { amounts.as_ref().unwrap_or(n) } else { n };
             // Every SUBTOTAL excludes filtered rows. Codes 101..111 also exclude manual hiding.

@@ -607,7 +607,7 @@ fn collect_single_link_node(node: &crate::formula::Node, bf: &mut BookFilter) {
             bf.add_name(sheet.as_deref(), name);
         }
         Node::Func(name, args) => {
-            let amounts = if name == "SUMIF" {
+            let amounts = if name == "SUMIF" || name == "AVERAGEIF" {
                 crate::formula::sumif_amount_range(args)
             } else {
                 None
@@ -684,7 +684,7 @@ fn walk_wb_ext_node(wb: &Workbook, node: &crate::formula::Node, filters: &mut [B
             }
         }
         Node::Func(name, args) => {
-            let amounts = if name == "SUMIF" {
+            let amounts = if name == "SUMIF" || name == "AVERAGEIF" {
                 crate::formula::sumif_amount_range(args)
             } else {
                 None

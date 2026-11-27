@@ -1670,11 +1670,15 @@ impl Walker<'_> {
                         self.result.has_other_volatile = true;
                     }
                 }
-                let sumif_rect = if id == FuncId::SumIf {
+                let sumif_rect = if matches!(id, FuncId::SumIf | FuncId::AverageIf) {
                     sumif_amount_rect_shifted(wb, si, args, dr, dc)
                 } else {
                     None
                 };
+                if matches!(id, FuncId::SumIf | FuncId::AverageIf) && args.len() == 3 && sumif_rect.is_none() {
+                    // Named and computed anchors need the expanded target recorded at evaluation.
+                    self.result.volatile_ref = true;
+                }
                 for (i, a) in args.iter().enumerate() {
                     if i == 2
                         && let Some(rect) = sumif_rect

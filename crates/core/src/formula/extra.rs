@@ -807,26 +807,35 @@ pub(crate) fn call_extra_in(sys: DateSystem, name: &str, args: &[Arg]) -> Option
             let rate = num(args, 0)?;
             let nper = num(args, 1)?;
             let pv = num(args, 2)?;
-            let start = int_arg(args, 3)?;
-            let end = int_arg(args, 4)?;
-            let t = opt_num(args, 5, 0.0)?;
-            // Excel：rate<=0、nper<=0、pv<=0、start<1、start>end 都是 #NUM!
-            if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1 || end < start {
+            let start = num(args, 3)?;
+            let end = num(args, 4)?;
+            let timing = num(args, 5)?;
+            if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1.0
+                || end < start || end > nper || !matches!(timing, 0.0 | 1.0)
+            {
                 return Err(ErrKind::Num);
             }
-            let pay = pmt_of(rate, nper, pv, 0.0, t);
-            let mut interest_sum = 0.0;
-            let mut principal_sum = 0.0;
-            for p in start..=end {
-                let bal = balance(rate, nper, pv, pay, (p - 1) as f64, t);
-                let interest = bal * rate;
-                interest_sum += interest;
-                principal_sum += pay - interest;
-            }
+            let first = start.ceil();
+            let last = end.floor();
+            if last < first { return Ok(FValue::number(0.0)); }
+            let count = last - first + 1.0;
+            let log_rate = rate.ln_1p();
+            let annuity = -(-nper * log_rate).exp_m1();
+            let pay = -pv * rate / (annuity * (1.0 + timing * rate));
+            // Principal repayments form a geometric series. A payment made at
+            // inception consists entirely of principal; subsequent periods lag by one.
+            let at_inception = timing == 1.0 && first == 1.0;
+            let accruing = if at_inception { count - 1.0 } else { count };
+            let principal = if accruing == 0.0 { 0.0 } else {
+                pv * ((last - timing - nper) * log_rate).exp()
+                    * (-accruing * log_rate).exp_m1() / annuity
+            };
             Ok(FValue::number(if name == "CUMIPMT" {
-                -interest_sum
+                accruing * pay - principal
+            } else if at_inception {
+                pay + principal
             } else {
-                -principal_sum
+                principal
             }))
         }),
         "PDURATION" => r(|| {
@@ -3170,24 +3179,6 @@ fn complex_fn(name: &str, args: &[Arg]) -> Result<FValue, ErrKind> {
         _ => return Err(ErrKind::Name),
     };
     Ok(out)
-}
-
-// ---------------------------------------------------------------- 财务辅助
-
-fn pmt_of(rate: f64, nper: f64, pv: f64, fv: f64, t: f64) -> f64 {
-    if rate == 0.0 {
-        return -(pv + fv) / nper;
-    }
-    let p = (1.0 + rate).powf(nper);
-    -(rate * (pv * p + fv)) / ((1.0 + rate * t) * (p - 1.0))
-}
-
-fn balance(rate: f64, nper: f64, pv: f64, pay: f64, periods: f64, t: f64) -> f64 {
-    if rate == 0.0 {
-        return pv + pay * periods;
-    }
-    let p = (1.0 + rate).powf(periods);
-    pv * p + pay * (1.0 + rate * t) * (p - 1.0) / rate
 }
 
 trait RoundTo {

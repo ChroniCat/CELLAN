@@ -68,6 +68,10 @@ impl Calc<'_> {
             args.push(self.criteria_range_arg(range)?);
             args.push(Arg::Val(FValue::Text(criterion.as_str().into())));
         }
+        if key.function == 2 {
+            // AVERAGEIF(criteria, test, amounts) orders its arguments differently.
+            args.rotate_left(1);
+        }
         Ok(args)
     }
 
@@ -98,6 +102,64 @@ impl Calc<'_> {
             range.4 = range.2 + used_cols - 1;
         }
         Ok(area - used_rows as u64 * used_cols as u64)
+    }
+
+    /// SUMIF/AVERAGEIF interpret the amount reference as the top-left anchor.
+    /// At the sheet edge only the overlap inside the grid can contribute.
+    pub(super) fn align_amount_anchor(&self, criteria: &mut RangeKey, amounts: &mut RangeKey) {
+        let height = (criteria.3 - criteria.1).min(1_048_575 - amounts.1);
+        let width = (criteria.4 - criteria.2).min(16_383 - amounts.2);
+        criteria.3 = criteria.1 + height;
+        criteria.4 = criteria.2 + width;
+        amounts.3 = amounts.1 + height;
+        amounts.4 = amounts.2 + width;
+        if let Some(watch) = self.deps_watch {
+            watch.record_dynamic_watch((self.cur_sheet, self.cur.0, self.cur.1),
+                amounts.0, amounts.1, amounts.2, amounts.3, amounts.4);
+        }
+    }
+
+    pub(super) fn sparse_computed_if(&mut self, id: FuncId, nodes: &[Node], si: usize) -> Option<FValue> {
+        let mut condition = self.ifs_range_key(nodes.first()?, si)?;
+        let mut amounts = None;
+        if id == FuncId::SumIf && let Some(node) = nodes.get(2) {
+            let mut amount = self.ifs_range_key(node, si)?;
+            self.align_amount_anchor(&mut condition, &mut amount);
+            amounts = Some(amount);
+        }
+        let criterion = if id == FuncId::CountBlank { String::new() } else {
+            match self.eval_node(nodes.get(1)?, si).to_text() {
+                Ok(text) => text,
+                Err(error) => return Some(FValue::Error(error)),
+            }
+        };
+        self.scan_single_if(id, condition, amounts, &criterion)
+    }
+
+    /// A full row/column or large rectangle can extend well beyond the last stored
+    /// cell. For a blank-matching condition its declared coverage affects the result.
+    pub(super) fn sparse_single_if(
+        &mut self, id: FuncId, condition: RangeKey, amounts: Option<RangeKey>, criterion: &str,
+    ) -> Option<FValue> {
+        let (_, r, c, last_r, last_c) = condition;
+        let area = (last_r - r + 1).checked_mul(last_c - c + 1)?;
+        if area <= 200_000 && !(c == 0 && last_c == 16_383) { return None; }
+        if last_c == c && !functions::Crit::parse(criterion).matches(&FValue::Empty) { return None; }
+        self.scan_single_if(id, condition, amounts, criterion)
+    }
+
+    fn scan_single_if(
+        &mut self, id: FuncId, condition: RangeKey, amounts: Option<RangeKey>, criterion: &str,
+    ) -> Option<FValue> {
+        let area = (condition.3 - condition.1 + 1) * (condition.4 - condition.2 + 1);
+        let (function, ranges) = match id {
+            FuncId::CountBlank | FuncId::CountIf => (1, vec![condition]),
+            FuncId::SumIf => (0, vec![amounts.unwrap_or(condition), condition]),
+            FuncId::AverageIf => (2, vec![condition, amounts.unwrap_or(condition)]),
+            _ => return None,
+        };
+        let key = CriteriaKey { function, ranges, criteria: vec![criterion.to_owned()] };
+        self.scan_sparse_ifs(&key, usize::try_from(area).ok()?)
     }
 
     /// Sparse two-dimensional ranges can have occupied cells in opposite corners on

@@ -2045,7 +2045,7 @@ pub(super) fn call_by_id_in(
             }
             Ok(FValue::number(v))
         }),
-        FuncId::Ceiling | FuncId::CeilingMath => r(|| {
+        FuncId::Ceiling => r(|| {
             let n = num(args, 0)?;
             let s = opt_num(args, 1, 1.0)?;
             if s == 0.0 {
@@ -2053,13 +2053,22 @@ pub(super) fn call_by_id_in(
             }
             Ok(FValue::number((n / s).ceil() * s))
         }),
-        FuncId::Floor | FuncId::FloorMath => r(|| {
+        FuncId::Floor => r(|| {
             let n = num(args, 0)?;
             let s = opt_num(args, 1, 1.0)?;
             if s == 0.0 {
                 return Err(ErrKind::Div0);
             }
             Ok(FValue::number((n / s).floor() * s))
+        }),
+        FuncId::CeilingMath | FuncId::FloorMath => r(|| {
+            let n = num(args, 0)?;
+            let step = opt_num(args, 1, 1.0)?.abs();
+            let mode = opt_num(args, 2, 0.0)?;
+            if step == 0.0 { return Ok(FValue::number(0.0)); }
+            let units = round_sig15(n / step);
+            let up = (id == FuncId::CeilingMath) != (n < 0.0 && mode != 0.0);
+            Ok(FValue::number(if up { units.ceil() } else { units.floor() } * step))
         }),
         FuncId::MRound => r(|| {
             let n = num(args, 0)?;
@@ -2076,9 +2085,9 @@ pub(super) fn call_by_id_in(
         }),
         FuncId::Odd => r(|| {
             let n = num(args, 0)?;
-            let mut v = (n.abs() / 2.0).ceil() * 2.0 - 1.0;
-            if v == 0.0 {
-                v = 1.0;
+            let mut v = n.abs().ceil();
+            if v % 2.0 == 0.0 {
+                v += 1.0;
             }
             Ok(FValue::number(if n < 0.0 { -v } else { v }))
         }),
