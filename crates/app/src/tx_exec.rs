@@ -12,6 +12,25 @@ use sheetcore::{
 };
 
 impl SheetApp {
+    /// Invalidate all coordinate-, layout-, conditional-format-, validation-,
+    /// formula-bar-, and print-preview render caches after a workbook mutation.
+    pub(crate) fn invalidate_render_and_layout_caches(&mut self) {
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.cf_cache = None;
+        self.cf_inputs.grid.invalidate_viewport();
+        *self.view_axes_cache.borrow_mut() = None;
+        self.normal_page_breaks.invalidate_layout_and_pivot_caches();
+    }
+
+    /// Dismiss transient pivot popups and resync the pivot sidebar with the live selection.
+    pub(crate) fn clear_transient_pivot_popups(&mut self) {
+        self.pivot_ui.field_settings = None;
+        self.pivot_ui.grid_filter = None;
+        self.pivot_ui.options_pivot_id = None;
+        self.sync_pivot_sidebar_selection();
+    }
+
     /// Synchronize coordinate-sensitive UI caches whenever `self.wb.coord_epoch()`
     /// advances through any local transaction, undo/redo, or remote structural /
     /// cell-shift / snapshot update.
@@ -21,15 +40,57 @@ impl SheetApp {
             return false;
         }
         self.last_seen_coord_epoch = epoch;
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.cf_cache = None;
-        self.cf_inputs.grid.invalidate_viewport();
-        self.pivot_ui.field_settings = None;
-        self.pivot_ui.grid_filter = None;
-        self.pivot_ui.options_pivot_id = None;
-        self.sync_pivot_sidebar_selection();
+        self.invalidate_render_and_layout_caches();
+        self.clear_transient_pivot_popups();
         true
+    }
+
+    /// Single shared post-mutation finalizer used by BOTH forward transactions
+    /// (`apply_tx_effects_internal`) and undo/redo (`apply_undo`).
+    pub(crate) fn finish_post_mutation_effects(
+        &mut self,
+        recalc: &RecalcScope,
+        invalidate_deps: bool,
+        invalidate_render_caches: bool,
+        clear_transient_pivot_ui: bool,
+        structural_recalc: Option<StructuralRecalc>,
+    ) {
+        self.wb.dirty = true;
+        self.doc_gen = self.doc_gen.wrapping_add(1);
+        self.tasks.last_edit = Some(std::time::Instant::now());
+
+        let epoch_changed = self.sync_coord_epoch_side_effects();
+        if !epoch_changed && invalidate_render_caches {
+            self.invalidate_render_and_layout_caches();
+        }
+
+        if let Some(updates) = structural_recalc {
+            self.recalc_after_structural(updates);
+        } else {
+            match recalc {
+                RecalcScope::Full => {
+                    self.wb.calc_manual |= self.manual_calc;
+                    self.recalc_all_and_deps_adaptive();
+                }
+                RecalcScope::Cells(keys) => {
+                    if invalidate_deps {
+                        self.wb.calc_manual |= self.manual_calc;
+                        self.recalc_all_and_deps_adaptive();
+                    } else if !keys.is_empty() {
+                        self.fast_recalc_cells(keys);
+                    }
+                }
+                RecalcScope::None => {
+                    if invalidate_deps {
+                        self.deps_built = false;
+                    }
+                }
+            }
+        }
+
+        if !epoch_changed && clear_transient_pivot_ui {
+            self.clear_transient_pivot_popups();
+        }
     }
 
     /// Single unified post-commit side-effect driver for transactions:
@@ -325,50 +386,16 @@ impl SheetApp {
     ) {
         self.apply_tx_focus(effects, prev_active_id);
 
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.tasks.last_edit = Some(std::time::Instant::now());
-
-        let epoch_changed = self.sync_coord_epoch_side_effects();
-        if !epoch_changed
-            && (effects.invalidate_render_caches || effects.coord_changed || effects.structural)
-        {
-            self.cf_stats_gen = u64::MAX;
-            self.invalid_gen = u64::MAX;
-            self.cf_cache = None;
-            self.cf_inputs.grid.invalidate_viewport();
-        }
-
-        if let Some(updates) = structural_recalc {
-            self.recalc_after_structural(updates);
-        } else {
-            match &effects.recalc {
-                RecalcScope::Full => {
-                    self.wb.calc_manual |= self.manual_calc;
-                    self.recalc_all_and_deps_adaptive();
-                }
-                RecalcScope::Cells(keys) => {
-                    if effects.invalidate_deps {
-                        self.wb.calc_manual |= self.manual_calc;
-                        self.recalc_all_and_deps_adaptive();
-                    } else if !keys.is_empty() {
-                        self.fast_recalc_cells(keys);
-                    }
-                }
-                RecalcScope::None => {
-                    if effects.invalidate_deps {
-                        self.deps_built = false;
-                    }
-                }
-            }
-        }
-
-        if !epoch_changed && (effects.coord_changed || effects.structural) {
-            self.pivot_ui.field_settings = None;
-            self.pivot_ui.grid_filter = None;
-            self.pivot_ui.options_pivot_id = None;
-            self.sync_pivot_sidebar_selection();
-        }
+        let invalidate_render =
+            effects.invalidate_render_caches || effects.coord_changed || effects.structural;
+        let clear_pivot_ui = effects.coord_changed || effects.structural;
+        self.finish_post_mutation_effects(
+            &effects.recalc,
+            effects.invalidate_deps,
+            invalidate_render,
+            clear_pivot_ui,
+            structural_recalc,
+        );
 
         if !effects.revision_deltas.is_empty() {
             for group in effects.revision_deltas.chunk_by(|a, b| a.sheet == b.sheet) {

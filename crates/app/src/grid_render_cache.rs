@@ -126,6 +126,14 @@ impl Default for PageBreaks {
 }
 
 impl PageBreaks {
+    pub(crate) fn invalidate_layout_and_pivot_caches(&mut self) {
+        self.source = None;
+        *self.base_axes.borrow_mut() = None;
+        self.pivot2_base_items = None;
+        self.print_preview = None;
+        self.formula_bar = None;
+    }
+
     pub(crate) fn reset_compare_cache(&mut self) {
         self.compare_cf_inputs = None;
         self.compare_cf_stats = cf::CfStats::default();

@@ -55,6 +55,33 @@ pub(super) struct RejoinMergeEntry {
     pub(super) on: bool,
 }
 
+pub(crate) const MAX_CANCELLED_OFFLINE_DRAFTS: usize = 10_000;
+
+/// Local recovery record for unacknowledged offline edits that were safely
+/// cancelled (rather than mis-replayed to shifted coordinates or a different room).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CancelledOfflineDraft {
+    pub room_id: String,
+    pub sheet: usize,
+    pub sheet_name: String,
+    pub row: u32,
+    pub col: u32,
+    pub value_display: String,
+    pub formula: Option<String>,
+    pub style_changed: bool,
+    pub merge_rect: Option<(u32, u32, u32, u32)>,
+    pub reason: String,
+}
+
+fn sanitize_tsv_field(s: &str) -> String {
+    s.chars()
+        .map(|ch| match ch {
+            '\t' | '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct ShiftIntro {
     pub(super) overlay: Option<(u64, Arc<sheetcore::cell_shift_patch::CellShiftOverlay>)>,
@@ -251,9 +278,145 @@ impl SheetApp {
         }
     }
 
+    fn draft_sheet_name(&self, sheet: usize) -> String {
+        self.wb
+            .sheets
+            .get(sheet)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| format!("Sheet{}", sheet + 1))
+    }
+
+    fn cancellation_reason(coord: &OutboxCoord, cur_room: &str) -> String {
+        if !coord.room_id.is_empty() && !cur_room.is_empty() && coord.room_id != cur_room {
+            "协作房间已切换".into()
+        } else {
+            "工作表坐标已改变".into()
+        }
+    }
+
+    fn push_cancelled_offline_draft(&mut self, draft: CancelledOfflineDraft) {
+        if let Some(existing) = self.cancelled_offline_drafts.iter_mut().find(|d| {
+            d.room_id == draft.room_id
+                && d.sheet == draft.sheet
+                && d.row == draft.row
+                && d.col == draft.col
+                && d.merge_rect == draft.merge_rect
+        }) {
+            if !draft.value_display.is_empty() || draft.formula.is_some() {
+                existing.value_display = draft.value_display;
+                existing.formula = draft.formula;
+            }
+            existing.style_changed |= draft.style_changed;
+            if existing.sheet_name.is_empty() {
+                existing.sheet_name = draft.sheet_name;
+            }
+            existing.reason = draft.reason;
+            return;
+        }
+        if self.cancelled_offline_drafts.len() >= MAX_CANCELLED_OFFLINE_DRAFTS {
+            return;
+        }
+        self.cancelled_offline_drafts.push(draft);
+    }
+
+    pub(super) fn archive_cancelled_offline_op(
+        &mut self,
+        room_id: String,
+        op: &sheetcore::sync::Op,
+        reason: String,
+    ) {
+        let sheet_name = self.draft_sheet_name(op.sheet);
+        let value_display = sheetcore::Value::from(&op.value).display();
+        let formula = op.formula.as_deref().map(str::to_string);
+        self.push_cancelled_offline_draft(CancelledOfflineDraft {
+            room_id,
+            sheet: op.sheet,
+            sheet_name,
+            row: op.row,
+            col: op.col,
+            value_display,
+            formula,
+            style_changed: false,
+            merge_rect: None,
+            reason,
+        });
+    }
+
+    pub(crate) fn clear_cancelled_offline_drafts(&mut self) {
+        self.cancelled_offline_drafts.clear();
+    }
+
+    pub(crate) fn export_cancelled_offline_drafts_tsv(&self) -> String {
+        if self.cancelled_offline_drafts.is_empty() {
+            return String::new();
+        }
+        use std::fmt::Write as _;
+        let mut out = String::from("房间\t工作表\t单元格\t原值\t公式\t样式变更\t合并区域\t原因");
+        for d in &self.cancelled_offline_drafts {
+            let cell = sheetcore::cell_name(d.row, d.col);
+            let merge = d
+                .merge_rect
+                .map(|(r1, c1, r2, c2)| {
+                    format!(
+                        "{}:{}",
+                        sheetcore::cell_name(r1, c1),
+                        sheetcore::cell_name(r2, c2)
+                    )
+                })
+                .unwrap_or_default();
+            let style = if d.style_changed { "是" } else { "否" };
+            let formula = d.formula.as_deref().unwrap_or("");
+            let _ = write!(
+                out,
+                "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sanitize_tsv_field(&d.room_id),
+                sanitize_tsv_field(&d.sheet_name),
+                cell,
+                sanitize_tsv_field(&d.value_display),
+                sanitize_tsv_field(formula),
+                style,
+                merge,
+                sanitize_tsv_field(&d.reason),
+            );
+        }
+        out
+    }
+
+    pub(crate) fn copy_cancelled_offline_drafts_to_clipboard(&mut self) -> bool {
+        let tsv = self.export_cancelled_offline_drafts_tsv();
+        if tsv.is_empty() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            crate::clipboard::set_test_clipboard(&tsv);
+            self.status = format!(
+                "已复制 {} 条本地冲突草稿到剪贴板（TSV）",
+                self.cancelled_offline_drafts.len()
+            );
+            true
+        }
+        #[cfg(not(test))]
+        {
+            match arboard::Clipboard::new().and_then(|mut c| c.set_text(tsv)) {
+                Ok(()) => {
+                    self.status = format!(
+                        "已复制 {} 条本地冲突草稿到剪贴板（TSV）",
+                        self.cancelled_offline_drafts.len()
+                    );
+                    true
+                }
+                Err(_) => {
+                    self.status = "复制本地冲突草稿失败：系统剪贴板不可用".into();
+                    false
+                }
+            }
+        }
+    }
+
     /// Discard ALL stale unacknowledged outbox entries (ordinary cell edits, style edits,
     /// merge edits, and deferred background pastes) whose room or unified coordinate epoch
-    /// no longer matches the settled snapshot.
+    /// no longer matches the settled snapshot, archiving them into `cancelled_offline_drafts`.
     pub(super) fn discard_stale_rejoin_outboxes(&mut self) -> usize {
         let Some(net) = &self.net else { return 0 };
         if net.hosting {
@@ -266,16 +429,37 @@ impl SheetApp {
         let mut discarded = 0usize;
 
         // 1. Check ordinary cell outbox against its bound room & unified CoordEpoch.
-        let ops_stale = match (&self.rejoin_outbox, &self.rejoin_outbox_meta) {
+        let (ops_stale, ops_room, ops_reason) = match (&self.rejoin_outbox, &self.rejoin_outbox_meta)
+        {
             (Some((owner, _)), Some(meta)) if *owner == uid && meta.doc_uid == uid => {
-                meta.coord.is_stale(&cur_room, cur_epoch)
+                let stale = meta.coord.is_stale(&cur_room, cur_epoch);
+                let room = if meta.coord.room_id.is_empty() {
+                    cur_room.clone()
+                } else {
+                    meta.coord.room_id.clone()
+                };
+                let reason = Self::cancellation_reason(&meta.coord, &cur_room);
+                (stale, room, reason)
             }
-            (Some((owner, _)), None) if *owner == uid => cur_epoch.shift_seq != 0,
-            _ => false,
+            (Some((owner, _)), None) if *owner == uid => (
+                cur_epoch.shift_seq != 0,
+                cur_room.clone(),
+                "工作表坐标已改变".to_string(),
+            ),
+            _ => (false, String::new(), String::new()),
         };
         if ops_stale {
             if let Some((_, ops)) = self.rejoin_outbox.take() {
-                discarded += ops.into_iter().filter(|op| op.ts > acked).count();
+                for op in ops {
+                    if op.ts > acked {
+                        discarded += 1;
+                        self.archive_cancelled_offline_op(
+                            ops_room.clone(),
+                            &op,
+                            ops_reason.clone(),
+                        );
+                    }
+                }
             }
             self.rejoin_outbox_meta = None;
         } else if self
@@ -291,51 +475,123 @@ impl SheetApp {
         let stale_pastes: Vec<_> = pastes
             .iter()
             .filter(|p| p.coord.is_stale(&cur_room, cur_epoch))
-            .map(|p| (p.first_exclusive, p.through))
+            .map(|p| {
+                let room = if p.coord.room_id.is_empty() {
+                    cur_room.clone()
+                } else {
+                    p.coord.room_id.clone()
+                };
+                let reason = Self::cancellation_reason(&p.coord, &cur_room);
+                (p.first_exclusive, p.through, room, reason)
+            })
             .collect();
         pastes.retain(|p| !p.coord.is_stale(&cur_room, cur_epoch) && p.through > acked);
         if !stale_pastes.is_empty() {
+            let mut removed_paste_ops = Vec::new();
             if let Some((owner, ops)) = &mut self.rejoin_outbox {
                 if *owner == uid {
-                    let before = ops.len();
-                    ops.retain(|op| {
-                        !stale_pastes
+                    let mut keep = Vec::with_capacity(ops.len());
+                    for op in ops.drain(..) {
+                        if let Some((_, _, room, reason)) = stale_pastes
                             .iter()
-                            .any(|&(prior, last)| prior < op.ts && op.ts <= last)
-                    });
-                    discarded += before - ops.len();
+                            .find(|(prior, last, _, _)| *prior < op.ts && op.ts <= *last)
+                        {
+                            discarded += 1;
+                            if op.ts > acked {
+                                removed_paste_ops.push((room.clone(), op, reason.clone()));
+                            }
+                        } else {
+                            keep.push(op);
+                        }
+                    }
+                    *ops = keep;
                     if ops.is_empty() {
                         self.rejoin_outbox = None;
                         self.rejoin_outbox_meta = None;
                     }
                 }
             }
+            for (room, op, reason) in removed_paste_ops {
+                self.archive_cancelled_offline_op(room, &op, reason);
+            }
         }
 
         // 3. Check style outbox entries against their bound room & unified CoordEpoch.
         if !self.rejoin_style_outbox.is_empty() {
             let mut keep = Vec::with_capacity(self.rejoin_style_outbox.len());
+            let mut archived = Vec::new();
             for entry in std::mem::take(&mut self.rejoin_style_outbox) {
                 if entry.doc_uid == uid && entry.coord.is_stale(&cur_room, cur_epoch) {
                     discarded += entry.items.len();
+                    let room = if entry.coord.room_id.is_empty() {
+                        cur_room.clone()
+                    } else {
+                        entry.coord.room_id.clone()
+                    };
+                    let reason = Self::cancellation_reason(&entry.coord, &cur_room);
+                    archived.push((room, entry.sheet, entry.items, reason));
                 } else {
                     keep.push(entry);
                 }
             }
             self.rejoin_style_outbox = keep;
+            for (room, sheet, items, reason) in archived {
+                let sheet_name = self.draft_sheet_name(sheet);
+                for (row, col, _) in items {
+                    self.push_cancelled_offline_draft(CancelledOfflineDraft {
+                        room_id: room.clone(),
+                        sheet,
+                        sheet_name: sheet_name.clone(),
+                        row,
+                        col,
+                        value_display: String::new(),
+                        formula: None,
+                        style_changed: true,
+                        merge_rect: None,
+                        reason: reason.clone(),
+                    });
+                }
+            }
         }
 
         // 4. Check merge outbox entries against their bound room & unified CoordEpoch.
         if !self.rejoin_merge_outbox.is_empty() {
             let mut keep = Vec::with_capacity(self.rejoin_merge_outbox.len());
+            let mut archived = Vec::new();
             for entry in std::mem::take(&mut self.rejoin_merge_outbox) {
                 if entry.doc_uid == uid && entry.coord.is_stale(&cur_room, cur_epoch) {
                     discarded += 1;
+                    let room = if entry.coord.room_id.is_empty() {
+                        cur_room.clone()
+                    } else {
+                        entry.coord.room_id.clone()
+                    };
+                    let reason = Self::cancellation_reason(&entry.coord, &cur_room);
+                    archived.push((room, entry.sheet, entry.rect, entry.on, reason));
                 } else {
                     keep.push(entry);
                 }
             }
             self.rejoin_merge_outbox = keep;
+            for (room, sheet, rect, on, reason) in archived {
+                let sheet_name = self.draft_sheet_name(sheet);
+                self.push_cancelled_offline_draft(CancelledOfflineDraft {
+                    room_id: room,
+                    sheet,
+                    sheet_name,
+                    row: rect.0,
+                    col: rect.1,
+                    value_display: if on {
+                        "合并单元格".into()
+                    } else {
+                        "取消合并".into()
+                    },
+                    formula: None,
+                    style_changed: false,
+                    merge_rect: Some(rect),
+                    reason,
+                });
+            }
         }
 
         discarded
