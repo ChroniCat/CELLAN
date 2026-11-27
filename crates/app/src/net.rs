@@ -1953,9 +1953,18 @@ fn shift_host_threads(
     }
 }
 
+/// Unified collaboration coordinate epoch across whole-row/col `Structural`
+/// operations (`struct_rev`) and partial `CellShift` operations (`shift_seq`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CoordEpoch {
+    pub struct_rev: usize,
+    pub shift_seq: u64,
+}
+
 pub struct Net {
     pub site: u32,
     structure_seen: Mutex<StructureProgress>,
+    shift_seq: AtomicU64,
     sheet_names: Arc<Mutex<Vec<String>>>,
     structural_ack: Arc<AtomicBool>,
     palette_styles_cap: Arc<AtomicBool>,
@@ -3850,6 +3859,18 @@ impl Net {
         *self.structure_seen.lock().unwrap_or_else(|e| e.into_inner()) = StructureProgress { seen:revision,..Default::default() };
     }
     pub fn reset_structure(&self) { self.set_structure_revision(0); }
+    pub(crate) fn shift_seq(&self) -> u64 { self.shift_seq.load(Ordering::Acquire) }
+    pub(crate) fn set_shift_seq(&self, seq: u64) { self.shift_seq.store(seq, Ordering::Release); }
+    pub(crate) fn coord_epoch(&self) -> CoordEpoch {
+        CoordEpoch {
+            struct_rev: self.structure_seen(),
+            shift_seq: self.shift_seq(),
+        }
+    }
+    pub(crate) fn reset_coord_epoch(&self) {
+        self.reset_structure();
+        self.set_shift_seq(0);
+    }
 
     pub fn sort_clock_ranges(&self) -> Vec<(u64,u64)> { self.local_sort_ranges.lock().unwrap_or_else(|e| e.into_inner()).clone() }
 
@@ -5328,6 +5349,7 @@ fn host_initialized(
         wm: host_watermark.clone(), clock: host_max_clock.clone(), structs: structs.clone(), locks: locks.clone(),
         state: state.clone(), delta: delta_ops.clone(), formula_keys: formula_keys.clone(), styles: styles.clone(),
         delta_styles: delta_styles.clone(), threads: host_threads.clone(), merges: delta_merges.clone(),
+        acked_ts: host_acked_ts.clone(),
         transactions: Default::default(), seed: Default::default(), has_app: Default::default(), t0,
     });
     let shift_host_for_self = shift_host.clone();
@@ -7449,6 +7471,7 @@ fn host_initialized(
         connection_generation: Default::default(),
         sheet_names,
         structure_seen: Default::default(),
+        shift_seq: AtomicU64::new(0),
         pending_sorts: Default::default(),
         local_sort_ranges: Default::default(),
         host_structs: Some(structs_for_self),
@@ -8936,6 +8959,7 @@ fn join_session(
         host_acked_ts: None,
         sheet_names: Default::default(),
         structure_seen: Default::default(),
+        shift_seq: AtomicU64::new(0),
         pending_structure,
         #[cfg(test)]
         unconfirmed_styles,
