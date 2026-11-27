@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Table {
     /// 程序用的名字（不能有空格），公式里写这个
     pub name: String,

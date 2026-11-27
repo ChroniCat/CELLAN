@@ -655,7 +655,7 @@ pub fn current_region(sheet: &Sheet, r: u32, c: u32) -> (u32, u32, u32, u32) {
 /// 比价方式：
 /// - 文本类：Contains/NotContains/Begins/Ends
 /// - 数值类：Eq/Ne/Gt/Ge/Lt/Le/Between（两边都能转成数字就按数字比，否则按文本比）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -806,7 +806,7 @@ fn pattern_has_wildcard(s: &str) -> bool {
 }
 
 /// 一条筛选条件（支持 Between 及 Excel 双条件 AND / OR 组合与通配符 `*`/`?`/`~`）
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Criterion {
     pub op: CmpOp,
     pub val: String,
@@ -930,7 +930,7 @@ impl Criterion {
 }
 
 /// 前 N 项 / 后 N 项 / 前 N% / 后 N% 筛选（OOXML `<top10>`）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TopFilter {
     pub top: bool,
     pub count: u32,
@@ -938,7 +938,7 @@ pub struct TopFilter {
 }
 
 /// 动态筛选：高于/低于平均值与动态日期（OOXML `<dynamicFilter>`）
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DynamicFilter {
     AboveAverage,
     BelowAverage,
@@ -1056,7 +1056,7 @@ impl DynamicFilter {
 }
 
 /// 按颜色筛选（单元格填充色或字体颜色）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ColorFilter {
     /// 匹配指定背景填充色（`None` 表示无填充）。
     Fill(Option<[u8; 3]>),
@@ -1065,7 +1065,7 @@ pub enum ColorFilter {
 }
 
 /// 日期层级筛选节点（年 / 年-月 / 年-月-日）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct DateGroupItem {
     pub year: i32,
     pub month: Option<u32>,

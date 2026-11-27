@@ -1046,3 +1046,421 @@ fn sync_room_tx_messages_peer_axis_permute_and_lock_table() {
     assert_eq!(locks.holder(0, 8, 0).map(|l| l.site), Some(11));
     assert_eq!(locks.holder(1, 2, 0).map(|l| l.site), Some(12));
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 A1: CoordParticipant Lifecycle Matrix & Full TxOverlay Coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coord_participant_lifecycle_matrix_covers_every_mutated_subsystem() {
+    assert_eq!(CoordParticipant::ALL.len(), 16);
+    for p in CoordParticipant::ALL {
+        assert_eq!(
+            p.mutated_by_cell_shift(),
+            p.cell_shift_mode() == CellShiftMode::Transform,
+            "mutated_by_cell_shift mismatch for {p:?}"
+        );
+        assert!(
+            p.mutated_by_axis_permute(),
+            "all 16 participants participate in AxisPermute: {p:?}"
+        );
+        if p.mutated_by_axis_permute() || p.mutated_by_cell_shift() {
+            assert!(
+                p.captured_in_tx_overlay(),
+                "every participant mutated by AxisPermute or CellShift must be captured in TxOverlay: {p:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tx_overlay_axis_permute_restores_tables_layout_filter_arrays_scenarios_pivots_and_dirty_flags() {
+    use sheetcore::model::CellRef;
+    use sheetcore::pic::Picture;
+    use sheetcore::pivot_engine::PivotSlicerSpec;
+    use sheetcore::pivot_multi::PivotGrid;
+    use sheetcore::protection::ProtectedRange;
+    use sheetcore::scenarios::Scenario;
+    use sheetcore::sort_filter::Filter;
+    use sheetcore::table::Table;
+    use sheetcore::textbox::TextBox;
+    use sheetcore::tx::TxOverlay;
+
+    let mut host = Workbook::new_blank();
+    host.sheets[0].name = "Data".into();
+    let host_data_id = host.sheets[0].identity;
+    {
+        let s = &mut host.sheets[0];
+        s.set(0, 0, txt("HeaderA"));
+        s.set(0, 1, txt("HeaderB"));
+        s.set(1, 0, txt("Row1"));
+        s.set(1, 1, num(100.0));
+        s.set(2, 0, txt("Row2"));
+        s.set(2, 1, num(200.0));
+
+        // 1. Tables (exact A1 repro: Table1 at A1:B2)
+        s.tables.push(Table {
+            name: "Table1".into(),
+            display: "Table1".into(),
+            range: (0, 0, 1, 1),
+            columns: vec!["HeaderA".into(), "HeaderB".into()],
+            ..Table::default()
+        });
+
+        // 2. LayoutAndPage (exact A1 repro: row 0 height 60.0 + col width + hidden + outline + freeze + page + picture/textbox)
+        s.rows.set(0, 60.0);
+        s.cols.set(1, 125.0);
+        s.hidden_rows.insert(1);
+        s.hidden_rows_user.insert(4);
+        s.hidden_cols.insert(2);
+        s.row_levels.insert(1, 1);
+        s.col_levels.insert(1, 2);
+        s.freeze = Some((1, 1));
+        s.page.print_area = Some((0, 0, 5, 3));
+        s.page.title_rows = Some((0, 1));
+        s.page.row_breaks = vec![3];
+        s.pictures.push(Picture {
+            part: "xl/media/image1.png".into(),
+            data: Some(Arc::new(vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4])),
+            rect: (0, 3, 1, 4),
+            off: [10, 20, 30, 40],
+            name: "Logo".into(),
+            ..Picture::default()
+        });
+        s.textboxes.push(TextBox {
+            from: (4, 11, 0, 22),
+            to: (5, 33, 1, 44),
+            text: "Callout".into(),
+            ..TextBox::default()
+        });
+
+        // 3. AutoFilter
+        let mut flt = Filter::new(0, 0, 1, 1);
+        flt.allows.insert(0, HashSet::from(["Row1".into()]));
+        s.filter = Some(flt);
+
+        // 4. ArraysAndSpills
+        s.arrays.push((CellRef::new(0, 6), (0, 6, 1, 6)));
+        s.spilled.insert(CellRef::new(1, 6));
+        s.spill_shapes.insert(CellRef::new(0, 6), (2, 1));
+
+        // 5. ScenariosAndProtectedRanges
+        let mut sc = Scenario::new("Budget");
+        sc.cells.push(((0, 1), "999".into()));
+        s.scenarios.push(sc);
+        s.scenario_settings.current = Some(0);
+        s.scenario_settings.sqref = Some("$B$1:$B$2".into());
+        s.protected_ranges
+            .push(ProtectedRange::new("PR1", vec![(0, 0, 1, 1)], ""));
+
+        // 6. Charts (anchor + data ref)
+        s.charts.push(Chart {
+            kind: ChartKind::Column,
+            part: "xl/charts/chart1.xml".into(),
+            anchor: (0, 7, 1, 9),
+            source_range: "Data!$B$1:$B$2".into(),
+            series: vec![Series {
+                val_ref: "Data!$B$1:$B$2".into(),
+                ..Series::default()
+            }],
+            ..Chart::default()
+        });
+    }
+    host.sheets.push(Sheet::new("PivotSheet"));
+
+    // 7. Workbook Pivots (intact pivot + pivot that splits & gets removed on host + pending + pending2)
+    let spec2 = PivotSpec2 {
+        source: (0, 0, 1, 1),
+        rows: vec![AxisField::plain(0)],
+        cols: Vec::new(),
+        values: vec![ValueField {
+            col: 1,
+            agg: Agg::Sum,
+            label: None,
+            show_as: ShowAs::Normal,
+            base: None,
+        }],
+        filters: Vec::new(),
+        layout: PivotLayout::default(),
+    };
+    let mut piv_intact = PivotTableModel::new(
+        "PIntact".into(),
+        "Data".into(),
+        Some(host_data_id),
+        1,
+        (2, 0),
+        spec2.clone(),
+    );
+    piv_intact.rect = (2, 0, 4, 2);
+    piv_intact.last_meta.rect = (2, 0, 4, 2);
+    piv_intact.imported_part = Some("xl/pivotTables/pivotTable1.xml".into());
+    piv_intact.options.slicers.push(PivotSlicerSpec {
+        id: 1,
+        col: 1,
+        title: "Amt".into(),
+        pos: [0.0, 0.0],
+        width: 100.0,
+        columns: 1,
+    });
+    host.pivots.push(piv_intact);
+
+    let mut piv_split = PivotTableModel::new(
+        "PSplit".into(),
+        "Data".into(),
+        Some(host_data_id),
+        1,
+        (6, 0),
+        PivotSpec2 {
+            source: (0, 0, 2, 1), // rows 0..=2 will split when rows 0..=1 move to 2..=3!
+            ..spec2.clone()
+        },
+    );
+    piv_split.rect = (6, 0, 8, 2);
+    piv_split.imported_part = Some("xl/pivotTables/pivotTable2.xml".into());
+    host.pivots.push(piv_split);
+
+    host.pivots_pending.push((
+        0,
+        PivotSpec {
+            source: (0, 0, 1, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: Vec::new(),
+        },
+        PivotResult::default(),
+        (0, 10, 1, 11),
+        "Pend1".into(),
+    ));
+    host.pivots_pending2
+        .push((0, spec2, PivotGrid::default(), (0, 12, 1, 13)));
+
+    // Simulate a late-joining guest opening the exact same disk baseline,
+    // but with DIFFERENT process-local Sheet::identity and PivotTableModel::id!
+    let mut guest = host.clone();
+    guest.sheets[0].identity = host_data_id.wrapping_add(10_000);
+    for p in &mut guest.pivots {
+        p.id = p.id.wrapping_add(500);
+        p.source_sheet_id = Some(guest.sheets[0].identity);
+    }
+
+    // Online host performs AxisPermute: move rows 0..=1 to rows 2..=3 (drop=4), then swap cols 0 and 1!
+    let row_perm = AxisPermutePatch::from_drop(&host, 0, Axis::Row, 0, 2, 4).unwrap();
+    assert!(row_perm.apply(&mut host, true));
+    let col_perm = AxisPermutePatch::from_drop(&host, 0, Axis::Col, 0, 1, 2).unwrap();
+    assert!(col_perm.apply(&mut host, true));
+
+    // Host has NOT saved; capture TxOverlay and wire-roundtrip it as JSON.
+    let overlay = TxOverlay::capture(&host);
+    assert!(overlay.wire_valid());
+    let wire_json = serde_json::to_string(&overlay).unwrap();
+    // Raw PNG image bytes MUST NOT be serialized on the wire!
+    assert!(
+        !wire_json.contains("[137,80,78,71"),
+        "TxOverlay must project only picture geometry, never raw bytes"
+    );
+    let decoded: TxOverlay = serde_json::from_str(&wire_json).unwrap();
+    assert!(decoded.wire_valid());
+    assert_eq!(decoded, overlay);
+
+    // Clear dirty flags on guest before applying overlay.
+    let clear_dirty = |s: &mut Sheet| {
+        s.tables_dirty = false;
+        s.layout_dirty = false;
+        s.freeze_dirty = false;
+        s.filter_dirty = false;
+        s.scenarios_dirty = false;
+        s.protected_ranges_dirty = false;
+        s.page_dirty = false;
+        s.pictures_dirty = false;
+        s.textboxes_dirty = false;
+        s.charts_dirty = false;
+    };
+    clear_dirty(&mut guest.sheets[0]);
+
+    assert!(decoded.apply_to(&mut guest));
+
+    let hs = &host.sheets[0];
+    let gs = &guest.sheets[0];
+
+    // All 6 newly covered participant groups + chart anchors match online host!
+    assert_eq!(gs.tables, hs.tables);
+    assert_eq!(gs.tables[0].range, (2, 0, 3, 1));
+    assert_eq!(gs.tables[0].columns, vec!["HeaderB", "HeaderA"]);
+    assert!((gs.rows.size(2) - 60.0).abs() < 1e-3);
+    assert!((gs.rows.size(0) - 18.0).abs() < 1e-3);
+    assert!((gs.cols.size(0) - 125.0).abs() < 1e-3);
+    assert_eq!(gs.hidden_rows, hs.hidden_rows);
+    assert_eq!(gs.hidden_rows_user, hs.hidden_rows_user);
+    assert_eq!(gs.hidden_cols, hs.hidden_cols);
+    assert_eq!(gs.row_levels, hs.row_levels);
+    assert_eq!(gs.col_levels, hs.col_levels);
+    assert_eq!(gs.freeze, hs.freeze);
+    assert_eq!(gs.page, hs.page);
+    assert_eq!(gs.pictures[0].rect, hs.pictures[0].rect);
+    assert_eq!(gs.pictures[0].off, hs.pictures[0].off);
+    assert_eq!(
+        gs.pictures[0].data.as_deref(),
+        Some(&vec![0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]),
+        "local picture bytes must stay intact"
+    );
+    assert_eq!(gs.textboxes[0].from, hs.textboxes[0].from);
+    assert_eq!(gs.textboxes[0].to, hs.textboxes[0].to);
+    assert_eq!(gs.charts[0].anchor, hs.charts[0].anchor);
+    assert_eq!(gs.charts[0].series[0].val_ref, hs.charts[0].series[0].val_ref);
+    assert_eq!(gs.filter, hs.filter);
+    assert_eq!(gs.arrays, hs.arrays);
+    assert_eq!(gs.spilled, hs.spilled);
+    assert_eq!(gs.spill_shapes, hs.spill_shapes);
+    assert_eq!(gs.scenarios, hs.scenarios);
+    assert_eq!(gs.scenario_settings.current, hs.scenario_settings.current);
+    assert_eq!(gs.scenario_settings.sqref, hs.scenario_settings.sqref);
+    assert_eq!(gs.protected_ranges, hs.protected_ranges);
+
+    // Pivots matched by imported_part/name, split pivot removed, source_sheet_id mapped to guest's local identity!
+    assert_eq!(guest.pivots.len(), 1);
+    assert_eq!(guest.pivots[0].name, "PIntact");
+    assert_eq!(guest.pivots[0].source_sheet_id, Some(guest.sheets[0].identity));
+    assert_eq!(guest.pivots[0].spec.source, host.pivots[0].spec.source);
+    assert_eq!(guest.pivots[0].spec.rows[0].col, host.pivots[0].spec.rows[0].col);
+    assert_eq!(guest.pivots[0].spec.values[0].col, host.pivots[0].spec.values[0].col);
+    assert_eq!(guest.pivots[0].options.slicers[0].col, host.pivots[0].options.slicers[0].col);
+    assert_eq!(guest.pivots[0].rect, host.pivots[0].rect);
+    assert!(guest.pivots_removed_parts.contains(&"xl/pivotTables/pivotTable2.xml".to_string()));
+    assert_eq!(guest.pivots_pending[0].1.source, host.pivots_pending[0].1.source);
+    assert_eq!(guest.pivots_pending[0].1.row_field, host.pivots_pending[0].1.row_field);
+    assert_eq!(guest.pivots_pending[0].3, host.pivots_pending[0].3);
+    assert_eq!(guest.pivots_pending2[0].1.source, host.pivots_pending2[0].1.source);
+    assert_eq!(guest.pivots_pending2[0].1.rows[0].col, host.pivots_pending2[0].1.rows[0].col);
+    assert_eq!(guest.pivots_pending2[0].3, host.pivots_pending2[0].3);
+
+    // Dirty flags WERE set because values changed.
+    assert!(gs.tables_dirty);
+    assert!(gs.layout_dirty);
+    assert!(gs.filter_dirty);
+    assert!(gs.scenarios_dirty);
+    assert!(gs.protected_ranges_dirty);
+    assert!(gs.page_dirty);
+    assert!(gs.pictures_dirty);
+    assert!(gs.textboxes_dirty);
+    assert!(gs.charts_dirty);
+
+    // Re-applying identical overlay MUST NOT mark any *_dirty flag!
+    clear_dirty(&mut guest.sheets[0]);
+    assert!(decoded.apply_to(&mut guest));
+    let gs2 = &guest.sheets[0];
+    assert!(!gs2.tables_dirty);
+    assert!(!gs2.layout_dirty);
+    assert!(!gs2.freeze_dirty);
+    assert!(!gs2.filter_dirty);
+    assert!(!gs2.scenarios_dirty);
+    assert!(!gs2.protected_ranges_dirty);
+    assert!(!gs2.page_dirty);
+    assert!(!gs2.pictures_dirty);
+    assert!(!gs2.textboxes_dirty);
+    assert!(!gs2.charts_dirty);
+}
+
+#[test]
+fn tx_overlay_legacy_json_preserves_baseline_and_wire_valid_bounds_new_fields() {
+    use sheetcore::table::Table;
+    use sheetcore::tx::TxOverlay;
+
+    // 1. Legacy JSON payload without `format_version` or any Phase 6 fields
+    //    must deserialize cleanly, validate, and NOT wipe baseline tables/layout!
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].tables.push(Table {
+        name: "BaselineT".into(),
+        display: "BaselineT".into(),
+        range: (0, 0, 3, 2),
+        columns: vec!["A".into(), "B".into(), "C".into()],
+        ..Table::default()
+    });
+    wb.sheets[0].rows.set(0, 48.0);
+
+    let mut legacy_json = serde_json::to_value(TxOverlay::capture(&Workbook::new_blank())).unwrap();
+    let root = legacy_json.as_object_mut().unwrap();
+    root.remove("format_version");
+    root.remove("pivots");
+    root.remove("pivots_pending");
+    root.remove("pivots_pending2");
+    root.remove("pivot_shifts");
+    for sh in root["sheets"].as_array_mut().unwrap() {
+        let m = sh.as_object_mut().unwrap();
+        for key in [
+            "chart_anchors",
+            "tables",
+            "filter",
+            "arrays",
+            "spilled",
+            "spill_shapes",
+            "scenarios",
+            "scenario_settings",
+            "protected_ranges",
+            "layout",
+        ] {
+            m.remove(key);
+        }
+    }
+    let legacy: TxOverlay = serde_json::from_value(legacy_json).unwrap();
+    assert!(legacy.wire_valid());
+    assert!(legacy.apply_to(&mut wb));
+    assert_eq!(wb.sheets[0].tables.len(), 1);
+    assert_eq!(wb.sheets[0].tables[0].name, "BaselineT");
+    assert!((wb.sheets[0].rows.size(0) - 48.0).abs() < 1e-3);
+
+    // 2. Strict wire_valid rejection across malformed new Phase 6 fields.
+    let base = serde_json::to_value(TxOverlay::capture(&wb)).unwrap();
+
+    // Invalid table range (r2 == MAX_ROWS)
+    let mut bad_table = base.clone();
+    bad_table["sheets"][0]["tables"][0]["range"] = serde_json::json!([0, 0, MAX_ROWS, 1]);
+    assert!(!serde_json::from_value::<TxOverlay>(bad_table).unwrap().wire_valid());
+
+    // Invalid row height (negative / excessive)
+    let mut bad_height = base.clone();
+    bad_height["sheets"][0]["layout"]["rows"]["spans"] = serde_json::json!([[0, 0, -5.0]]);
+    assert!(!serde_json::from_value::<TxOverlay>(bad_height).unwrap().wire_valid());
+
+    let mut huge_height = base.clone();
+    huge_height["sheets"][0]["layout"]["rows"]["spans"] = serde_json::json!([[0, 0, 999_999.0]]);
+    assert!(!serde_json::from_value::<TxOverlay>(huge_height).unwrap().wire_valid());
+
+    // Invalid hidden row interval (hi >= MAX_ROWS)
+    let mut bad_hidden = base.clone();
+    bad_hidden["sheets"][0]["layout"]["hidden_rows"] = serde_json::json!([[0, MAX_ROWS]]);
+    assert!(!serde_json::from_value::<TxOverlay>(bad_hidden).unwrap().wire_valid());
+
+    // Invalid textbox anchor (col >= MAX_COLS)
+    let mut bad_tb = base.clone();
+    bad_tb["sheets"][0]["layout"]["textboxes"] = serde_json::json!([{
+        "id": 2,
+        "from": [MAX_COLS, 0, 0, 0],
+        "to": [MAX_COLS, 0, 1, 0]
+    }]);
+    assert!(!serde_json::from_value::<TxOverlay>(bad_tb).unwrap().wire_valid());
+
+    // Invalid autofilter col >= MAX_COLS
+    let mut bad_flt = base.clone();
+    bad_flt["sheets"][0]["filter"] = serde_json::json!({
+        "range": [0, 0, 2, 2],
+        "allows": [[MAX_COLS, ["x"]]]
+    });
+    assert!(!serde_json::from_value::<TxOverlay>(bad_flt).unwrap().wire_valid());
+
+    // Invalid pivot target_sheet out of bounds
+    let mut bad_piv = base;
+    bad_piv["pivots"] = serde_json::json!([{
+        "name": "P1",
+        "source_sheet": "Sheet1",
+        "target_sheet": 99,
+        "anchor": [0, 0],
+        "rect": [0, 0, 1, 1],
+        "last_meta_anchor": [0, 0],
+        "last_meta_rect": [0, 0, 1, 1],
+        "source": [0, 0, 1, 1]
+    }]);
+    assert!(!serde_json::from_value::<TxOverlay>(bad_piv).unwrap().wire_valid());
+}

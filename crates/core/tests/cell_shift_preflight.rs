@@ -916,3 +916,477 @@ fn preflight_blocks_chart_sparkline_protected_range_scenario_and_partial_hyperli
     assert!(ok_op.apply(&mut wb_hl, 0));
     assert!(wb_hl.sheets[0].hyperlinks.contains_key(&(3, 1)));
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 A3: Whole-Axis & MultiInsert Tail Overflow Preflight + Bounded Mapper
+// ---------------------------------------------------------------------------
+
+#[test]
+fn whole_axis_and_multi_insert_reject_tail_overflow_across_all_participants_without_mutating() {
+    use sheetcore::charts::Chart;
+    use sheetcore::external::{Kind as SourceKind, Source};
+    use sheetcore::hyperlinks::Hyperlink;
+    use sheetcore::notes::{Note, ThreadEntry, ThreadedComment};
+    use sheetcore::pic::Picture;
+    use sheetcore::protection::ProtectedRange;
+    use sheetcore::refs::Axis;
+    use sheetcore::richtext::RichRun;
+    use sheetcore::scenarios::Scenario;
+    use sheetcore::sparkline::Sparkline;
+    use sheetcore::structural::{Structural, apply_structural_wb};
+    use sheetcore::sync::{MAX_COLS, MAX_ROWS};
+    use sheetcore::textbox::TextBox;
+    use sheetcore::transform::CoordTransform;
+    use sheetcore::tx::{TxError, TxIntent, WorkbookTx};
+
+    let last_r = MAX_ROWS - 1;
+    let last_c = MAX_COLS - 1;
+
+    let assert_overflow_untouched = |label: &str, mut wb: Workbook, tx: CoordTransform| {
+        wb.dirty = false;
+        let epoch0 = wb.coord_epoch();
+        let snap_cells: Vec<_> = wb
+            .sheets
+            .iter()
+            .map(|s| s.used_bounds())
+            .collect();
+        let snap_formulas: Vec<_> = wb
+            .sheets
+            .iter()
+            .map(|s| s.formula_of(0, 0).map(str::to_owned))
+            .collect();
+
+        assert_eq!(
+            tx.preflight(&wb),
+            Err(CellShiftConflict::Overflow),
+            "{label}: preflight must return Overflow"
+        );
+        assert_eq!(
+            WorkbookTx::execute(&mut wb, TxIntent::Transform(tx.clone()), (0, 0, 0)).unwrap_err(),
+            TxError::Conflict(CellShiftConflict::Overflow),
+            "{label}: WorkbookTx::execute must return Overflow"
+        );
+        assert_eq!(wb.coord_epoch(), epoch0, "{label}: coord_epoch mutated on overflow");
+        assert!(!wb.dirty, "{label}: wb.dirty set on overflow");
+
+        if let CoordTransform::AxisShift {
+            sheet_idx,
+            axis,
+            at,
+            n,
+            delete: false,
+            band: None,
+        } = tx
+        {
+            let op = match axis {
+                Axis::Row => Structural::InsertRows { at, n },
+                Axis::Col => Structural::InsertCols { at, n },
+            };
+            apply_structural_wb(&mut wb, sheet_idx, &op);
+            assert_eq!(wb.coord_epoch(), epoch0, "{label}: apply_structural_wb mutated coord_epoch");
+        }
+
+        let after_cells: Vec<_> = wb.sheets.iter().map(|s| s.used_bounds()).collect();
+        let after_formulas: Vec<_> = wb
+            .sheets
+            .iter()
+            .map(|s| s.formula_of(0, 0).map(str::to_owned))
+            .collect();
+        assert_eq!(after_cells, snap_cells, "{label}: bounds mutated");
+        assert_eq!(after_formulas, snap_formulas, "{label}: cross-sheet formula mutated");
+    };
+
+    let base_wb = || {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S".into();
+        let mut other = Sheet::new("Ref");
+        other.set(0, 0, formula("=S!A1048576+S!XFD1"));
+        wb.sheets.push(other);
+        wb
+    };
+
+    let row_tx = CoordTransform::from_structural(0, &Structural::InsertRows { at: 0, n: 1 });
+    let col_tx = CoordTransform::from_structural(0, &Structural::InsertCols { at: 0, n: 1 });
+    let multi_row_tx = CoordTransform::from_multi_insert(0, Axis::Row, vec![0, 5]);
+    let multi_col_tx = CoordTransform::from_multi_insert(0, Axis::Col, vec![0, 5]);
+
+    // 1. Value + cross-sheet formula (exact A3 peer-review repro!)
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].set(last_r, 0, num(7.0));
+        assert_overflow_untouched("row value", wb.clone(), row_tx.clone());
+        assert_overflow_untouched("multi_row value", wb, multi_row_tx.clone());
+
+        let mut wbc = base_wb();
+        wbc.sheets[0].set(0, last_c, num(7.0));
+        assert_overflow_untouched("col value", wbc.clone(), col_tx.clone());
+        assert_overflow_untouched("multi_col value", wbc, multi_col_tx.clone());
+    }
+
+    // 2. Explicit styles + row_styles / col_styles
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].set_style(last_r, 0, 2);
+        assert_overflow_untouched("row explicit style", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].set_style(0, last_c, 2);
+        assert_overflow_untouched("col explicit style", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].set_row_style(last_r, 2);
+        assert_overflow_untouched("row_styles tail", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].set_col_style(last_c, 2);
+        assert_overflow_untouched("col_styles tail", wb, col_tx.clone());
+    }
+
+    // 3. Merges
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].merges.push((last_r - 1, 0, last_r, 1));
+        assert_overflow_untouched("row merge", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].merges.push((0, last_c - 1, 1, last_c));
+        assert_overflow_untouched("col merge", wb, col_tx.clone());
+    }
+
+    // 4. Tables (at tail AND expansion at r2 + 1 when !totals_row)
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].tables.push(table("TailRowT", (last_r - 2, 0, last_r, 2)));
+        assert_overflow_untouched("row table", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        let mut exp_t = table("ExpandT", (last_r - 2, 0, last_r - 1, 2));
+        exp_t.totals_row = false;
+        wb.sheets[0].tables.push(exp_t);
+        // Normal cells at `last_r - 1` map to `last_r` under MultiInsert [0, last_r] (no cell overflow),
+        // but the totals-less table ALSO expands at `r2 + 1 == last_r` -> `r2 + 2 == MAX_ROWS` -> Overflow!
+        let expand_multi = CoordTransform::from_multi_insert(0, Axis::Row, vec![0, last_r]);
+        assert_overflow_untouched("multi_insert table expansion at tail", wb, expand_multi);
+
+        let mut wb = base_wb();
+        wb.sheets[0].tables.push(table("TailColT", (0, last_c - 2, 2, last_c)));
+        assert_overflow_untouched("col table", wb, col_tx.clone());
+    }
+
+    // 5. Pivots (wb.pivots, wb.pivots_pending, wb.pivots_pending2)
+    {
+        let mut wb = base_wb();
+        let sid = wb.sheets[0].identity;
+        let spec2 = PivotSpec2 {
+            source: (last_r - 2, 0, last_r, 1),
+            rows: vec![AxisField::plain(0)],
+            cols: Vec::new(),
+            values: vec![ValueField {
+                col: 1,
+                agg: Agg::Sum,
+                label: None,
+                show_as: ShowAs::Normal,
+                base: None,
+            }],
+            filters: Vec::new(),
+            layout: PivotLayout::default(),
+        };
+        let p = PivotTableModel::new("PT".into(), "S".into(), Some(sid), 1, (0, 0), spec2.clone());
+        wb.pivots.push(p);
+        assert_overflow_untouched("row pivot source", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.pivots_pending.push((
+            0,
+            PivotSpec {
+                source: (0, last_c - 1, 2, last_c),
+                row_field: 0,
+                col_field: None,
+                value_field: 1,
+                agg: Agg::Sum,
+                group: GroupBy::None,
+                exclude: Vec::new(),
+            },
+            PivotResult::default(),
+            (0, 0, 2, 1),
+            "P1".into(),
+        ));
+        assert_overflow_untouched("col pivot_pending", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.pivots_pending2
+            .push((0, spec2, PivotGrid::default(), (0, 0, 2, 1)));
+        assert_overflow_untouched("row pivot_pending2", wb, row_tx.clone());
+    }
+
+    // 6. Sparklines (same-sheet anchor & cross-sheet data rect)
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].sparklines.push(Sparkline {
+            r: last_r,
+            c: 0,
+            source_sheet: None,
+            rect: (0, 0, 2, 0),
+            ..Default::default()
+        });
+        assert_overflow_untouched("row sparkline anchor", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[1].sparklines.push(Sparkline {
+            r: 0,
+            c: 0,
+            source_sheet: Some("s".into()),
+            rect: (0, last_c - 1, 0, last_c),
+            ..Default::default()
+        });
+        assert_overflow_untouched("col cross-sheet sparkline rect", wb, col_tx.clone());
+    }
+
+    // 7. Notes, Threads, Hyperlinks (with span), Rich, IgnoredErrors
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].notes.insert(
+            CellRef::new(last_r, 0),
+            Note { r: last_r, c: 0, author: "a".into(), text: "n".into() },
+        );
+        assert_overflow_untouched("row note", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].threads.insert(
+            CellRef::new(0, last_c),
+            ThreadedComment {
+                r: 0,
+                c: last_c,
+                resolved: false,
+                entries: vec![ThreadEntry {
+                    id: "1".into(),
+                    author: "a".into(),
+                    timestamp: "t".into(),
+                    text: "x".into(),
+                }],
+            },
+        );
+        assert_overflow_untouched("col thread", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].hyperlinks.insert(
+            (last_r - 1, 0),
+            Hyperlink { span: (1, 0), ..Default::default() },
+        );
+        assert_overflow_untouched("row hyperlink span", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].rich.insert((0, last_c), vec![RichRun::plain("x")]);
+        assert_overflow_untouched("col rich", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].ignored_errors.insert((last_r, 0));
+        assert_overflow_untouched("row ignored_error", wb, row_tx.clone());
+    }
+
+    // 8. Arrays/Spills, AutoFilter, Scenarios/ProtectedRanges, LayoutAndPage, Charts, ExternalSources
+    {
+        let mut wb = base_wb();
+        wb.sheets[0].spill_shapes.insert(CellRef::new(last_r - 1, 0), (2, 1));
+        assert_overflow_untouched("row spill_shapes", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].filter = Some(autofilter((0, last_c - 1, 3, last_c)));
+        assert_overflow_untouched("col autofilter", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        let mut sc = Scenario::new("S");
+        sc.cells.push(((last_r, 0), "1".into()));
+        wb.sheets[0].scenarios.push(sc);
+        assert_overflow_untouched("row scenario", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0]
+            .protected_ranges
+            .push(ProtectedRange::new("P", vec![(0, last_c, 1, last_c)], ""));
+        assert_overflow_untouched("col protected_range", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].rows.set(last_r, 40.0);
+        assert_overflow_untouched("row custom height", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].hidden_cols.insert(last_c);
+        assert_overflow_untouched("col hidden_cols", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].freeze = Some((last_r, 0));
+        assert_overflow_untouched("row freeze", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].pictures.push(Picture { rect: (0, last_c, 1, last_c), ..Picture::default() });
+        assert_overflow_untouched("col picture", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].textboxes.push(TextBox { from: (0, 0, last_r, 0), to: (1, 0, last_r, 0), ..TextBox::default() });
+        assert_overflow_untouched("row textbox", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].charts.push(Chart { anchor: (0, last_c, 2, last_c), ..Chart::default() });
+        assert_overflow_untouched("col chart anchor", wb, col_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sheets[0].page.row_breaks.push(last_r);
+        assert_overflow_untouched("row page break", wb, row_tx.clone());
+
+        let mut wb = base_wb();
+        wb.sources.push(Source {
+            name: "Ext".into(),
+            kind: SourceKind::Internal { sheet: "S".into(), rect: (last_r - 1, 0, last_r, 1) },
+            at: (0, 0),
+            target_sheet: Some("Ref".into()),
+            rows: 2,
+            cols: 2,
+            csv_opts: None,
+        });
+        assert_overflow_untouched("row external source", wb, row_tx.clone());
+
+        // MultiInsert duplicate tail slot overflow (positions [last_r, last_r] pushes 2nd slot to MAX_ROWS!)
+        let wb_empty = base_wb();
+        let dup_tail = CoordTransform::from_multi_insert(0, Axis::Row, vec![last_r, last_r]);
+        assert_overflow_untouched("multi_insert duplicate tail", wb_empty, dup_tail);
+    }
+}
+
+#[test]
+fn whole_axis_insert_allows_full_axis_rules_and_non_overflowing_objects_and_bounds_physical_mapper() {
+    use sheetcore::cf::{CfBlock, CfKind, CfOp, CfRule};
+    use sheetcore::dv::{DataValidation, DvKind};
+    use sheetcore::refs::Axis;
+    use sheetcore::structural::{Structural, apply_structural_wb};
+    use sheetcore::sync::{MAX_COLS, MAX_ROWS};
+    use sheetcore::transform::CoordTransform;
+    use sheetcore::tx::{TxIntent, WorkbookTx};
+
+    let last_r = MAX_ROWS - 1;
+    let last_c = MAX_COLS - 1;
+
+    // 1. Full-axis CF/DV rules + col_styles + non-overflowing Table/Pivot/AutoFilter/Merge/Array
+    //    MUST succeed on whole-axis InsertRows & InsertCols!
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "S".into();
+    wb.sheets[0].set(1, 1, num(10.0));
+    wb.sheets[0].set_col_style(0, 3); // full-column style must NOT block InsertRows
+    wb.sheets[0].set_row_style(0, 4); // full-row style must NOT block InsertCols
+    wb.sheets[0].cf.blocks.push(CfBlock {
+        ranges: vec![(0, 0, last_r, 0), (0, 0, 0, last_c)],
+        rules: vec![CfRule {
+            kind: CfKind::CellIs {
+                op: CfOp::Greater,
+                a: "0".into(),
+                b: String::new(),
+                dxf: 0,
+            },
+            stop: false,
+            priority: 1,
+        }],
+    });
+    wb.sheets[0].dv.push(DataValidation {
+        ranges: vec![(0, 0, last_r, 0), (0, 0, 0, last_c)],
+        kind: DvKind::Any,
+        ..Default::default()
+    });
+    wb.sheets[0].tables.push(table("T1", (0, 0, 3, 2)));
+    wb.sheets[0].filter = Some(autofilter((0, 0, 3, 2)));
+    wb.sheets[0].merges.push((5, 0, 6, 1));
+    wb.sheets[0].arrays.push((CellRef::new(8, 0), (8, 0, 9, 1)));
+    let sid = wb.sheets[0].identity;
+    let spec2 = PivotSpec2 {
+        source: (0, 0, 3, 2),
+        rows: vec![AxisField::plain(0)],
+        cols: Vec::new(),
+        values: vec![ValueField {
+            col: 1,
+            agg: Agg::Sum,
+            label: None,
+            show_as: ShowAs::Normal,
+            base: None,
+        }],
+        filters: Vec::new(),
+        layout: PivotLayout::default(),
+    };
+    wb.pivots
+        .push(PivotTableModel::new("P1".into(), "S".into(), Some(sid), 0, (12, 0), spec2));
+
+    // Whole-axis InsertRows at 0 succeeds cleanly!
+    WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_structural(0, &Structural::InsertRows { at: 0, n: 1 }),
+        (0, 0, 0),
+    )
+    .expect("whole-axis InsertRows with full-axis CF/DV, col_style, and non-overflowing objects must succeed");
+    assert_eq!(wb.sheets[0].value(2, 1), Value::Number(10.0));
+    assert_eq!(wb.sheets[0].tables[0].range, (1, 0, 4, 2));
+    assert_eq!(wb.sheets[0].cf.blocks[0].ranges[0], (0, 0, last_r, 0));
+    assert_eq!(wb.sheets[0].dv[0].ranges[0], (0, 0, last_r, 0));
+
+    // Whole-axis InsertCols at 0 succeeds cleanly!
+    WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_structural(0, &Structural::InsertCols { at: 0, n: 1 }),
+        (0, 0, 0),
+    )
+    .expect("whole-axis InsertCols with full-axis CF/DV, row_style, and non-overflowing objects must succeed");
+    assert_eq!(wb.sheets[0].value(2, 2), Value::Number(10.0));
+    assert_eq!(wb.sheets[0].tables[0].range, (1, 1, 4, 3));
+    assert_eq!(wb.sheets[0].cf.blocks[0].ranges[1], (1, 0, 1, last_c));
+    assert_eq!(wb.sheets[0].dv[0].ranges[1], (1, 0, 1, last_c));
+
+    // 2. Physical mapper parity with CoordTransform::map_index at grid limits!
+    let r_shift = sheetcore::refs::Shift {
+        axis: Axis::Row,
+        at: 0,
+        n: 1,
+        delete: false,
+        ..Default::default()
+    };
+    let r_tx = CoordTransform::from_structural(0, &Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(r_shift.map_bounded(last_r), r_tx.map_index(last_r));
+    assert_eq!(r_shift.map_bounded(last_r), None);
+    assert_eq!(r_shift.map_bounded(last_r - 1), Some(last_r));
+    let r_mtx = CoordTransform::from_multi_insert(0, Axis::Row, vec![0, 5]);
+    assert_eq!(r_mtx.map_index(last_r - 1), None);
+    assert_eq!(r_mtx.map_index(last_r - 2), Some(last_r));
+
+    let c_shift = sheetcore::refs::Shift {
+        axis: Axis::Col,
+        at: 0,
+        n: 1,
+        delete: false,
+        ..Default::default()
+    };
+    let c_tx = CoordTransform::from_structural(0, &Structural::InsertCols { at: 0, n: 1 });
+    assert_eq!(c_shift.map_bounded(last_c), c_tx.map_index(last_c));
+    assert_eq!(c_shift.map_bounded(last_c), None);
+    assert_eq!(c_shift.map_bounded(last_c - 1), Some(last_c));
+
+    // 3. Low-level Sheet::insert_rows / insert_cols can NEVER create out-of-grid coordinates (>= MAX_ROWS / MAX_COLS).
+    let mut raw_sh = Sheet::new("Raw");
+    raw_sh.set(last_r, 0, num(9.0));
+    raw_sh.set_style(last_r, 0, 5);
+    raw_sh.insert_rows(0, 1);
+    assert!(raw_sh.get(MAX_ROWS, 0).is_none());
+    assert!(raw_sh.explicit_style_of(MAX_ROWS, 0).is_none());
+    assert!(raw_sh.used_bounds().is_none_or(|b| b.2 < MAX_ROWS));
+
+    let mut raw_sh_c = Sheet::new("RawC");
+    raw_sh_c.set(0, last_c, num(9.0));
+    raw_sh_c.set_style(0, last_c, 5);
+    raw_sh_c.insert_cols(0, 1);
+    assert!(raw_sh_c.get(0, MAX_COLS).is_none());
+    assert!(raw_sh_c.explicit_style_of(0, MAX_COLS).is_none());
+    assert!(raw_sh_c.used_bounds().is_none_or(|b| b.3 < MAX_COLS));
+
+    // 4. apply_structural_wb on non-overflowing sheet still works normally.
+    let mut ok_wb = Workbook::new_blank();
+    ok_wb.sheets[0].set(0, 0, num(1.0));
+    let ep = ok_wb.coord_epoch();
+    apply_structural_wb(&mut ok_wb, 0, &Structural::InsertRows { at: 0, n: 1 });
+    assert_eq!(ok_wb.sheets[0].value(1, 0), Value::Number(1.0));
+    assert!(ok_wb.coord_epoch() > ep);
+}

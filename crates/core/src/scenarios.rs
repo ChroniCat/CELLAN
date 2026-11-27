@@ -60,6 +60,48 @@ impl Scenario {
         self.input_properties
             .retain(|key, _| self.cells.iter().any(|(k, _)| k == key));
     }
+
+    pub(crate) fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    pub(crate) fn explicit_count(&self) -> bool {
+        self.explicit_count
+    }
+
+    pub(crate) fn sorted_input_properties(&self) -> Vec<((u32, u32), Vec<(String, String)>)> {
+        let mut out: Vec<_> = self
+            .input_properties
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        out.sort_unstable_by_key(|(k, _)| *k);
+        out
+    }
+
+    pub(crate) fn from_portable(
+        name: String,
+        comment: String,
+        cells: Vec<((u32, u32), String)>,
+        hidden: bool,
+        locked: bool,
+        user: Option<String>,
+        explicit_count: bool,
+        input_properties: Vec<((u32, u32), Vec<(String, String)>)>,
+    ) -> Self {
+        Self {
+            name,
+            comment,
+            cells,
+            hidden,
+            locked,
+            source_record: None,
+            source_inputs: HashMap::new(),
+            user,
+            explicit_count,
+            input_properties: input_properties.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

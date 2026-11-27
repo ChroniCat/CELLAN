@@ -6,7 +6,8 @@
 use crate::model::Sheet;
 
 /// 矢量水印配置（超越 Excel：原生支持斜角居中或满页平铺半透明水印）
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WatermarkConfig {
     pub text: String,
     pub font_size: f32,
@@ -49,7 +50,8 @@ pub const PAPER_SIZES: &[(u16, &str)] = &[
     (70, "A6 (105×148 mm)"),
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PageSetup {
     pub landscape: bool,
     /// ISO/IEC 29500 OOXML paperSize：9 = A4，8 = A3，11 = A5，1 = Letter，5 = Legal，12 = B4，13 = B5

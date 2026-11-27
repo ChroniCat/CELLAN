@@ -1255,8 +1255,20 @@ impl Entry {
             Self::Cells(_, a, _, None, None) if a.snap_before.is_none() && a.snap_after.is_none()
                 && a.merges.is_none() && a.shapes.is_none() && a.pictures.is_none()
                 && a.refresh_sizes.is_none() => Some(Box::new(a.deltas.iter().map(|d| (d.sheet, d.row, d.col)))),
-            Self::Tx(_, TxAction { delta: crate::tx::TxDelta::CellBatch { deltas, .. }, .. }) => {
-                Some(Box::new(deltas.iter().map(|d| (d.sheet, d.row, d.col))))
+            Self::Tx(_, TxAction { delta: crate::tx::TxDelta::CellBatch { deltas, sheet_ids, rich }, .. }) => {
+                let fallback_sheet = deltas
+                    .first()
+                    .map(|d| d.sheet)
+                    .or_else(|| sheet_ids.first().map(|&(idx, _)| idx));
+                Some(Box::new(
+                    deltas
+                        .iter()
+                        .map(|d| (d.sheet, d.row, d.col))
+                        .chain(
+                            rich.iter()
+                                .filter_map(move |&((r, c), ..)| fallback_sheet.map(|s| (s, r, c))),
+                        ),
+                ))
             }
             Self::CowBatch(_, a)
                 if a.row_style_deltas.is_empty()
@@ -1372,50 +1384,154 @@ impl TxAction {
         redo: bool,
         guard: &mut impl FnMut(usize, u32, u32, &Cell) -> bool,
     ) -> Option<(Applied, bool)> {
-        let crate::tx::TxDelta::CellBatch { deltas, sheet_ids } = &mut self.delta else {
+        let crate::tx::TxDelta::CellBatch {
+            deltas,
+            sheet_ids,
+            rich,
+        } = &mut self.delta
+        else {
             return None;
         };
         let mut touched = Vec::new();
         let mut style_changes = Vec::new();
         let mut excluded = std::collections::HashSet::new();
+        let mut applied_coords = std::collections::HashSet::new();
+        let mut skipped_coords = std::collections::HashSet::new();
+        let batch_sheet = deltas
+            .first()
+            .map(|d| d.sheet)
+            .or_else(|| sheet_ids.first().map(|&(idx, _)| idx));
         let id_matches = |sheet_idx: usize, sh: &Sheet| -> bool {
             sheet_ids
                 .iter()
                 .find(|&&(idx, _)| idx == sheet_idx)
                 .is_none_or(|&(_, id)| sh.identity == id)
         };
+        let rich_by_coord: std::collections::HashMap<(u32, u32), usize> = rich
+            .iter()
+            .enumerate()
+            .map(|(idx, &(pos, ..))| (pos, idx))
+            .collect();
+        let rich_matches_expected = |sheet: &Sheet, r: u32, c: u32| -> bool {
+            let Some(&ri) = rich_by_coord.get(&(r, c)) else {
+                return true;
+            };
+            let (_, ref before_runs, ref after_runs) = rich[ri];
+            let expected_runs = if redo { before_runs } else { after_runs };
+            sheet.rich.get(&(r, c)) == expected_runs.as_ref()
+        };
+
         if redo {
             for (i, d) in deltas.iter().enumerate() {
                 let Some(sheet) = sheets.get_mut(d.sheet) else {
                     excluded.insert(i);
+                    skipped_coords.insert((d.sheet, d.row, d.col));
                     continue;
                 };
-                if !id_matches(d.sheet, sheet) || !d.can_replay(sheet, true, guard) {
+                if !id_matches(d.sheet, sheet)
+                    || !rich_matches_expected(sheet, d.row, d.col)
+                    || !d.can_replay(sheet, true, guard)
+                {
                     excluded.insert(i);
+                    skipped_coords.insert((d.sheet, d.row, d.col));
                     continue;
                 }
                 d.replay(sheet, true, &mut style_changes);
+                applied_coords.insert((d.sheet, d.row, d.col));
                 touched.push((d.sheet, d.row, d.col));
             }
         } else {
             for (i, d) in deltas.iter().enumerate().rev() {
                 let Some(sheet) = sheets.get_mut(d.sheet) else {
                     excluded.insert(i);
+                    skipped_coords.insert((d.sheet, d.row, d.col));
                     continue;
                 };
-                if !id_matches(d.sheet, sheet) || !d.can_replay(sheet, false, guard) {
+                if !id_matches(d.sheet, sheet)
+                    || !rich_matches_expected(sheet, d.row, d.col)
+                    || !d.can_replay(sheet, false, guard)
+                {
                     excluded.insert(i);
+                    skipped_coords.insert((d.sheet, d.row, d.col));
                     continue;
                 }
                 d.replay(sheet, false, &mut style_changes);
+                applied_coords.insert((d.sheet, d.row, d.col));
                 touched.push((d.sheet, d.row, d.col));
             }
         }
-        let skipped = excluded.len();
-        if skipped != 0 {
+
+        // Restore/clear `RichRun`s AFTER `delta.replay` (which calls `Sheet::set` and strips runs).
+        let mut excluded_rich = std::collections::HashSet::new();
+        let mut standalone_rich_skipped = 0usize;
+        if !rich.is_empty() {
+            if let Some(sheet_idx) = batch_sheet
+                && let Some(sheet) = sheets.get_mut(sheet_idx)
+            {
+                let mut any_rich_changed = false;
+                for (ri, &((r, c), ref before_runs, ref after_runs)) in rich.iter().enumerate() {
+                    if skipped_coords.contains(&(sheet_idx, r, c)) {
+                        excluded_rich.insert(ri);
+                        continue;
+                    }
+                    if !applied_coords.contains(&(sheet_idx, r, c)) {
+                        let blank = Cell::default();
+                        let cur_cell = sheet.get(r, c);
+                        let cur_cell = cur_cell.as_deref().unwrap_or(&blank);
+                        let expected_runs = if redo { before_runs } else { after_runs };
+                        if !id_matches(sheet_idx, sheet)
+                            || sheet.rich.get(&(r, c)) != expected_runs.as_ref()
+                            || !guard(sheet_idx, r, c, cur_cell)
+                        {
+                            excluded_rich.insert(ri);
+                            standalone_rich_skipped += 1;
+                            continue;
+                        }
+                        touched.push((sheet_idx, r, c));
+                    }
+                    let target_runs = if redo { after_runs } else { before_runs };
+                    let expected_runs = if redo { before_runs } else { after_runs };
+                    match target_runs {
+                        Some(runs) if !runs.is_empty() => {
+                            if sheet.rich.get(&(r, c)) != Some(runs) {
+                                sheet.rich.insert((r, c), runs.clone());
+                                any_rich_changed = true;
+                            }
+                        }
+                        _ => {
+                            if sheet.rich.remove(&(r, c)).is_some() || expected_runs.is_some() {
+                                any_rich_changed = true;
+                            }
+                        }
+                    }
+                }
+                if any_rich_changed {
+                    sheet.rich_dirty = true;
+                    sheet.bump_display_style_revision();
+                }
+            } else {
+                for (ri, &((r, c), ..)) in rich.iter().enumerate() {
+                    excluded_rich.insert(ri);
+                    if batch_sheet.is_none_or(|s| !skipped_coords.contains(&(s, r, c))) {
+                        standalone_rich_skipped += 1;
+                    }
+                }
+            }
+        }
+
+        let skipped = excluded.len() + standalone_rich_skipped;
+        if !excluded.is_empty() {
             let mut i = 0usize;
             deltas.retain(|_| {
                 let keep = !excluded.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+        if !excluded_rich.is_empty() {
+            let mut i = 0usize;
+            rich.retain(|_| {
+                let keep = !excluded_rich.contains(&i);
                 i += 1;
                 keep
             });
@@ -1434,7 +1550,7 @@ impl TxAction {
             merge_conflict: false,
             total_touched,
         };
-        Some((applied, !deltas.is_empty()))
+        Some((applied, !deltas.is_empty() || !rich.is_empty()))
     }
 
     fn apply_meta(
@@ -2792,11 +2908,25 @@ fn sheet_inputs_match(a: &Sheet, b: &Sheet) -> bool {
         })
 }
 
+fn sheet_styles_match(a: &Sheet, b: &Sheet) -> bool {
+    if a.styles == b.styles {
+        return true;
+    }
+    if a.row_styles != b.row_styles || a.col_styles != b.col_styles {
+        return false;
+    }
+    let mut diff = crate::model::CellJournal::default();
+    a.styles.diff_into_journal(&b.styles, &mut diff);
+    diff.iter()
+        .all(|k| a.style_of(k.row, k.col) == b.style_of(k.row, k.col))
+}
+
 fn target_matches(a: &Sheet, b: &Sheet) -> bool {
     a.identity == b.identity && a.name == b.name && a.arrays == b.arrays
         && a.tables == b.tables && a.pictures == b.pictures && a.merges == b.merges
-        && a.cols == b.cols && a.rows == b.rows && a.styles == b.styles
+        && a.cols == b.cols && a.rows == b.rows
         && a.col_styles == b.col_styles && a.row_styles == b.row_styles
+        && sheet_styles_match(a, b)
         && a.cf == b.cf && a.dv == b.dv && a.freeze == b.freeze
         && a.filter == b.filter && a.hidden_rows == b.hidden_rows && a.hidden_rows_user == b.hidden_rows_user
         && a.hidden_cols == b.hidden_cols && a.scenarios == b.scenarios && a.scenario_settings == b.scenario_settings && a.ignored_errors == b.ignored_errors
@@ -3166,12 +3296,37 @@ impl UndoStack {
     fn tx_delta_bytes(&self, delta: &crate::tx::TxDelta) -> usize {
         use crate::tx::{SheetTabChange, TxDelta};
         match delta {
-            TxDelta::SparseShift { deltas, .. } | TxDelta::CellBatch { deltas, .. } => {
+            TxDelta::SparseShift { deltas, .. } => {
                 deltas.capacity() * std::mem::size_of::<CellDelta>()
                     + deltas
                         .iter()
                         .map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after))
                         .sum::<usize>()
+            }
+            TxDelta::CellBatch { deltas, rich, .. } => {
+                let rich_bytes: usize = rich
+                    .iter()
+                    .map(|(_, b, a)| {
+                        let runs_bytes = |opt: &Option<Vec<crate::richtext::RichRun>>| -> usize {
+                            opt.as_ref().map_or(0, |runs| {
+                                runs.capacity() * std::mem::size_of::<crate::richtext::RichRun>()
+                                    + runs.iter().map(|r| r.text.len()).sum::<usize>()
+                            })
+                        };
+                        std::mem::size_of::<(
+                            (u32, u32),
+                            Option<Vec<crate::richtext::RichRun>>,
+                            Option<Vec<crate::richtext::RichRun>>,
+                        )>() + runs_bytes(b)
+                            + runs_bytes(a)
+                    })
+                    .sum();
+                deltas.capacity() * std::mem::size_of::<CellDelta>()
+                    + deltas
+                        .iter()
+                        .map(|d| cell_heap_bytes(&d.before) + cell_heap_bytes(&d.after))
+                        .sum::<usize>()
+                    + rich_bytes
             }
             TxDelta::Structure(history) => history.initial_bytes,
             TxDelta::RoomPatch { patch, .. } => {

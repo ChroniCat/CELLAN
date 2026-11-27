@@ -420,6 +420,11 @@ impl HiddenIndices {
 
     /// Shift all hidden intervals in `O(intervals)` time for a structural insert or delete.
     pub fn shift_axis(&mut self, at: u32, n: u32, delete: bool) -> bool {
+        self.shift_axis_bounded(at, n, delete, u32::MAX)
+    }
+
+    /// Shift all hidden intervals in `O(intervals)` time, dropping any shifted index `>= limit`.
+    pub fn shift_axis_bounded(&mut self, at: u32, n: u32, delete: bool, limit: u32) -> bool {
         if n == 0 || self.intervals.is_empty() {
             return false;
         }
@@ -431,27 +436,47 @@ impl HiddenIndices {
             let end_del = at.saturating_add(n);
             for &(lo, hi) in self.intervals.iter() {
                 if hi < at {
-                    raw.push((lo, hi));
-                } else if lo >= end_del {
-                    raw.push((lo - n, hi - n));
-                } else {
-                    if lo < at {
-                        raw.push((lo, at - 1));
+                    if lo < limit {
+                        raw.push((lo, hi.min(limit.saturating_sub(1))));
                     }
-                    if hi >= end_del {
-                        raw.push((at, hi - n));
+                } else if lo >= end_del {
+                    let nlo = lo - n;
+                    let nhi = hi - n;
+                    if nlo < limit {
+                        raw.push((nlo, nhi.min(limit.saturating_sub(1))));
+                    }
+                } else {
+                    if lo < at && lo < limit {
+                        raw.push((lo, (at - 1).min(limit.saturating_sub(1))));
+                    }
+                    if hi >= end_del && at < limit {
+                        raw.push((at, (hi - n).min(limit.saturating_sub(1))));
                     }
                 }
             }
         } else {
             for &(lo, hi) in self.intervals.iter() {
                 if hi < at {
-                    raw.push((lo, hi));
+                    if lo < limit {
+                        raw.push((lo, hi.min(limit.saturating_sub(1))));
+                    }
                 } else if lo >= at {
-                    raw.push((lo.saturating_add(n), hi.saturating_add(n)));
+                    if let Some(nlo) = lo.checked_add(n)
+                        && nlo < limit
+                    {
+                        let nhi = hi.saturating_add(n).min(limit.saturating_sub(1));
+                        raw.push((nlo, nhi));
+                    }
                 } else {
-                    raw.push((lo, at - 1));
-                    raw.push((at.saturating_add(n), hi.saturating_add(n)));
+                    if lo < limit {
+                        raw.push((lo, (at - 1).min(limit.saturating_sub(1))));
+                    }
+                    if let Some(nlo) = at.checked_add(n)
+                        && nlo < limit
+                    {
+                        let nhi = hi.saturating_add(n).min(limit.saturating_sub(1));
+                        raw.push((nlo, nhi));
+                    }
                 }
             }
         }
@@ -731,6 +756,17 @@ impl Axis {
         }
     }
 
+    pub(crate) fn from_default_and_spans(default: f32, mut raw: Vec<(u32, u32, f32)>) -> Self {
+        let mut ax = Self::new(default);
+        raw.retain(|&(lo, hi, sz)| lo <= hi && sz.is_finite() && (sz - default).abs() >= 0.01);
+        if !raw.is_empty() {
+            raw.sort_unstable_by_key(|&(lo, _, _)| lo);
+            let prev_def_zero = ax.default <= 0.0;
+            ax.install_raw_spans(raw, prev_def_zero);
+        }
+        ax
+    }
+
     #[inline]
     pub fn revision(&self) -> u64 {
         self.revision
@@ -971,6 +1007,11 @@ impl Axis {
     /// Shift custom spans in `O(spans)` time for a structural insert or delete,
     /// without expanding million-row hidden/uniform spans into per-row loops.
     pub fn shift_axis(&mut self, at: u32, n: u32, delete: bool) -> bool {
+        self.shift_axis_bounded(at, n, delete, u32::MAX)
+    }
+
+    /// Shift custom spans in `O(spans)` time, dropping any shifted index `>= limit`.
+    pub fn shift_axis_bounded(&mut self, at: u32, n: u32, delete: bool, limit: u32) -> bool {
         if n == 0 || self.spans.is_empty() {
             return false;
         }
@@ -982,27 +1023,47 @@ impl Axis {
             let end_del = at.saturating_add(n);
             for s in self.spans.iter() {
                 if s.end < at {
-                    raw.push((s.start, s.end, s.size));
-                } else if s.start >= end_del {
-                    raw.push((s.start - n, s.end - n, s.size));
-                } else {
-                    if s.start < at {
-                        raw.push((s.start, at - 1, s.size));
+                    if s.start < limit {
+                        raw.push((s.start, s.end.min(limit.saturating_sub(1)), s.size));
                     }
-                    if s.end >= end_del {
-                        raw.push((at, s.end - n, s.size));
+                } else if s.start >= end_del {
+                    let nlo = s.start - n;
+                    let nhi = s.end - n;
+                    if nlo < limit {
+                        raw.push((nlo, nhi.min(limit.saturating_sub(1)), s.size));
+                    }
+                } else {
+                    if s.start < at && s.start < limit {
+                        raw.push((s.start, (at - 1).min(limit.saturating_sub(1)), s.size));
+                    }
+                    if s.end >= end_del && at < limit {
+                        raw.push((at, (s.end - n).min(limit.saturating_sub(1)), s.size));
                     }
                 }
             }
         } else {
             for s in self.spans.iter() {
                 if s.end < at {
-                    raw.push((s.start, s.end, s.size));
+                    if s.start < limit {
+                        raw.push((s.start, s.end.min(limit.saturating_sub(1)), s.size));
+                    }
                 } else if s.start >= at {
-                    raw.push((s.start.saturating_add(n), s.end.saturating_add(n), s.size));
+                    if let Some(nlo) = s.start.checked_add(n)
+                        && nlo < limit
+                    {
+                        let nhi = s.end.saturating_add(n).min(limit.saturating_sub(1));
+                        raw.push((nlo, nhi, s.size));
+                    }
                 } else {
-                    raw.push((s.start, at - 1, s.size));
-                    raw.push((at.saturating_add(n), s.end.saturating_add(n), s.size));
+                    if s.start < limit {
+                        raw.push((s.start, (at - 1).min(limit.saturating_sub(1)), s.size));
+                    }
+                    if let Some(nlo) = at.checked_add(n)
+                        && nlo < limit
+                    {
+                        let nhi = s.end.saturating_add(n).min(limit.saturating_sub(1));
+                        raw.push((nlo, nhi, s.size));
+                    }
                 }
             }
         }

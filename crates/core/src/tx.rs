@@ -622,6 +622,11 @@ pub enum TxDelta {
     CellBatch {
         deltas: Vec<CellDelta>,
         sheet_ids: Vec<(usize, u64)>,
+        rich: Vec<(
+            (u32, u32),
+            Option<Vec<crate::richtext::RichRun>>,
+            Option<Vec<crate::richtext::RichRun>>,
+        )>,
     },
 }
 
@@ -630,7 +635,8 @@ impl TxDelta {
     /// sparse shift, empty cell batch, empty metadata edit, or unchanged names).
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::SparseShift { deltas, .. } | Self::CellBatch { deltas, .. } => deltas.is_empty(),
+            Self::SparseShift { deltas, .. } => deltas.is_empty(),
+            Self::CellBatch { deltas, rich, .. } => deltas.is_empty() && rich.is_empty(),
             Self::Meta(edit) => edit.is_empty(),
             Self::DefinedNames { before, after } => before == after,
             Self::Structure(_)
@@ -1540,6 +1546,15 @@ impl WorkbookTx {
             }
         }
         let before = crate::undo::capture(&wb.sheets[sheet_idx], sheet_idx, &keys);
+        let mut before_rich: Vec<((u32, u32), Option<Vec<crate::richtext::RichRun>>)> = Vec::new();
+        if !wb.sheets[sheet_idx].rich.is_empty() {
+            let sh = &wb.sheets[sheet_idx];
+            for &pos in &keys {
+                if let Some(runs) = sh.rich.get(&pos) {
+                    before_rich.push((pos, Some(runs.clone())));
+                }
+            }
+        }
         {
             let sh = &mut wb.sheets[sheet_idx];
             for w in batch.writes {
@@ -1567,7 +1582,17 @@ impl WorkbookTx {
             }
         }
         let deltas = crate::undo::finish(before, &wb.sheets[sheet_idx]);
-        let has_changes = !deltas.is_empty();
+        let mut rich = Vec::new();
+        if !before_rich.is_empty() {
+            let sh = &wb.sheets[sheet_idx];
+            for (pos, prev) in before_rich {
+                let after = sh.rich.get(&pos).cloned();
+                if prev != after {
+                    rich.push((pos, prev, after));
+                }
+            }
+        }
+        let has_changes = !deltas.is_empty() || !rich.is_empty();
         if has_changes {
             wb.dirty = true;
         }
@@ -1594,6 +1619,7 @@ impl WorkbookTx {
             delta: TxDelta::CellBatch {
                 deltas: deltas.clone(),
                 sheet_ids,
+                rich,
             },
             effects: TxEffects {
                 recalc,

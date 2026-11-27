@@ -51,6 +51,14 @@ impl Default for Shift {
 }
 
 impl Shift {
+    #[inline]
+    pub fn axis_limit(&self) -> u32 {
+        match self.axis {
+            Axis::Row => crate::sync::MAX_ROWS,
+            Axis::Col => crate::sync::MAX_COLS,
+        }
+    }
+
     /// 区间平移：删除时区间会「收缩」而不是整体报废（A:C 删掉 A 列 → A:B）
     pub fn map_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
         let (a, b) = if a <= b { (a, b) } else { (b, a) };
@@ -77,6 +85,40 @@ impl Shift {
             return None;
         }
         Some((new_a, new_b))
+    }
+
+    /// Bounded coordinate map aligned with `CoordTransform::map_index` (`< MAX_ROWS` / `< MAX_COLS`).
+    pub fn map_bounded(&self, v: u32) -> Option<u32> {
+        let limit = self.axis_limit();
+        if v >= limit {
+            return None;
+        }
+        if self.delete {
+            if v < self.at {
+                Some(v)
+            } else if v < self.at.saturating_add(self.n) {
+                None
+            } else {
+                Some(v - self.n)
+            }
+        } else if v >= self.at {
+            v.checked_add(self.n).filter(|&nv| nv < limit)
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Bounded inclusive range map aligned with `CoordTransform::map_range` (`< MAX_ROWS` / `< MAX_COLS`).
+    pub fn map_range_bounded(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        let limit = self.axis_limit();
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        if b >= limit {
+            return None;
+        }
+        if !self.delete {
+            return Some((self.map_bounded(a)?, self.map_bounded(b)?));
+        }
+        self.map_range(a, b).filter(|&(_, hi)| hi < limit)
     }
 
     /// 一个下标平移到哪；None 表示落进被删的区间
@@ -117,6 +159,27 @@ impl MappedShift<'_> {
     pub fn map_range(&self, a: u32, b: u32) -> Option<(u32, u32)> {
         if self.insertions.is_empty() { return self.shift.map_range(a, b); }
         Some((self.map(a.min(b))?, self.map(a.max(b))?))
+    }
+
+    /// Bounded coordinate map aligned with `CoordTransform::map_index` (`< MAX_ROWS` / `< MAX_COLS`).
+    pub fn map_bounded(&self, pos: u32) -> Option<u32> {
+        if self.insertions.is_empty() {
+            return self.shift.map_bounded(pos);
+        }
+        let limit = self.shift.axis_limit();
+        if pos >= limit {
+            return None;
+        }
+        let delta = self.insertions.partition_point(|&at| at <= pos) as u32;
+        pos.checked_add(delta).filter(|&v| v < limit)
+    }
+
+    /// Bounded inclusive range map aligned with `CoordTransform::map_range` (`< MAX_ROWS` / `< MAX_COLS`).
+    pub fn map_range_bounded(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        if self.insertions.is_empty() {
+            return self.shift.map_range_bounded(a, b);
+        }
+        Some((self.map_bounded(a.min(b))?, self.map_bounded(a.max(b))?))
     }
     fn last_index(&self) -> u32 {
         match self.axis { Axis::Row => 1_048_575, Axis::Col => 16_383 }

@@ -54,9 +54,9 @@ fn shift_internal_link_location(
         }
         let (r, c) = crate::sparse::parse_ref(&format!("{col_str}{r_part}"))?;
         let (nr, nc) = if rows {
-            (shift.map(r)?, c)
+            (shift.map_bounded(r)?, c)
         } else {
-            (r, shift.map(c)?)
+            (r, shift.map_bounded(c)?)
         };
         let mut out = String::new();
         if col_abs {
@@ -111,17 +111,20 @@ impl Structural {
     }
 }
 
-fn shift_axis(v: u32, at: u32, n: u32, del: bool) -> Option<u32> {
+fn shift_axis(v: u32, at: u32, n: u32, del: bool, limit: u32) -> Option<u32> {
+    if v >= limit {
+        return None;
+    }
     if del {
         if v < at {
             Some(v)
-        } else if v < at + n {
+        } else if v < at.saturating_add(n) {
             None // 被删掉
         } else {
             Some(v - n)
         }
     } else if v >= at {
-        Some(v + n)
+        v.checked_add(n).filter(|&nv| nv < limit)
     } else {
         Some(v)
     }
@@ -201,13 +204,9 @@ impl Sheet {
                 self.merges = self
                     .merges
                     .iter()
-                    .map(|(r1, c1, r2, c2)| {
-                        (
-                            if *r1 >= *at { r1 + n } else { *r1 },
-                            *c1,
-                            if *r2 >= *at { r2 + n } else { *r2 },
-                            *c2,
-                        )
+                    .filter_map(|&(r1, c1, r2, c2)| {
+                        let (nr1, nr2) = shift.map_range_bounded(r1, r2)?;
+                        Some((nr1, c1, nr2, c2))
                     })
                     .collect();
                 self.shift_notes(&shift);
@@ -215,10 +214,14 @@ impl Sheet {
                 self.shift_dv(&shift);
                 self.shift_sparklines(&shift);
                 if let Some((r, c)) = self.freeze {
-                    let nr = if r > *at { r + *n } else { r };
+                    let nr = if r > *at {
+                        r.saturating_add(*n).min(crate::sync::MAX_ROWS - 1)
+                    } else {
+                        r
+                    };
                     self.freeze = Some((nr, c));
                 }
-                self.layout_dirty |= self.rows.shift_axis(*at, *n, false);
+                self.layout_dirty |= self.rows.shift_axis_bounded(*at, *n, false, crate::sync::MAX_ROWS);
                 self.shift_filter(&shift);
                 self.adjust_tables_for_row_insert(*at, *n);
                 self.shift_objects_and_page(&shift);
@@ -229,7 +232,7 @@ impl Sheet {
                     .merges
                     .iter()
                     .filter_map(|&(r1, c1, r2, c2)| {
-                        let (a, b) = shift.map_range(r1, r2)?;
+                        let (a, b) = shift.map_range_bounded(r1, r2)?;
                         (b > a || c2 > c1).then_some((a, c1, b, c2))
                     })
                     .collect();
@@ -238,10 +241,10 @@ impl Sheet {
                 self.shift_dv(&shift);
                 self.shift_sparklines(&shift);
                 if let Some((fr, fc)) = self.freeze {
-                    let nf = if fr >= *at + *n { fr - *n } else { (*at).min(fr) };
+                    let nf = if fr >= at.saturating_add(*n) { fr - *n } else { (*at).min(fr) };
                     self.freeze = Some((nf, fc));
                 }
-                self.layout_dirty |= self.rows.shift_axis(*at, *n, true);
+                self.layout_dirty |= self.rows.shift_axis_bounded(*at, *n, true, crate::sync::MAX_ROWS);
                 self.shift_filter(&shift);
                 self.shift_tables(&shift);
                 self.shift_objects_and_page(&shift);
@@ -251,13 +254,9 @@ impl Sheet {
                 self.merges = self
                     .merges
                     .iter()
-                    .map(|(r1, c1, r2, c2)| {
-                        (
-                            *r1,
-                            if *c1 >= *at { c1 + n } else { *c1 },
-                            *r2,
-                            if *c2 >= *at { c2 + n } else { *c2 },
-                        )
+                    .filter_map(|&(r1, c1, r2, c2)| {
+                        let (nc1, nc2) = shift.map_range_bounded(c1, c2)?;
+                        Some((r1, nc1, r2, nc2))
                     })
                     .collect();
                 self.shift_notes(&shift);
@@ -266,10 +265,10 @@ impl Sheet {
                 self.shift_sparklines(&shift);
                 if let Some((fr, fc)) = self.freeze {
                     if fc > *at {
-                        self.freeze = Some((fr, fc + *n));
+                        self.freeze = Some((fr, fc.saturating_add(*n).min(crate::sync::MAX_COLS - 1)));
                     }
                 }
-                self.layout_dirty |= self.cols.shift_axis(*at, *n, false);
+                self.layout_dirty |= self.cols.shift_axis_bounded(*at, *n, false, crate::sync::MAX_COLS);
                 self.shift_filter(&shift);
                 self.shift_tables(&shift);
                 self.shift_objects_and_page(&shift);
@@ -280,7 +279,7 @@ impl Sheet {
                     .merges
                     .iter()
                     .filter_map(|&(r1, c1, r2, c2)| {
-                        let (a, b) = shift.map_range(c1, c2)?;
+                        let (a, b) = shift.map_range_bounded(c1, c2)?;
                         (r2 > r1 || b > a).then_some((r1, a, r2, b))
                     })
                     .collect();
@@ -289,10 +288,10 @@ impl Sheet {
                 self.shift_dv(&shift);
                 self.shift_sparklines(&shift);
                 if let Some((fr, fc)) = self.freeze {
-                    let nf = if fc >= *at + *n { fc - *n } else { (*at).min(fc) };
+                    let nf = if fc >= at.saturating_add(*n) { fc - *n } else { (*at).min(fc) };
                     self.freeze = Some((fr, nf));
                 }
-                self.layout_dirty |= self.cols.shift_axis(*at, *n, true);
+                self.layout_dirty |= self.cols.shift_axis_bounded(*at, *n, true, crate::sync::MAX_COLS);
                 self.shift_filter(&shift);
                 self.shift_tables(&shift);
                 self.shift_objects_and_page(&shift);
@@ -355,9 +354,9 @@ impl Sheet {
                 .iter()
                 .filter_map(|key| {
                     let (r, c) = if rows {
-                        (shift.map(key.row)?, key.col)
+                        (shift.map_bounded(key.row)?, key.col)
                     } else {
-                        (key.row, shift.map(key.col)?)
+                        (key.row, shift.map_bounded(key.col)?)
                     };
                     Some(CellRef::new(r, c))
                 })
@@ -376,9 +375,9 @@ impl Sheet {
             let mut next_shapes = crate::model::CellMetadata::default();
             for (&anchor, &(h, w)) in &self.spill_shapes {
                 let mapped_anchor = if rows {
-                    shift.map(anchor.row).map(|r| CellRef::new(r, anchor.col))
+                    shift.map_bounded(anchor.row).map(|r| CellRef::new(r, anchor.col))
                 } else {
-                    shift.map(anchor.col).map(|c| CellRef::new(anchor.row, c))
+                    shift.map_bounded(anchor.col).map(|c| CellRef::new(anchor.row, c))
                 };
                 let Some(new_anchor) = mapped_anchor else {
                     if h > 0 && w > 0 {
@@ -388,10 +387,10 @@ impl Sheet {
                             c1.saturating_add(w.saturating_sub(1)),
                         );
                         if rows {
-                            if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                            if let Some((nr1, nr2)) = shift.map_range_bounded(r1, r2) {
                                 orphan_tails.push((nr1, c1, nr2, c2));
                             }
-                        } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+                        } else if let Some((nc1, nc2)) = shift.map_range_bounded(c1, c2) {
                             orphan_tails.push((r1, nc1, r2, nc2));
                         }
                     }
@@ -404,12 +403,12 @@ impl Sheet {
                 let span_intact = if rows {
                     let end = anchor.row.saturating_add(h.saturating_sub(1));
                     shift
-                        .map_range(anchor.row, end)
+                        .map_range_bounded(anchor.row, end)
                         .is_some_and(|(nr1, nr2)| nr1 == new_anchor.row && nr2 - nr1 + 1 == h)
                 } else {
                     let end = anchor.col.saturating_add(w.saturating_sub(1));
                     shift
-                        .map_range(anchor.col, end)
+                        .map_range_bounded(anchor.col, end)
                         .is_some_and(|(nc1, nc2)| nc1 == new_anchor.col && nc2 - nc1 + 1 == w)
                 };
                 if span_intact {
@@ -422,10 +421,10 @@ impl Sheet {
                         c1.saturating_add(w.saturating_sub(1)),
                     );
                     if rows {
-                        if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                        if let Some((nr1, nr2)) = shift.map_range_bounded(r1, r2) {
                             orphan_tails.push((nr1, c1, nr2, c2));
                         }
-                    } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+                    } else if let Some((nc1, nc2)) = shift.map_range_bounded(c1, c2) {
                         orphan_tails.push((r1, nc1, r2, nc2));
                     }
                     next_shapes.insert(new_anchor, (0, 0));
@@ -461,7 +460,7 @@ impl Sheet {
                     }
                     let (start, span) = if rows { (r, link.span.0) } else { (c, link.span.1) };
                     let end = start.saturating_add(span);
-                    let moved = shift.map_range(start, end);
+                    let moved = shift.map_range_bounded(start, end);
                     self.hyperlinks_dirty |= moved != Some((start, end));
                     let Some((first, last)) = moved else { continue };
                     let anchor = if rows {
@@ -482,12 +481,12 @@ impl Sheet {
                 .iter()
                 .filter_map(|&(anchor, (r1, c1, r2, c2))| {
                     if rows {
-                        let row = shift.map(anchor.row)?;
-                        let (r1, r2) = shift.map_range(r1, r2)?;
+                        let row = shift.map_bounded(anchor.row)?;
+                        let (r1, r2) = shift.map_range_bounded(r1, r2)?;
                         Some((CellRef::new(row, anchor.col), (r1, c1, r2, c2)))
                     } else {
-                        let col = shift.map(anchor.col)?;
-                        let (c1, c2) = shift.map_range(c1, c2)?;
+                        let col = shift.map_bounded(anchor.col)?;
+                        let (c1, c2) = shift.map_range_bounded(c1, c2)?;
                         Some((CellRef::new(anchor.row, col), (r1, c1, r2, c2)))
                     }
                 })
@@ -511,7 +510,12 @@ impl Sheet {
     }
 
     fn shift_cells(&mut self, rows: bool, at: u32, n: u32, delete: bool) {
-        self.remap_cell_axis(rows, at, |pos| shift_axis(pos, at, n, delete));
+        let limit = if rows {
+            crate::sync::MAX_ROWS
+        } else {
+            crate::sync::MAX_COLS
+        };
+        self.remap_cell_axis(rows, at, |pos| shift_axis(pos, at, n, delete, limit));
     }
 
     /// 把 [from, from+n) 这段整行移动到 `to`（`to` 是「删掉源行之后」的插入位置，
@@ -1356,14 +1360,22 @@ impl Sheet {
 
     fn adjust_tables_for_row_insert(&mut self, at: u32, n: u32) {
         let mut changed = false;
+        let max_row = crate::sync::MAX_ROWS - 1;
         for t in &mut self.tables {
             let (r1, _, r2, _) = t.range;
             if at <= r1 {
-                t.range.0 += n;
-                t.range.2 += n;
-                changed = true;
-            } else if at <= r2 + u32::from(!t.totals_row) {
-                t.range.2 += n;
+                if let (Some(nr1), Some(nr2)) = (
+                    r1.checked_add(n).filter(|&v| v <= max_row),
+                    r2.checked_add(n).filter(|&v| v <= max_row),
+                ) {
+                    t.range.0 = nr1;
+                    t.range.2 = nr2;
+                    changed = true;
+                }
+            } else if at <= r2.saturating_add(u32::from(!t.totals_row))
+                && let Some(nr2) = r2.checked_add(n).filter(|&v| v <= max_row)
+            {
+                t.range.2 = nr2;
                 changed = true;
             }
         }
@@ -1402,29 +1414,40 @@ impl Sheet {
     fn insert_mapped_rows_inner(&mut self, shift: &MappedShift, move_cells: bool) {
         let orphans = self.shift_array_and_hyperlink_ranges(shift);
         if move_cells {
-            self.remap_cell_axis(true, shift.at, |row| shift.map(row));
+            self.remap_cell_axis(true, shift.at, |row| shift.map_bounded(row));
         }
         self.clear_orphan_spill_tails(&orphans);
-        for (r1, _, r2, _) in &mut self.merges {
-            *r1 = shift.map(*r1).unwrap();
-            *r2 = shift.map(*r2).unwrap();
-        }
+        self.merges = self
+            .merges
+            .iter()
+            .filter_map(|&(r1, c1, r2, c2)| {
+                let (nr1, nr2) = shift.map_range_bounded(r1, r2)?;
+                Some((nr1, c1, nr2, c2))
+            })
+            .collect();
         self.shift_notes(shift);
         self.shift_cf(shift);
         self.shift_dv(shift);
         self.shift_sparklines(shift);
         if let Some((r, c)) = self.freeze {
+            let max_row = crate::sync::MAX_ROWS - 1;
             let nr = if shift.insertions.is_empty() {
-                if r > shift.at { r + shift.n } else { r }
+                if r > shift.at {
+                    r.saturating_add(shift.n).min(max_row)
+                } else {
+                    r
+                }
             } else {
-                r + shift.insertions.partition_point(|&at| at < r) as u32
+                r.saturating_add(shift.insertions.partition_point(|&at| at < r) as u32)
+                    .min(max_row)
             };
             self.freeze = Some((nr, c));
         }
         self.layout_dirty |= if shift.insertions.is_empty() {
-            self.rows.shift_axis(shift.at, shift.n, shift.delete)
+            self.rows
+                .shift_axis_bounded(shift.at, shift.n, shift.delete, crate::sync::MAX_ROWS)
         } else {
-            self.rows.remap_indices(|r| shift.map(r))
+            self.rows.remap_indices(|r| shift.map_bounded(r))
         };
         self.shift_filter(shift);
         self.shift_objects_and_page(shift);
@@ -1452,7 +1475,7 @@ impl Sheet {
             .merges
             .iter()
             .filter_map(|&(r1, c1, r2, c2)| {
-                let (a, b) = shift.map_range(r1, r2)?;
+                let (a, b) = shift.map_range_bounded(r1, r2)?;
                 (b > a || c2 > c1).then_some((a, c1, b, c2))
             })
             .collect();
@@ -1461,10 +1484,12 @@ impl Sheet {
         self.shift_dv(&shift);
         self.shift_sparklines(&shift);
         if let Some((fr, fc)) = self.freeze {
-            let nf = if fr >= at + n { fr - n } else { at.min(fr) };
+            let nf = if fr >= at.saturating_add(n) { fr - n } else { at.min(fr) };
             self.freeze = Some((nf, fc));
         }
-        self.layout_dirty |= self.rows.shift_axis(at, n, true);
+        self.layout_dirty |= self
+            .rows
+            .shift_axis_bounded(at, n, true, crate::sync::MAX_ROWS);
         self.shift_filter(&shift);
         self.shift_tables(&shift);
         self.shift_objects_and_page(&shift);
@@ -1491,10 +1516,9 @@ impl Sheet {
         self.merges = self
             .merges
             .iter()
-            .map(|(r1, c1, r2, c2)| {
-                let nc1 = if *c1 >= at { c1 + n } else { *c1 };
-                let nc2 = if *c2 >= at { c2 + n } else { *c2 };
-                (*r1, nc1, *r2, nc2)
+            .filter_map(|&(r1, c1, r2, c2)| {
+                let (nc1, nc2) = shift.map_range_bounded(c1, c2)?;
+                Some((r1, nc1, r2, nc2))
             })
             .collect();
         self.shift_notes(&shift);
@@ -1503,10 +1527,12 @@ impl Sheet {
         self.shift_sparklines(&shift);
         if let Some((fr, fc)) = self.freeze {
             if fc > at {
-                self.freeze = Some((fr, fc + n));
+                self.freeze = Some((fr, fc.saturating_add(n).min(crate::sync::MAX_COLS - 1)));
             }
         }
-        self.layout_dirty |= self.cols.shift_axis(at, n, false);
+        self.layout_dirty |= self
+            .cols
+            .shift_axis_bounded(at, n, false, crate::sync::MAX_COLS);
         self.shift_filter(&shift);
         self.shift_tables(&shift);
         self.shift_objects_and_page(&shift);
@@ -1534,7 +1560,7 @@ impl Sheet {
             .merges
             .iter()
             .filter_map(|&(r1, c1, r2, c2)| {
-                let (a, b) = shift.map_range(c1, c2)?;
+                let (a, b) = shift.map_range_bounded(c1, c2)?;
                 (r2 > r1 || b > a).then_some((r1, a, r2, b))
             })
             .collect();
@@ -1543,10 +1569,12 @@ impl Sheet {
         self.shift_dv(&shift);
         self.shift_sparklines(&shift);
         if let Some((fr, fc)) = self.freeze {
-            let nf = if fc >= at + n { fc - n } else { at.min(fc) };
+            let nf = if fc >= at.saturating_add(n) { fc - n } else { at.min(fc) };
             self.freeze = Some((fr, nf));
         }
-        self.layout_dirty |= self.cols.shift_axis(at, n, true);
+        self.layout_dirty |= self
+            .cols
+            .shift_axis_bounded(at, n, true, crate::sync::MAX_COLS);
         self.shift_filter(&shift);
         self.shift_tables(&shift);
         self.shift_objects_and_page(&shift);
@@ -1569,7 +1597,7 @@ impl Sheet {
                 self.layout_dirty = true;
                 return;
             }
-            if let Some(moved) = shift.map_range(f.range.0, f.range.2) {
+            if let Some(moved) = shift.map_range_bounded(f.range.0, f.range.2) {
                 if (f.range.0, f.range.2) != moved {
                     (f.range.0, f.range.2) = moved;
                     self.filter_dirty = true;
@@ -1580,7 +1608,7 @@ impl Sheet {
                 self.filter_dirty = true;
                 self.layout_dirty = true;
             }
-        } else if let Some(moved) = shift.map_range(f.range.1, f.range.3) {
+        } else if let Some(moved) = shift.map_range_bounded(f.range.1, f.range.3) {
             if (f.range.1, f.range.3) != moved {
                 (f.range.1, f.range.3) = moved;
                 self.filter_dirty = true;
@@ -1588,42 +1616,42 @@ impl Sheet {
             if !f.allows.is_empty() {
                 f.allows = std::mem::take(&mut f.allows)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
             if !f.criteria.is_empty() {
                 f.criteria = std::mem::take(&mut f.criteria)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
             if !f.date_groups.is_empty() {
                 f.date_groups = std::mem::take(&mut f.date_groups)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
             if !f.color_filters.is_empty() {
                 f.color_filters = std::mem::take(&mut f.color_filters)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
             if !f.top_filters.is_empty() {
                 f.top_filters = std::mem::take(&mut f.top_filters)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
             if !f.dynamic_filters.is_empty() {
                 f.dynamic_filters = std::mem::take(&mut f.dynamic_filters)
                     .into_iter()
-                    .filter_map(|(c, v)| Some((shift.map(c)?, v)))
+                    .filter_map(|(c, v)| Some((shift.map_bounded(c)?, v)))
                     .collect();
                 self.filter_dirty = true;
             }
@@ -1640,11 +1668,12 @@ impl Sheet {
             return;
         }
         let rows = shift.axis == crate::refs::Axis::Row;
+        let max_col = crate::sync::MAX_COLS - 1;
         let mut changed = false;
         self.tables.retain_mut(|t| {
             let (r1, c1, r2, c2) = t.range;
             if rows {
-                if let Some((nr1, nr2)) = shift.map_range(r1, r2) {
+                if let Some((nr1, nr2)) = shift.map_range_bounded(r1, r2) {
                     if (nr1, nr2) != (r1, r2) {
                         t.range.0 = nr1;
                         t.range.2 = nr2;
@@ -1657,12 +1686,19 @@ impl Sheet {
                 }
             } else if !shift.delete {
                 if shift.at <= c1 {
-                    t.range.1 += shift.n;
-                    t.range.3 += shift.n;
-                    changed = true;
-                } else if shift.at <= c2 {
+                    if let (Some(nc1), Some(nc2)) = (
+                        c1.checked_add(shift.n).filter(|&v| v <= max_col),
+                        c2.checked_add(shift.n).filter(|&v| v <= max_col),
+                    ) {
+                        t.range.1 = nc1;
+                        t.range.3 = nc2;
+                        changed = true;
+                    }
+                } else if shift.at <= c2
+                    && let Some(nc2) = c2.checked_add(shift.n).filter(|&v| v <= max_col)
+                {
                     let insert_pos = (shift.at - c1) as usize;
-                    t.range.3 += shift.n;
+                    t.range.3 = nc2;
                     for k in 0..shift.n {
                         let name = format!("列{}", t.columns.len() + 1);
                         let at = (insert_pos + k as usize).min(t.columns.len());
@@ -1671,7 +1707,7 @@ impl Sheet {
                     changed = true;
                 }
                 true
-            } else if let Some((nc1, nc2)) = shift.map_range(c1, c2) {
+            } else if let Some((nc1, nc2)) = shift.map_range_bounded(c1, c2) {
                 let del_lo = shift.at;
                 let del_hi = shift.at.saturating_add(shift.n);
                 let mut new_cols = Vec::with_capacity(t.columns.len());
@@ -1703,13 +1739,14 @@ impl Sheet {
             return;
         }
         let rows = shift.axis == crate::refs::Axis::Row;
+        let max_idx = shift.axis_limit() - 1;
         let map_anchor_point = |v: u32| -> u32 {
-            if let Some(m) = shift.map(v) {
+            if let Some(m) = shift.map_bounded(v) {
                 m
             } else if shift.delete {
-                shift.at
+                shift.at.min(max_idx)
             } else {
-                v
+                v.min(max_idx)
             }
         };
         if !self.pictures.is_empty() {
@@ -1781,9 +1818,9 @@ impl Sheet {
         let mut page_changed = false;
         if let Some((r1, c1, r2, c2)) = self.page.print_area {
             let next = if rows {
-                shift.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2))
+                shift.map_range_bounded(r1, r2).map(|(a, b)| (a, c1, b, c2))
             } else {
-                shift.map_range(c1, c2).map(|(a, b)| (r1, a, r2, b))
+                shift.map_range_bounded(c1, c2).map(|(a, b)| (r1, a, r2, b))
             };
             if next != self.page.print_area {
                 self.page.print_area = next;
@@ -1792,7 +1829,7 @@ impl Sheet {
         }
         if rows {
             if let Some((a, b)) = self.page.title_rows {
-                let next = shift.map_range(a, b);
+                let next = shift.map_range_bounded(a, b);
                 if next != self.page.title_rows {
                     self.page.title_rows = next;
                     page_changed = true;
@@ -1803,7 +1840,7 @@ impl Sheet {
                     .page
                     .row_breaks
                     .iter()
-                    .filter_map(|&b| shift.map(b))
+                    .filter_map(|&b| shift.map_bounded(b))
                     .filter(|&b| b > 0)
                     .collect();
                 if next != self.page.row_breaks {
@@ -1815,7 +1852,7 @@ impl Sheet {
             }
         } else {
             if let Some((a, b)) = self.page.title_cols {
-                let next = shift.map_range(a, b);
+                let next = shift.map_range_bounded(a, b);
                 if next != self.page.title_cols {
                     self.page.title_cols = next;
                     page_changed = true;
@@ -1826,7 +1863,7 @@ impl Sheet {
                     .page
                     .col_breaks
                     .iter()
-                    .filter_map(|&b| shift.map(b))
+                    .filter_map(|&b| shift.map_bounded(b))
                     .filter(|&b| b > 0)
                     .collect();
                 if next != self.page.col_breaks {
@@ -1845,9 +1882,9 @@ impl Sheet {
             let mut out = std::collections::HashMap::with_capacity(old.len());
             for ((r, c), runs) in old {
                 let mapped = if rows {
-                    shift.map(r).map(|nr| (nr, c))
+                    shift.map_bounded(r).map(|nr| (nr, c))
                 } else {
-                    shift.map(c).map(|nc| (r, nc))
+                    shift.map_bounded(c).map(|nc| (r, nc))
                 };
                 if let Some(nk) = mapped {
                     if nk != (r, c) {
@@ -1867,9 +1904,9 @@ impl Sheet {
             let mut out = HashSet::with_capacity(old.len());
             for (r, c) in old {
                 let mapped = if rows {
-                    shift.map(r).map(|nr| (nr, c))
+                    shift.map_bounded(r).map(|nr| (nr, c))
                 } else {
-                    shift.map(c).map(|nc| (r, nc))
+                    shift.map_bounded(c).map(|nc| (r, nc))
                 };
                 if let Some(nk) = mapped {
                     if nk != (r, c) {
@@ -1889,9 +1926,9 @@ impl Sheet {
                 let mut next_sq = Vec::with_capacity(pr.sqref.len());
                 for &(r1, c1, r2, c2) in &pr.sqref {
                     let mapped = if rows {
-                        shift.map_range(r1, r2).map(|(nr1, nr2)| (nr1, c1, nr2, c2))
+                        shift.map_range_bounded(r1, r2).map(|(nr1, nr2)| (nr1, c1, nr2, c2))
                     } else {
-                        shift.map_range(c1, c2).map(|(nc1, nc2)| (r1, nc1, r2, nc2))
+                        shift.map_range_bounded(c1, c2).map(|(nc1, nc2)| (r1, nc1, r2, nc2))
                     };
                     if let Some(m) = mapped {
                         if m != (r1, c1, r2, c2) {
@@ -1912,6 +1949,7 @@ impl Sheet {
     fn shift_axis_metadata(&mut self, shift: &MappedShift) {
         let rows = shift.axis == crate::refs::Axis::Row;
         if shift.n == 0 { return; }
+        let limit = shift.axis_limit();
         let min_at = if shift.insertions.is_empty() {
             shift.at
         } else {
@@ -1921,9 +1959,9 @@ impl Sheet {
         let mut move_hidden = |hidden: &mut crate::layout::HiddenIndices| {
             if !hidden.is_empty() {
                 let changed = if shift.insertions.is_empty() {
-                    hidden.shift_axis(shift.at, shift.n, shift.delete)
+                    hidden.shift_axis_bounded(shift.at, shift.n, shift.delete, limit)
                 } else {
-                    hidden.remap_insertions(|pos| shift.map(pos))
+                    hidden.remap_insertions(|pos| shift.map_bounded(pos))
                 };
                 self.layout_dirty |= changed;
             }
@@ -1938,7 +1976,7 @@ impl Sheet {
         if !levels.is_empty() && levels.keys().any(|&pos| pos >= min_at) {
             *levels = std::mem::take(levels)
                 .into_iter()
-                .filter_map(|(pos, level)| Some((shift.map(pos)?, level)))
+                .filter_map(|(pos, level)| Some((shift.map_bounded(pos)?, level)))
                 .collect();
             self.layout_dirty = true;
         }
@@ -1949,7 +1987,7 @@ impl Sheet {
         let old = std::mem::take(map);
         let mut out = std::collections::HashMap::with_capacity(old.len());
         for (idx, st) in old {
-            if let Some(nidx) = shift.map(idx) {
+            if let Some(nidx) = shift.map_bounded(idx) {
                 out.insert(nidx, st);
             }
         }
@@ -1984,7 +2022,7 @@ impl Sheet {
             self.notes_dirty = true;
             for (k, mut v) in old {
                 let pos = if rows { k.row } else { k.col };
-                if let Some(np) = shift.map(pos) {
+                if let Some(np) = shift.map_bounded(pos) {
                     let key = if rows {
                         CellRef::new(np, k.col)
                     } else {
@@ -2008,7 +2046,7 @@ impl Sheet {
             self.threads_dirty = true;
             for (k, mut v) in old {
                 let pos = if rows { k.row } else { k.col };
-                if let Some(np) = shift.map(pos) {
+                if let Some(np) = shift.map_bounded(pos) {
                     let key = if rows {
                         CellRef::new(np, k.col)
                     } else {
@@ -2034,7 +2072,7 @@ impl Sheet {
         let mut out = Vec::with_capacity(old.len());
         for mut sp in old {
             let anchor = if rows { sp.r } else { sp.c };
-            let Some(na) = shift.map(anchor) else {
+            let Some(na) = shift.map_bounded(anchor) else {
                 continue;
             };
             if rows {
@@ -2045,12 +2083,12 @@ impl Sheet {
             if sp.source_sheet.is_none() {
                 let (r1, c1, r2, c2) = sp.rect;
                 if rows {
-                    let Some((nr1, nr2)) = shift.map_range(r1, r2) else {
+                    let Some((nr1, nr2)) = shift.map_range_bounded(r1, r2) else {
                         continue;
                     };
                     sp.rect = (nr1, c1, nr2, c2);
                 } else {
-                    let Some((nc1, nc2)) = shift.map_range(c1, c2) else {
+                    let Some((nc1, nc2)) = shift.map_range_bounded(c1, c2) else {
                         continue;
                     };
                     sp.rect = (r1, nc1, r2, nc2);
@@ -2083,7 +2121,7 @@ fn shift_rule_ranges(ranges: &mut Vec<(u32, u32, u32, u32)>, shift: &MappedShift
         };
         // A rule covering entire columns/rows continues to cover the entire axis.
         if *first == 0 && *last == limit { return true; }
-        let Some((a, b)) = shift.map_range(*first, *last) else {
+        let Some((a, b)) = shift.map_range_bounded(*first, *last) else {
             return false;
         };
         *first = a;
@@ -2343,10 +2381,13 @@ pub fn apply_cell_shift_wb(
 }
 
 pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op: &Structural) {
+    let tx = crate::transform::CoordTransform::from_structural(sheet_idx, op);
+    if tx.is_noop() || tx.preflight(wb).is_err() {
+        return;
+    }
     let Some(sheet) = wb.sheets.get_mut(sheet_idx) else { return; };
     sheet.apply_structural(op);
-    crate::transform::CoordTransform::from_structural(sheet_idx, op)
-        .apply_workbook_references(wb);
+    tx.apply_workbook_references(wb);
 }
 
 /// 整工作簿级行移动：先在目标表执行无损行置换，再通过统一 `CoordTransform` 调度器同步
@@ -2374,6 +2415,16 @@ pub fn move_cols_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32
 /// row, so defer only the grand total insertion when a table intersects the edit.
 pub(crate) fn insert_subtotal_rows(wb: &mut crate::model::Workbook, sheet_idx: usize, positions: &[u32]) {
     let Some(&at) = positions.first() else { return };
+    if crate::transform::CoordTransform::from_multi_insert(
+        sheet_idx,
+        crate::refs::Axis::Row,
+        positions.to_vec(),
+    )
+    .preflight(wb)
+    .is_err()
+    {
+        return;
+    }
     if positions.len() == 1 {
         apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at, n: 1 });
         return;
@@ -2402,11 +2453,13 @@ pub(crate) fn insert_subtotal_rows(wb: &mut crate::model::Workbook, sheet_idx: u
         let map = MappedShift { shift: &shift, insertions: grouped };
         let sheet = &mut wb.sheets[sheet_idx];
         sheet.insert_mapped_rows(&map);
+        let max_row = crate::sync::MAX_ROWS - 1;
         for table in &mut sheet.tables {
             let (r1, _, r2, _) = table.range;
-            let first = map.map(r1).unwrap();
+            let Some(first) = map.map_bounded(r1) else { continue };
             // With no totals row, inserting immediately after the table expands it.
-            let end = r2 + grouped.partition_point(|&r| r <= r2 + u32::from(!table.totals_row)) as u32;
+            let added = grouped.partition_point(|&r| r <= r2.saturating_add(u32::from(!table.totals_row))) as u32;
+            let Some(end) = r2.checked_add(added).filter(|&v| v <= max_row) else { continue };
             sheet.tables_dirty |= (first, end) != (r1, r2);
             (table.range.0, table.range.2) = (first, end);
         }
