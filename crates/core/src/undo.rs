@@ -327,6 +327,7 @@ const HISTORY_PAYLOAD_BUDGET: usize = 256 * 1024 * 1024;
 static NEXT_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 struct EntryStamp {
+    link_source: Option<Box<crate::external::Source>>,
     move_refs: Option<Box<MoveReferences>>,
     sort_created: Option<u64>,
     sort_replay: Option<(u64, bool, Option<u64>)>,
@@ -335,7 +336,25 @@ struct EntryStamp {
 }
 
 fn next_entry(payload_bytes: usize) -> EntryStamp {
-    EntryStamp { move_refs: None, sort_created: None, sort_replay: None, id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
+    EntryStamp { link_source: None, move_refs: None, sort_created: None, sort_replay: None, id: NEXT_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed), payload_bytes }
+}
+
+impl EntryStamp {
+    fn link_matches(&self, wb: &Workbook, redo: bool) -> bool {
+        self.link_source.as_deref().is_none_or(|src| {
+            wb.sources.iter().find(|s| s.name == src.name) == if redo { None } else { Some(src) }
+        })
+    }
+
+    fn replay_link(&self, wb: &mut Workbook, redo: bool) {
+        if let Some(src) = self.link_source.as_deref() {
+            if redo {
+                wb.sources.push(src.clone());
+            } else {
+                wb.sources.retain(|s| s.name != src.name);
+            }
+        }
+    }
 }
 
 pub(crate) fn cell_heap_bytes(cell: &Cell) -> usize {
@@ -1254,6 +1273,7 @@ impl Entry {
     }
 
     fn simple_cells(&self) -> Option<Box<dyn Iterator<Item = (usize, u32, u32)> + '_>> {
+        if self.stamp().link_source.is_some() { return None; }
         if self.stamp().move_refs.is_some() { return None; }
         match self {
             Self::Cells(_, a, _, None, None) if a.snap_before.is_none() && a.snap_after.is_none()
@@ -2938,6 +2958,22 @@ impl UndoStack {
         }
     }
 
+    /// Register the binding in the same history entry as its imported cells.
+    /// Identical formulas can still create a new binding with no cell deltas.
+    pub fn record_link_registration(&mut self, prior: Option<u64>, focus: (usize, u32, u32), source: crate::external::Source) {
+        if self.top_undo_id() == prior {
+            let action = Action {
+                label: "从另一张表取数".into(), deltas: Vec::new(), focus, by_site: self.site,
+                snap_before: None, snap_after: None, shapes: None, pictures: None, merges: None, refresh_sizes: None,
+            };
+            self.done.push(Entry::Cells(next_entry(0), action, None, None, None));
+        }
+        let stamp = self.done.last_mut().unwrap().stamp_mut();
+        stamp.payload_bytes += size_of::<crate::external::Source>() + source.to_name_text().len();
+        stamp.link_source = Some(Box::new(source));
+        self.trim_history(HISTORY_PAYLOAD_BUDGET);
+    }
+
     pub fn push_prepared(&mut self, PreparedAction(action, bytes): PreparedAction) {
         if action.is_empty() {
             return;
@@ -3497,11 +3533,17 @@ impl UndoStack {
                     }
                 }
             }
+            if !self.done.last()?.stamp().link_matches(wb, false) { return None; }
             let entry = self.done.last()?;
             if !entry.can_replay_move(wb, false, &mut guard) { return None; }
             let entry_id = entry.id();
             let result = self.undo(&mut wb.sheets, guard)?;
             if let Some(entry) = self.undone.last_mut().filter(|e| e.id() == entry_id) {
+                if result.skipped == 0 && !result.merge_conflict {
+                    entry.stamp().replay_link(wb, false);
+                } else {
+                    entry.stamp_mut().link_source = None;
+                }
                 if !result.merge_conflict && let Some(refs) = &mut entry.stamp_mut().move_refs {
                     self.last_needs_recalc |= refs.replay(wb, false);
                 }
@@ -3547,11 +3589,17 @@ impl UndoStack {
                     }
                 }
             }
+            if !self.undone.last()?.stamp().link_matches(wb, true) { return None; }
             let entry = self.undone.last()?;
             if !entry.can_replay_move(wb, true, &mut guard) { return None; }
             let entry_id = entry.id();
             let result = self.redo(&mut wb.sheets, guard)?;
             if let Some(entry) = self.done.last_mut().filter(|e| e.id() == entry_id) {
+                if result.skipped == 0 && !result.merge_conflict {
+                    entry.stamp().replay_link(wb, true);
+                } else {
+                    entry.stamp_mut().link_source = None;
+                }
                 if !result.merge_conflict && let Some(refs) = &mut entry.stamp_mut().move_refs {
                     self.last_needs_recalc |= refs.replay(wb, true);
                 }
@@ -3768,7 +3816,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays, notes)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() || id.link_source.is_some() { self.undone.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 
@@ -3956,7 +4004,7 @@ impl UndoStack {
             merge_conflict: false,
             total_touched,
         };
-        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays, notes)); }
+        if !action.is_empty() || arrays.is_some() || notes.is_some() || id.move_refs.is_some() || id.link_source.is_some() { self.done.push(Entry::Cells(id, action, permutation, arrays, notes)); }
         Some(applied)
     }
 

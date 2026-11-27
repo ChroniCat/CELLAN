@@ -1235,7 +1235,7 @@ struct SheetApp {
     /// 右侧批注管理侧边栏与财务常用语模板状态
     comments_panel: comments_panel::CommentsPanelState,
     /// 跨表取数对话框：输入文本
-    link_dlg: Option<String>,
+    link_dlg: Option<(sheet_edit_target::SheetEditTarget, String)>,
     /// 运行宏对话框：宏名
     macro_run_dlg: Option<String>,
     macro_run_rx: Option<std::sync::mpsc::Receiver<String>>,
@@ -30055,9 +30055,14 @@ impl SheetApp {
     /// 从另一张表取数：输入 "表名!A1:C10"，结果贴到当前选区左上角，
     /// 并登记成可刷新的数据源
     fn link_dialog(&mut self, ctx: &egui::Context) {
-        let Some(mut text) = self.link_dlg.take() else { return };
+        let Some((target, mut text)) = self.link_dlg.take() else { return };
+        if !target.valid(self) {
+            self.status = "目标工作表已改变，请重新取数".into();
+            return;
+        }
         let mut open = true;
         let mut apply = false;
+        let mut cancel = false;
         ui_kit::window(ctx, "从另一张表取数", 320.0)
             .collapsible(false)
             .resizable(false)
@@ -30075,64 +30080,17 @@ impl SheetApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui_kit::secondary_button(ui, "取消").clicked() {
-                            ui.close_menu();
-                        }
-                        if ui_kit::primary_button(ui, "确定").clicked() {
+                        cancel = ui_kit::secondary_button(ui, "取消").clicked();
+                    if ui_kit::primary_button(ui, "确定").clicked() {
                             apply = true;
                         }
                     });
                 });
             });
         if apply {
-            let spec = text.trim().to_string();
-            if let Some((sheet_name, range)) = spec.split_once('!') {
-                if let (Some(r1c1), Some(r2c2)) = (
-                    sheetcore::sparse::parse_ref(range.split(':').next().unwrap_or("A1")),
-                    sheetcore::sparse::parse_ref(range.split(':').nth(1).unwrap_or(range)),
-                ) {
-                    let rect = (r1c1.0, r1c1.1, r2c2.0, r2c2.1);
-                    let at = self.sel;
-                    let n = self.wb.sources.len() + 1;
-                    let idx = self.sheet_idx;
-                    let src = sheetcore::external::Source {
-                        name: format!("_sc_src_{n}"),
-                        kind: sheetcore::external::Kind::Internal {
-                            sheet: sheet_name.trim().to_string(),
-                            rect,
-                        },
-                        at,
-                        target_sheet: Some(self.wb.sheet(idx).name.clone()),
-                        rows: 0,
-                        cols: 0,
-                        csv_opts: None,
-                    };
-                    match sheetcore::external::refresh(&mut self.wb, idx, &src) {
-                        Ok((rows, cols)) => {
-                            self.wb.sources.push(sheetcore::external::Source {
-                                rows,
-                                cols,
-                                ..src
-                            });
-                            self.wb.dirty = true;
-                            self.doc_gen = self.doc_gen.wrapping_add(1);
-                            self.status = format!(
-                                "已从 {} 取数 {} 行 × {} 列（可刷新）",
-                                sheet_name.trim(), rows, cols
-                            );
-                        }
-                        Err(e) => self.status = format!("取数失败：{e}"),
-                    }
-                } else {
-                    self.status = "区间写法看不懂，像 A1:C10".into();
-                }
-            } else {
-                self.status = "格式要写成 表名!A1:C10".into();
-            }
-            return;
-        }
-        if open && !apply {
-            self.link_dlg = Some(text);
+            self.start_sheet_link(&text, target);
+        } else if open && !cancel {
+            self.link_dlg = Some((target, text));
         }
     }
 
@@ -48928,6 +48886,7 @@ impl eframe::App for SheetApp {
             || self.tab_close_confirm.is_some()
             || self.show_load_diag
             || self.xlink_dlg
+            || self.link_dlg.is_some()
             || self.shift_cells_dlg.is_some()
             || self.eval_formula_dlg.is_some()
             || self.cross_trace_popup.is_some()
@@ -49352,6 +49311,7 @@ impl eframe::App for SheetApp {
         }
         self.dv_dialog(ctx);
         self.xlink_dialog(ctx);
+        self.link_dialog(ctx);
         self.fn_wizard_dialog(ctx);
         self.revision_panel(ctx);
         self.draw_audit_dialogs(ctx);

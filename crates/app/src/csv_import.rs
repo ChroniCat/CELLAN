@@ -260,12 +260,14 @@ enum Input {
         parsed: Option<ParsedCsv>,
     },
     Refresh,
+    Link(Source),
 }
 
 pub(super) struct PendingImport {
     target: Target,
     path: Option<PathBuf>,
     refreshing: bool,
+    linking: bool,
     sources: Vec<Source>,
     worker: Worker<PreparedImport>,
 }
@@ -388,6 +390,7 @@ fn prepare(
     };
     let mut refresh_sizes = None;
     let mut registration = None;
+    let linking = matches!(&input, Input::Link(_));
     let (label, status) = match input {
         Input::Import {
             path,
@@ -490,7 +493,10 @@ fn prepare(
             });
             ("导入 CSV", format!("已导入 {} 行 × {} 列", size.0, size.1))
         }
-        Input::Refresh => {
+        Input::Refresh | Input::Link(_) => {
+            if let Input::Link(source) = input {
+                sources = vec![source];
+            }
             let old_sizes = sizes(&sources);
             let mut matched = 0usize;
             let mut ok = 0;
@@ -620,13 +626,15 @@ fn prepare(
                 .zip(sizes(&sources))
                 .filter(|(before, after)| before != after)
                 .unzip();
-            if !before_sizes.is_empty() {
+            if !linking && !before_sizes.is_empty() {
                 refresh_sizes = Some((before_sizes, after_sizes));
             }
             // Multiple sources may have written one cell. Its undo baseline is the original workbook.
             (
-                "刷新外部数据",
-                if failures.is_empty() {
+                if linking { "从另一张表取数" } else { "刷新外部数据" },
+                if linking {
+                    format!("已取数 {} 行 × {} 列（可刷新）", sources[0].rows, sources[0].cols)
+                } else if failures.is_empty() {
                     format!("已刷新 {ok} 个数据源")
                 } else {
                     format!(
@@ -788,12 +796,14 @@ impl SheetApp {
         self.csv_dlg = None;
         let before = before.unwrap_or_else(|| self.wb.sheet(target.sheet).reorder_snapshot());
         let refreshing = matches!(&input, Input::Refresh);
-        let internal = if refreshing {
+        let link = if let Input::Link(src) = &input { Some(src) } else { None };
+        let linking = link.is_some();
+        let internal = if refreshing || linking {
             self.wb
                 .sheets
                 .iter()
                 .filter(|s| {
-                    s.identity != before.identity && self.wb.sources.iter().any(|src|
+                    s.identity != before.identity && link.into_iter().chain(self.wb.sources.iter().filter(|_| refreshing)).any(|src|
                 matches!(&src.kind, Kind::Internal { sheet, .. } if sheet == &s.name))
                 })
                 .map(Sheet::search_snapshot)
@@ -815,6 +825,7 @@ impl SheetApp {
             target,
             path,
             refreshing,
+            linking,
             sources,
             worker: Worker::start(move |cancel| {
                 prepare(
@@ -878,6 +889,25 @@ impl SheetApp {
         );
     }
 
+    pub(super) fn start_sheet_link(&mut self, spec: &str, target: Target) {
+        let Some((Some(name), rect)) = sheetcore::sparkline::parse_ref(spec) else {
+            self.status = "请输入有效的工作表及区域，例如 销售!A1:C10".into();
+            return;
+        };
+        let Some(sheet) = self.wb.sheets.iter().find(|s| s.name.eq_ignore_ascii_case(&name)) else {
+            self.status = format!("找不到来源表 {name}");
+            return;
+        };
+        if !target.valid(self) { self.status = "目标工作表已改变，请重新取数".into(); return; }
+        let source = Source {
+            name: String::new(),
+            kind: Kind::Internal { sheet: sheet.name.clone(), rect },
+            at: target.at, target_sheet: Some(self.wb.sheet(target.sheet).name.clone()),
+            rows: 0, cols: 0, csv_opts: None,
+        };
+        self.start_import(Input::Link(source), target);
+    }
+
     pub(super) fn refresh_import(&mut self) {
         if !self.wb.sources.is_empty() {
             self.start_import(Input::Refresh, Target::current(self, self.sel));
@@ -923,6 +953,7 @@ impl SheetApp {
             return;
         };
         let idx = job.target.sheet;
+        let linking = job.linking;
         self.csv_job = None;
         let mut update = match outcome {
             Ok(update) => update,
@@ -935,7 +966,13 @@ impl SheetApp {
         let whole_snapshot_matches = live.matches_reorder_source(&update.before);
         let source_changed = update.sources.iter().any(|source| {
             let Kind::Internal { sheet, rect } = &source.kind else { return false };
-            let Some(before) = update.internal.iter().find(|s| &s.name == sheet) else { return false };
+            let before = if *sheet == update.before.name {
+                &update.before
+            } else if let Some(source_sheet) = update.internal.iter().find(|s| &s.name == sheet) {
+                source_sheet
+            } else {
+                return false;
+            };
             !self.wb.sheets.iter().any(|s| s.identity == before.identity && s.name == before.name
                 && s.coordinate_revision() == before.coordinate_revision()
                 && s.same_cells_in(before, &[*rect], false))
@@ -985,7 +1022,17 @@ impl SheetApp {
             }
         }
         live.take_row_changes(&mut update.result);
-        if let Some(registration) = update.registration {
+        let prior = self.undo.top_undo_id();
+        let mut registered_link = None;
+        if linking {
+            let mut source = update.sources.pop().expect("successful link has one source");
+            let mut n = self.wb.sources.len() + 1;
+            while self.wb.sources.iter().any(|s| s.name == format!("_sc_src_{n}")) { n += 1; }
+            source.name = format!("_sc_src_{n}");
+            source.target_sheet = Some(self.wb.sheet(idx).name.clone());
+            registered_link = Some(source.clone());
+            self.wb.sources.push(source);
+        } else if let Some(registration) = update.registration {
             store_source(&mut self.wb, registration);
         } else {
             self.wb.sources = update.sources;
@@ -998,6 +1045,9 @@ impl SheetApp {
             PreparedHistory::Action(action) => self.undo.push_prepared(action),
             PreparedHistory::Cow(Some(batch)) => self.undo.push_prepared_cow_batch(batch),
             PreparedHistory::Cow(None) => {}
+        }
+        if let Some(source) = registered_link {
+            self.undo.record_link_registration(prior, (idx, source.at.0, source.at.1), source);
         }
         self.broadcast_cells(&update.broadcast);
         if update.changed != 0 {
@@ -1084,6 +1134,62 @@ mod tests {
             value: Value::Number(n),
             formula: None,
         }
+    }
+
+    #[test]
+    fn sheet_link_ribbon_renders_and_import_undo_restores_target_and_binding() {
+        let _env = crate::test_env::TestEnv::new("sheet-link-ribbon");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        let mut source = Sheet::new("Sales Q1");
+        source.set(0, 0, number(11.));
+        app.wb.sheets.push(source);
+        app.wb.sheets[0].set(0, 0, number(88.));
+        app.ribbon_action("LinkSheet", &ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut shown = false;
+        fn has_prompt(shape: &egui::Shape) -> bool {
+            match shape {
+                egui::Shape::Text(t) => t.galley.text().contains("格式：表名!A1:C10"),
+                egui::Shape::Vec(v) => v.iter().any(has_prompt),
+                _ => false,
+            }
+        }
+        for _ in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280., 800.))),
+                ..Default::default()
+            };
+            let out = ctx.run(raw, |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+            shown |= out.shapes.iter().any(|s| has_prompt(&s.shape));
+        }
+        assert!(shown, "the ribbon command must show the dialog on a normal application frame");
+        let (target, _) = app.link_dlg.take().unwrap();
+        app.start_sheet_link("'sales Q1'!$A$1", target.clone());
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(11.));
+        assert_eq!(app.wb.sources.len(), 1);
+        app.do_undo(false);
+        assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(88.));
+        assert!(app.wb.sources.is_empty());
+        app.do_undo(true);
+        assert_eq!(app.wb.sources.len(), 1);
+        // An identical import only adds a binding: it must not attach to an older undo step.
+        app.start_sheet_link("'Sales Q1'!A1", target.clone());
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sources.len(), 2);
+        app.do_undo(false);
+        assert_eq!(app.wb.sources.len(), 1);
+        assert_eq!(app.wb.sheets[0].value(0, 0), Value::Number(11.));
+        app.start_sheet_link("'Sales Q1'!A1", target.clone());
+        assert!(app.set_sheet_name(0, "Renamed Target"));
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sources.last().unwrap().target_sheet.as_deref(), Some("Renamed Target"));
+        let count = app.wb.sources.len();
+        app.start_sheet_link("'Sales Q1'!A1", target);
+        app.wb.sheets[1].set(0, 0, number(42.));
+        app.finish_csv_probe();
+        assert_eq!(app.wb.sources.len(), count, "changed input must cancel a pending import");
     }
 
     #[test]

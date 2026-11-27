@@ -1207,7 +1207,12 @@ impl SheetApp {
             "ShowDetail" => self.toggle_detail(false),
             "ImportCsv" => self.import_csv(),
             "ImportWorkbook" => self.import_workbook(),
-            "LinkSheet" => self.link_dlg = Some(String::new()),
+            "LinkSheet" => {
+                if !self.edit_blocked() {
+                    self.commit_edit(None);
+                    self.link_dlg = Some((crate::sheet_edit_target::SheetEditTarget::current(self, self.sel), String::new()));
+                }
+            }
             "TextToColumns" => self.open_data_dlg(1),
             "RefreshImport" => self.refresh_import(),
             "SortAscending" => {
