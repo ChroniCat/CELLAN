@@ -527,7 +527,7 @@ impl SheetApp {
                 deltas.extend(changes);
             }
         }
-        if let Some(net) = &self.net {
+        if self.net.is_some() || self.room_lost {
             let styles: Vec<_> = deltas
                 .iter()
                 .filter(|d| d.before_style != d.after_style)
@@ -535,7 +535,7 @@ impl SheetApp {
                 .collect();
             self.broadcast_cell_styles(&styles);
             for (sheet, rect, on) in merge_changes {
-                net.broadcast_merge(sheet, rect, on);
+                self.queue_or_broadcast_merge(sheet, rect, on);
             }
         }
         if !deferred_note_edit.is_empty() {
@@ -692,9 +692,9 @@ impl SheetApp {
                 self.status = "粘贴区域中的合并单元格相互冲突".into();
                 return true;
             };
-            if let Some(net) = &self.net {
+            if self.net.is_some() || self.room_lost {
                 for (sheet, rect, on) in changes {
-                    net.broadcast_merge(sheet, rect, on);
+                    self.queue_or_broadcast_merge(sheet, rect, on);
                 }
             }
         }
@@ -922,7 +922,7 @@ impl SheetApp {
                 .map(|d| (d.sheet, d.row, d.col))
                 .collect();
             self.fast_recalc_cells(&touched);
-            if self.net.is_some() {
+            if self.net.is_some() || self.room_lost {
                 let style_keys: Vec<_> = deltas
                     .iter()
                     .filter(|d| d.before_style != d.after_style)

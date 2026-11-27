@@ -1,25 +1,210 @@
 //! Local and host-confirmed partial cell insertion and deletion.
 
 use super::SheetApp;
-use sheetcore::{cell_shift_patch::CellShiftPatch, sync::CellShiftPhase};
+use crate::net::CoordEpoch;
+use sheetcore::{
+    cell_shift_patch::CellShiftPatch,
+    sync::CellShiftPhase,
+    tx::{RecalcScope, TxEffects, TxError, TxIntent, TxPatch, WorkbookTx},
+};
 use std::sync::Arc;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct OutboxCoord {
+    pub(super) room_id: String,
+    pub(super) epoch: CoordEpoch,
+}
+
+impl OutboxCoord {
+    pub(super) fn matches_room(&self, cur_room: &str) -> bool {
+        self.room_id.is_empty() || cur_room.is_empty() || self.room_id == cur_room
+    }
+
+    pub(super) fn is_stale(&self, cur_room: &str, cur_epoch: CoordEpoch) -> bool {
+        let room_changed = !self.room_id.is_empty() && self.room_id != cur_room;
+        room_changed
+            || self.epoch.shift_seq != cur_epoch.shift_seq
+            || self.epoch.struct_rev != cur_epoch.struct_rev
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RejoinOutboxMeta {
+    pub(super) doc_uid: u64,
+    pub(super) coord: OutboxCoord,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RejoinStyleEntry {
+    pub(super) doc_uid: u64,
+    pub(super) coord: OutboxCoord,
+    pub(super) sheet: usize,
+    pub(super) items: Vec<(u32, u32, sheetcore::style::CellStyle)>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RejoinMergeEntry {
+    pub(super) doc_uid: u64,
+    pub(super) coord: OutboxCoord,
+    pub(super) sheet: usize,
+    pub(super) rect: (u32, u32, u32, u32),
+    pub(super) on: bool,
+}
 
 #[derive(Default)]
 pub(super) struct ShiftIntro {
     pub(super) overlay: Option<(u64, Arc<sheetcore::cell_shift_patch::CellShiftOverlay>)>,
     pub(super) receipt: Option<(u64, CellShiftPhase, Arc<CellShiftPatch>)>,
     pub(super) applied_seq: u64,
+    pub(super) last_struct_rev: usize,
+    pub(super) room_id: String,
+    /// Local ops in `peer.cells` with `ts <= pre_shift_stale_ts` were created before
+    /// a live `CellShiftCommitted` advanced `applied_seq`, so if still unacked they
+    /// belong to a stale coordinate epoch and must not be replayed post-shift.
+    pub(super) pre_shift_stale_ts: u64,
+    /// Inclusive `(first, last)` logical timestamp ranges of live `CellShiftCommitted`
+    /// ops authored by this site so they are never misclassified as unacked local edits.
+    pub(super) committed_shift_ts_ranges: Vec<(u64, u64)>,
+    /// Count of stale unconfirmed edits discarded across a delta->full resync cycle.
+    pub(super) pending_cancelled_edits: usize,
+    /// True when stale optimistic local writes were discarded before a delta snapshot
+    /// settled, so `SnapshotDone` must trigger a full authoritative resync.
+    pub(super) needs_delta_resync_for_stale: bool,
     deferred_pastes: Vec<DeferredPasteWrites>,
 }
 
+impl ShiftIntro {
+    pub(super) fn begin_welcome(&mut self, room_id: String) {
+        self.overlay = None;
+        self.receipt = None;
+        self.applied_seq = 0;
+        self.last_struct_rev = 0;
+        self.room_id = room_id;
+        self.clear_peer_shift_tracking();
+    }
+
+    pub(super) fn clear_peer_shift_tracking(&mut self) {
+        self.pre_shift_stale_ts = 0;
+        self.committed_shift_ts_ranges.clear();
+    }
+
+    pub(super) fn sync_struct_rev(&mut self, rev: usize) {
+        self.last_struct_rev = rev;
+    }
+
+    pub(super) fn is_committed_shift_ts(&self, ts: u64) -> bool {
+        self.committed_shift_ts_ranges
+            .iter()
+            .any(|&(first, last)| first <= ts && ts <= last)
+    }
+
+    pub(super) fn record_live_shift(
+        &mut self,
+        local_author: bool,
+        first_ts: u64,
+        cell_count: usize,
+        seq: u64,
+        old_seq: u64,
+        pre_clock: u64,
+    ) {
+        if seq != old_seq && pre_clock > 0 {
+            self.pre_shift_stale_ts = self.pre_shift_stale_ts.max(pre_clock);
+        }
+        if local_author && cell_count > 0 {
+            let last_ts = first_ts.saturating_add(cell_count as u64 - 1);
+            self.committed_shift_ts_ranges.push((first_ts, last_ts));
+        }
+        self.applied_seq = seq;
+    }
+}
+
 struct DeferredPasteWrites {
-    room: String,
-    seq: u64,
+    coord: OutboxCoord,
     first_exclusive: u64,
     through: u64,
 }
 
+pub(super) fn shift_cell_shift_coord(
+    r: u32,
+    c: u32,
+    rect: (u32, u32, u32, u32),
+    horizontal: bool,
+    effective_insert: bool,
+) -> Option<(u32, u32)> {
+    let (r1, c1, r2, c2) = rect;
+    if horizontal {
+        if r < r1 || r > r2 {
+            return Some((r, c));
+        }
+        let n = c2 - c1 + 1;
+        if effective_insert {
+            if c < c1 {
+                Some((r, c))
+            } else {
+                c.checked_add(n)
+                    .filter(|&nc| nc < sheetcore::sync::MAX_COLS)
+                    .map(|nc| (r, nc))
+            }
+        } else if c < c1 {
+            Some((r, c))
+        } else if c <= c2 {
+            None
+        } else {
+            Some((r, c - n))
+        }
+    } else {
+        if c < c1 || c > c2 {
+            return Some((r, c));
+        }
+        let n = r2 - r1 + 1;
+        if effective_insert {
+            if r < r1 {
+                Some((r, c))
+            } else {
+                r.checked_add(n)
+                    .filter(|&nr| nr < sheetcore::sync::MAX_ROWS)
+                    .map(|nr| (nr, c))
+            }
+        } else if r < r1 {
+            Some((r, c))
+        } else if r <= r2 {
+            None
+        } else {
+            Some((r - n, c))
+        }
+    }
+}
+
 impl SheetApp {
+    pub(super) fn current_coord_epoch(&self) -> CoordEpoch {
+        if let Some(net) = self.net.as_ref() {
+            CoordEpoch {
+                struct_rev: net.structure_seen(),
+                shift_seq: self.shift_intro.applied_seq,
+            }
+        } else {
+            CoordEpoch {
+                struct_rev: self.shift_intro.last_struct_rev,
+                shift_seq: self.shift_intro.applied_seq,
+            }
+        }
+    }
+
+    pub(super) fn current_outbox_coord(&self) -> OutboxCoord {
+        let room_id = if !self.shift_intro.room_id.is_empty() {
+            self.shift_intro.room_id.clone()
+        } else {
+            self.net
+                .as_ref()
+                .map(|n| n.connected_room_id())
+                .unwrap_or_default()
+        };
+        OutboxCoord {
+            room_id,
+            epoch: self.current_coord_epoch(),
+        }
+    }
+
     /// Unacknowledged writes can survive a dropped socket in the rejoin outbox.
     /// Remember which ones came from an asynchronous paste tied to a coordinate frame.
     pub(super) fn track_deferred_paste(&mut self, first_exclusive: u64, through: u64) {
@@ -29,45 +214,271 @@ impl SheetApp {
         if through <= first_exclusive {
             return;
         }
-        let room = net.connected_room_id();
         let acked = net.acked_op_ts();
-        let seq = self.shift_intro.applied_seq;
+        let coord = self.current_outbox_coord();
         let pastes = &mut self.shift_intro.deferred_pastes;
-        pastes.retain(|p| p.room != room || p.through > acked);
+        pastes.retain(|p| p.coord.room_id != coord.room_id || p.through > acked);
         if through > acked {
             pastes.push(DeferredPasteWrites {
-                room,
-                seq,
+                coord,
                 first_exclusive,
                 through,
             });
         }
     }
 
-    pub(super) fn discard_stale_deferred_pastes(&mut self, seq: u64) -> usize {
+    pub(super) fn advance_deferred_paste_struct_rev(
+        &mut self,
+        cur_room: &str,
+        target_rev: Option<usize>,
+    ) {
+        for p in &mut self.shift_intro.deferred_pastes {
+            if p.coord.matches_room(cur_room) {
+                if let Some(rev) = target_rev {
+                    if p.coord.epoch.struct_rev < rev {
+                        p.coord.epoch.struct_rev = rev;
+                    }
+                } else {
+                    p.coord.epoch.struct_rev = p.coord.epoch.struct_rev.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Discard ALL stale unacknowledged outbox entries (ordinary cell edits, style edits,
+    /// merge edits, and deferred background pastes) whose room or unified coordinate epoch
+    /// no longer matches the settled snapshot.
+    pub(super) fn discard_stale_rejoin_outboxes(&mut self) -> usize {
         let Some(net) = &self.net else { return 0 };
-        let room = net.connected_room_id();
-        let pastes = &mut self.shift_intro.deferred_pastes;
-        let stale: Vec<_> = pastes
-            .iter()
-            .filter(|p| p.room != room || p.seq < seq)
-            .map(|p| (p.first_exclusive, p.through))
-            .collect();
-        let acked = net.acked_op_ts();
-        pastes.retain(|p| p.room == room && p.seq >= seq && p.through > acked);
-        let Some((uid, ops)) = &mut self.rejoin_outbox else {
-            return 0;
-        };
-        if *uid != self.doc_uid || stale.is_empty() {
+        if net.hosting {
             return 0;
         }
-        let before = ops.len();
-        ops.retain(|op| {
-            !stale
-                .iter()
-                .any(|&(prior, last)| prior < op.ts && op.ts <= last)
-        });
-        before - ops.len()
+        let uid = self.doc_uid;
+        let cur_room = net.connected_room_id();
+        let cur_epoch = self.current_coord_epoch();
+        let acked = net.acked_op_ts();
+        let mut discarded = 0usize;
+
+        // 1. Check ordinary cell outbox against its bound room & unified CoordEpoch.
+        let ops_stale = match (&self.rejoin_outbox, &self.rejoin_outbox_meta) {
+            (Some((owner, _)), Some(meta)) if *owner == uid && meta.doc_uid == uid => {
+                meta.coord.is_stale(&cur_room, cur_epoch)
+            }
+            (Some((owner, _)), None) if *owner == uid => cur_epoch.shift_seq != 0,
+            _ => false,
+        };
+        if ops_stale {
+            if let Some((_, ops)) = self.rejoin_outbox.take() {
+                discarded += ops.into_iter().filter(|op| op.ts > acked).count();
+            }
+            self.rejoin_outbox_meta = None;
+        } else if self
+            .rejoin_outbox_meta
+            .as_ref()
+            .is_some_and(|meta| meta.doc_uid == uid && meta.coord.is_stale(&cur_room, cur_epoch))
+        {
+            self.rejoin_outbox_meta = None;
+        }
+
+        // 2. Check deferred background pastes (in case a paste predated a shift while other ops didn't).
+        let pastes = &mut self.shift_intro.deferred_pastes;
+        let stale_pastes: Vec<_> = pastes
+            .iter()
+            .filter(|p| p.coord.is_stale(&cur_room, cur_epoch))
+            .map(|p| (p.first_exclusive, p.through))
+            .collect();
+        pastes.retain(|p| !p.coord.is_stale(&cur_room, cur_epoch) && p.through > acked);
+        if !stale_pastes.is_empty() {
+            if let Some((owner, ops)) = &mut self.rejoin_outbox {
+                if *owner == uid {
+                    let before = ops.len();
+                    ops.retain(|op| {
+                        !stale_pastes
+                            .iter()
+                            .any(|&(prior, last)| prior < op.ts && op.ts <= last)
+                    });
+                    discarded += before - ops.len();
+                    if ops.is_empty() {
+                        self.rejoin_outbox = None;
+                        self.rejoin_outbox_meta = None;
+                    }
+                }
+            }
+        }
+
+        // 3. Check style outbox entries against their bound room & unified CoordEpoch.
+        if !self.rejoin_style_outbox.is_empty() {
+            let mut keep = Vec::with_capacity(self.rejoin_style_outbox.len());
+            for entry in std::mem::take(&mut self.rejoin_style_outbox) {
+                if entry.doc_uid == uid && entry.coord.is_stale(&cur_room, cur_epoch) {
+                    discarded += entry.items.len();
+                } else {
+                    keep.push(entry);
+                }
+            }
+            self.rejoin_style_outbox = keep;
+        }
+
+        // 4. Check merge outbox entries against their bound room & unified CoordEpoch.
+        if !self.rejoin_merge_outbox.is_empty() {
+            let mut keep = Vec::with_capacity(self.rejoin_merge_outbox.len());
+            for entry in std::mem::take(&mut self.rejoin_merge_outbox) {
+                if entry.doc_uid == uid && entry.coord.is_stale(&cur_room, cur_epoch) {
+                    discarded += 1;
+                } else {
+                    keep.push(entry);
+                }
+            }
+            self.rejoin_merge_outbox = keep;
+        }
+
+        discarded
+    }
+
+    /// Keep live collaboration coordinates, locks, active editing state, remote cursors,
+    /// and any queued rejoin outboxes consistent when a `CellShift` commits live.
+    pub(super) fn on_live_cell_shift_committed(
+        &mut self,
+        site: u32,
+        phase: CellShiftPhase,
+        patch: &CellShiftPatch,
+        first_ts: u64,
+        seq: u64,
+        old_seq: u64,
+        pre_clock: u64,
+    ) {
+        let my_site = self.net.as_ref().map(|n| n.site).unwrap_or(0);
+        let hosting = self.net.as_ref().is_some_and(|n| n.hosting);
+        let target_sheet = patch.target_sheet();
+        let forward = !matches!(phase, CellShiftPhase::Undo);
+        let effective_insert = patch.insert == forward;
+
+        self.shift_intro.record_live_shift(
+            !hosting && site == my_site,
+            first_ts,
+            patch.cells.len(),
+            seq,
+            old_seq,
+            pre_clock,
+        );
+        if let Some(net) = self.net.as_ref() {
+            net.set_shift_seq(seq);
+        }
+
+        let in_shifted_band = |si: usize, r: u32, c: u32| -> bool {
+            si == target_sheet
+                && shift_cell_shift_coord(r, c, patch.rect, patch.horizontal, effective_insert)
+                    != Some((r, c))
+        };
+        let touched_by_patch = |si: usize, r: u32, c: u32| -> bool {
+            in_shifted_band(si, r, c)
+                || patch
+                    .cells
+                    .iter()
+                    .any(|cell| cell.sheet == si && cell.row == r && cell.col == c)
+        };
+
+        // Release any local lock entries in the shifted band / touched cells (host does not
+        // shift locks across partial CellShift and already fenced other peers' active locks).
+        let stale_locks: Vec<(usize, u32, u32, u32)> = self
+            .locks
+            .iter()
+            .filter_map(|((ls, lr, lc), holder)| {
+                touched_by_patch(ls, lr, lc).then_some((ls, lr, lc, holder.site))
+            })
+            .collect();
+        for (ls, lr, lc, lsite) in stale_locks {
+            self.locks.release(ls, lr, lc, lsite);
+        }
+
+        let mut cancelled_edit = false;
+        if let Some((ls, lr, lc)) = self.my_lock {
+            if touched_by_patch(ls, lr, lc) {
+                self.my_lock = None;
+                if let Some(net) = self.net.as_ref() {
+                    net.release_lock(ls, lr, lc);
+                }
+                if self.edit_sheet.unwrap_or(self.sheet_idx) == ls
+                    && self.edit_sel == Some((lr, lc))
+                {
+                    if self.editing.take().is_some() {
+                        cancelled_edit = true;
+                    }
+                    self.pending_edit = None;
+                    self.edit_sel = None;
+                    self.edit_sheet = None;
+                }
+            }
+        }
+        if let Some((ls, lr, lc)) = self.requested_lock {
+            if touched_by_patch(ls, lr, lc) {
+                self.requested_lock = None;
+                self.pending_edit = None;
+                if let Some(net) = self.net.as_ref() {
+                    net.release_lock(ls, lr, lc);
+                }
+                if self.edit_sheet.unwrap_or(self.sheet_idx) == ls
+                    && self.edit_sel == Some((lr, lc))
+                {
+                    if self.editing.take().is_some() {
+                        cancelled_edit = true;
+                    }
+                    self.edit_sel = None;
+                    self.edit_sheet = None;
+                }
+            }
+        }
+        let edit_sheet = self.edit_sheet.unwrap_or(self.sheet_idx);
+        let active_edit_cell = self
+            .edit_sel
+            .or_else(|| self.editing.is_some().then_some(self.sel));
+        if let Some((er, ec)) = active_edit_cell {
+            if touched_by_patch(edit_sheet, er, ec) {
+                if self.editing.take().is_some() {
+                    cancelled_edit = true;
+                }
+                self.pending_edit = None;
+                self.edit_sel = None;
+                self.edit_sheet = None;
+            }
+        }
+
+        // Shift or remove remote cursors on the target sheet.
+        let old_remote = std::mem::take(&mut self.remote);
+        for (rsite, (rsh, rname, rcol, rr, rc, er, ec)) in old_remote {
+            if rsh == target_sheet {
+                if let Some((nr, nc)) =
+                    shift_cell_shift_coord(rr, rc, patch.rect, patch.horizontal, effective_insert)
+                {
+                    let (ner, nec) = shift_cell_shift_coord(
+                        er,
+                        ec,
+                        patch.rect,
+                        patch.horizontal,
+                        effective_insert,
+                    )
+                    .unwrap_or((nr, nc));
+                    self.remote
+                        .insert(rsite, (rsh, rname, rcol, nr, nc, ner, nec));
+                }
+            } else {
+                self.remote
+                    .insert(rsite, (rsh, rname, rcol, rr, rc, er, ec));
+            }
+        }
+
+        // Discard any queued rejoin outboxes from older shift epochs.
+        let discarded = self.discard_stale_rejoin_outboxes();
+        if discarded > 0 {
+            self.shift_intro.pending_cancelled_edits = self
+                .shift_intro
+                .pending_cancelled_edits
+                .saturating_add(discarded);
+            self.shift_intro.needs_delta_resync_for_stale = true;
+        }
+        if cancelled_edit {
+            self.status.push_str("；当前编辑单元格受位移影响，已取消编辑");
+        }
     }
 
     /// 插入/删除单元格（down_or_up: true=插入；horizontal: true=右移/左移）
@@ -103,11 +514,12 @@ impl SheetApp {
             sheetcore::cells::Shift::Vertical
         };
         let op = sheetcore::structural::CellShift::new(rect, direction, insert);
-        let sh = self.wb.sheet(si);
-        if op.would_overflow(sh) {
-            self.status = "插入/删除区域超出工作表边界，无法移动单元格".into();
+        let intent = TxIntent::from_cell_shift(si, &op);
+        if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+            self.status = err.message().into();
             return;
         }
+        let sh = self.wb.sheet(si);
 
         let (r1, c1, last_row, last_col) =
             moved_extent(sh, rect, horizontal, if insert { op.count() } else { 0 });
@@ -132,63 +544,15 @@ impl SheetApp {
             self.request_room_shift(si, op);
             return;
         }
-        let before = sheetcore::undo::snapshot_cell_shift_if_metadata(&self.wb, si, &op);
-        let mut affected = vec![(si, keys)];
-        if let Some(snapshot) = &before {
-            affected.extend(snapshot.foreign_formula_positions());
-        } else {
-            for (idx, other) in self.wb.sheets.iter().enumerate() {
-                if idx == si {
-                    continue;
-                }
-                let keys = op.affected_formula_positions(other, &self.wb.sheet(si).name);
-                if !keys.is_empty() {
-                    affected.push((idx, keys));
-                }
-            }
-        }
-        let captured: Vec<_> = affected
-            .into_iter()
-            .map(|(idx, keys)| {
-                (
-                    idx,
-                    sheetcore::undo::capture(self.wb.sheet(idx), idx, &keys),
-                )
-            })
-            .collect();
-        if !op.apply(&mut self.wb, si) {
-            return;
-        }
-        let deltas: Vec<_> = captured
-            .into_iter()
-            .flat_map(|(idx, cells)| sheetcore::undo::finish(cells, self.wb.sheet(idx)))
-            .collect();
         let focus = (si, self.sel.0, self.sel.1);
-        let detached_source = before
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.detached_source(&self.wb));
-        let structure = before
-            .filter(|s| s.cell_shift_changed_metadata(&self.wb))
-            .map(|snapshot| {
-                let after = snapshot.capture_after(&self.wb);
-                (snapshot, after)
-            });
-        self.recalc_all_and_deps_adaptive();
-        for group in deltas.chunk_by(|a, b| a.sheet == b.sheet) {
-            self.record_revision(label, group);
-        }
-        if let Some((before, after)) = structure {
-            if deltas.is_empty() {
-                self.record_revision(label, &[]);
+        let (_entry_id, effects) = match self.execute_local_tx(intent, Some(label.to_string()), focus) {
+            Ok(ok) => ok,
+            Err(TxError::NoOp) => return,
+            Err(err) => {
+                self.status = err.message().into();
+                return;
             }
-            self.undo.push_structure(label, before, after, focus);
-        } else if !deltas.is_empty() {
-            self.undo
-                .push_cell_shift(label, deltas, focus, &self.wb.sheets);
-        }
-        self.tasks.last_edit = Some(std::time::Instant::now());
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.wb.dirty = true;
+        };
         self.status = if insert {
             if horizontal {
                 "已插入单元格（右侧右移）"
@@ -201,14 +565,19 @@ impl SheetApp {
         } else {
             "已删除单元格（上方上移）".into()
         };
-        if detached_source {
+        if effects.detached_sources {
             self.status
                 .push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }
     }
 
     fn request_room_shift(&mut self, sheet: usize, op: sheetcore::structural::CellShift) {
-        let Some(patch) = CellShiftPatch::prepare(&self.wb, sheet, op) else {
+        let intent = TxIntent::from_cell_shift(sheet, &op);
+        if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+            self.status = err.message().into();
+            return;
+        }
+        let Some(patch) = TxPatch::prepare(&self.wb, &intent).and_then(TxPatch::into_cell_shift) else {
             self.status = "单元格位移范围无效，未执行操作".into();
             return;
         };
@@ -254,7 +623,25 @@ impl SheetApp {
             CellShiftPhase::Undo
         };
         let Some(net) = &self.net else {
-            if !patch.matches_replica(&self.wb, redo) || !patch.apply_committed(&mut self.wb, redo)
+            let effective_op = sheetcore::structural::CellShift::new(
+                patch.rect,
+                if patch.horizontal {
+                    sheetcore::cells::Shift::Horizontal
+                } else {
+                    sheetcore::cells::Shift::Vertical
+                },
+                patch.insert == redo,
+            );
+            if let Err(err) = WorkbookTx::preflight(
+                &self.wb,
+                &TxIntent::from_cell_shift(patch.target_sheet(), &effective_op),
+            ) {
+                self.status = err.message().into();
+                return false;
+            }
+            let tx_patch = TxPatch::from_cell_shift((*patch).clone());
+            if !tx_patch.matches_replica(&self.wb, redo)
+                || !tx_patch.apply_committed(&mut self.wb, redo)
             {
                 self.status = "关联单元格、批注或数据源已更改，已保留历史记录".into();
                 return false;
@@ -292,6 +679,12 @@ impl SheetApp {
         phase: CellShiftPhase,
         patch: Arc<CellShiftPatch>,
     ) -> Result<Arc<CellShiftPatch>, String> {
+        if matches!(phase, CellShiftPhase::Forward) {
+            let intent = TxIntent::from_cell_shift(patch.target_sheet(), &patch.operation());
+            if let Err(err) = WorkbookTx::preflight(&self.wb, &intent) {
+                return Err(err.message().into());
+            }
+        }
         let canonical = if matches!(phase, CellShiftPhase::Forward) {
             Arc::new(
                 patch
@@ -320,6 +713,20 @@ impl SheetApp {
             .ok_or("目标工作表已更改，已保留历史记录")?;
         if self.deps_pending {
             return Err("工作簿正在建立依赖关系，请稍后重试".into());
+        }
+        let effective_op = sheetcore::structural::CellShift::new(
+            patch.rect,
+            if patch.horizontal {
+                sheetcore::cells::Shift::Horizontal
+            } else {
+                sheetcore::cells::Shift::Vertical
+            },
+            patch.insert == forward,
+        );
+        if let Err(err) =
+            WorkbookTx::preflight(&self.wb, &TxIntent::from_cell_shift(sheet, &effective_op))
+        {
+            return Err(err.message().into());
         }
         if !matches!(phase, CellShiftPhase::Forward) {
             let matches = if self.net.as_ref().is_some_and(|net| net.hosting) {
@@ -457,12 +864,18 @@ impl SheetApp {
     }
 
     fn finish_shift_edit(&mut self) {
-        self.recalc_all_and_deps_adaptive();
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
-        self.tasks.last_edit = Some(std::time::Instant::now());
+        let effects = TxEffects {
+            recalc: RecalcScope::Full,
+            invalidate_deps: true,
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: false,
+            detached_sources: false,
+            revision_deltas: Vec::new(),
+            touched_sheets: Vec::new(),
+            new_focus: None,
+        };
+        self.apply_tx_effects("", &effects);
     }
 
     pub(super) fn discard_room_peer(&mut self) {
@@ -540,7 +953,12 @@ fn moved_extent(
     for key in sh.notes.keys().chain(sh.threads.keys()) {
         include(key.row, key.col);
     }
-    for &(r, c) in sh.rich.keys().chain(sh.hyperlinks.keys()) {
+    for &(r, c) in sh
+        .rich
+        .keys()
+        .chain(sh.hyperlinks.keys())
+        .chain(sh.ignored_errors.iter())
+    {
         include(r, c);
     }
     for &(top, left, bottom, right) in &sh.merges {

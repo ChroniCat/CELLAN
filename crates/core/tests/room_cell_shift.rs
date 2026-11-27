@@ -148,6 +148,7 @@ fn room_shift_replays_all_metadata_styles_and_foreign_references_atomically() {
     assert_eq!(sh.notes[&CellRef::new(0, 2)].c, 2);
     assert_eq!(sh.threads[&CellRef::new(0, 2)].c, 2);
     assert!(sh.hyperlinks.contains_key(&(0, 2)));
+    assert_eq!(sh.hyperlinks[&(0, 2)].location, "Data!C1");
     assert_eq!(sh.merges.as_ref(), &[(0, 2, 1, 2)]);
     assert_eq!(host.sources[0].at, (0, 2));
     assert_eq!(host.sheets[1].dv[0].f1, "Data!C1");
@@ -188,6 +189,7 @@ fn room_shift_replays_all_metadata_styles_and_foreign_references_atomically() {
 #[test]
 fn room_shift_reconnect_uses_current_metadata_local_source_path_and_local_values() {
     let mut host = fixture();
+    host.sheets[0].merges.clear();
     // A partial cut across the destination footprint detaches this source.
     let op = CellShift::new((0, 1, 0, 1), Shift::Horizontal, true);
     let patch = CellShiftPatch::prepare(&host, 0, op).unwrap();

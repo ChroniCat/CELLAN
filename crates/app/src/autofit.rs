@@ -76,8 +76,14 @@ impl SheetApp {
         }
         if changed {
             self.wb.sheet_mut(si).layout_dirty = true;
-            self.undo.push_meta("自动换行调整行高", (si, self.sel.0, self.sel.1), edit);
-            self.doc_gen = self.doc_gen.wrapping_add(1);
+            self.commit_meta_tx(
+                "自动换行调整行高",
+                (si, self.sel.0, self.sel.1),
+                edit,
+                sheetcore::tx::RecalcScope::None,
+                false,
+                Vec::new(),
+            );
         }
     }
 

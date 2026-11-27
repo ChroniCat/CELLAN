@@ -328,7 +328,7 @@ impl SparkCache {
             Some(name) => wb
                 .sheets
                 .iter()
-                .find(|s| s.name == name)
+                .find(|s| s.name.eq_ignore_ascii_case(name))
                 .map(|s| (s.identity, s.cell_version().clone())),
             None => Some((sh.identity, sh.cell_version().clone())),
         };
@@ -952,6 +952,56 @@ fn expr_may_cross_sheet(formula: &str) -> bool {
     formula.contains('!')
 }
 
+fn cf_rule_formulas(rule: &cf::CfRule, mut f: impl FnMut(&str)) {
+    match &rule.kind {
+        cf::CfKind::Expr { formula, .. } => f(formula),
+        cf::CfKind::CellIs { a, b, .. } => {
+            if !a.is_empty() && a.trim().parse::<f64>().is_err() {
+                f(a);
+            }
+            if !b.is_empty() && b.trim().parse::<f64>().is_err() {
+                f(b);
+            }
+        }
+        cf::CfKind::Scale { points } => {
+            for (v, _) in points {
+                if v.kind == cf::CfvoKind::Formula && !v.formula.is_empty() {
+                    f(&v.formula);
+                }
+            }
+        }
+        cf::CfKind::Bar { min, max, .. } => {
+            for v in [min, max] {
+                if v.kind == cf::CfvoKind::Formula && !v.formula.is_empty() {
+                    f(&v.formula);
+                }
+            }
+        }
+        cf::CfKind::IconSet { thresholds, .. } => {
+            for v in thresholds {
+                if v.kind == cf::CfvoKind::Formula && !v.formula.is_empty() {
+                    f(&v.formula);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cf_sheet_expression_flags(cf_sheet: &cf::CfSheet) -> (bool, bool) {
+    let mut expressions = false;
+    let mut cross_expressions = false;
+    for rule in cf_sheet.blocks.iter().flat_map(|b| &b.rules) {
+        cf_rule_formulas(rule, |formula| {
+            expressions = true;
+            if expr_may_cross_sheet(formula) {
+                cross_expressions = true;
+            }
+        });
+    }
+    (expressions, cross_expressions)
+}
+
 #[derive(Default)]
 pub(super) struct Rules {
     pub index: cf::RuleIndex,
@@ -1009,16 +1059,9 @@ impl Rules {
         if definitions_changed {
             self.definitions = sh.cf.clone();
             self.index = cf::RuleIndex::new(&sh.cf);
-            self.expressions = sh
-                .cf
-                .blocks
-                .iter()
-                .flat_map(|b| &b.rules)
-                .any(|r| matches!(r.kind, cf::CfKind::Expr { .. }));
-            self.cross_expressions = sh.cf.blocks.iter().flat_map(|b| &b.rules).any(|r| match &r.kind {
-                cf::CfKind::Expr { formula, .. } => expr_may_cross_sheet(formula),
-                _ => false,
-            });
+            let (expressions, cross_expressions) = cf_sheet_expression_flags(&sh.cf);
+            self.expressions = expressions;
+            self.cross_expressions = cross_expressions;
             self.stat_area = cf_stat_area(&sh.cf);
         }
         let dirty = local_changed || definitions_changed || self.expressions;
@@ -1078,16 +1121,9 @@ impl Rules {
         if definitions_changed {
             self.definitions = sh.cf.clone();
             self.index = cf::RuleIndex::new(&sh.cf);
-            self.expressions = sh
-                .cf
-                .blocks
-                .iter()
-                .flat_map(|b| &b.rules)
-                .any(|r| matches!(r.kind, cf::CfKind::Expr { .. }));
-            self.cross_expressions = sh.cf.blocks.iter().flat_map(|b| &b.rules).any(|r| match &r.kind {
-                cf::CfKind::Expr { formula, .. } => expr_may_cross_sheet(formula),
-                _ => false,
-            });
+            let (expressions, cross_expressions) = cf_sheet_expression_flags(&sh.cf);
+            self.expressions = expressions;
+            self.cross_expressions = cross_expressions;
             self.stat_area = cf_stat_area(&sh.cf);
         }
         let has_rules = !sh.cf.blocks.is_empty();
@@ -1346,9 +1382,14 @@ pub(crate) fn charts_fingerprint(charts: &[sheetcore::charts::Chart]) -> u64 {
             rl.color.hash(&mut h);
             rl.dash.hash(&mut h);
         }
+        ch.source_range.hash(&mut h);
         ch.series.len().hash(&mut h);
         for s in &ch.series {
             s.name.hash(&mut h);
+            s.name_ref.hash(&mut h);
+            s.cat_ref.hash(&mut h);
+            s.val_ref.hash(&mut h);
+            s.size_ref.hash(&mut h);
             s.color.hash(&mut h);
             s.kind.hash(&mut h);
             s.secondary.hash(&mut h);

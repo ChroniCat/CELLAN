@@ -654,11 +654,11 @@ impl SheetApp {
                 deltas.extend(changes);
             }
         }
-        if let Some(net) = &self.net {
+        if self.net.is_some() || self.room_lost {
             let styles: Vec<_> = deltas.iter().filter(|d| d.before_style != d.after_style)
                 .map(|d| (d.sheet, d.row, d.col)).collect();
             self.broadcast_cell_styles(&styles);
-            for (sheet, rect, on) in merge_changes { net.broadcast_merge(sheet, rect, on); }
+            for (sheet, rect, on) in merge_changes { self.queue_or_broadcast_merge(sheet, rect, on); }
         }
         if !paste_note_edit.is_empty() {
             self.broadcast_note_undo_edit(&paste_note_edit);

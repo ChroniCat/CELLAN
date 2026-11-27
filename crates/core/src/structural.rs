@@ -148,174 +148,13 @@ fn formula_may_be_affected(formula: &str, shift: &MappedShift) -> bool {
     } else {
         shift.insertions.iter().copied().min().unwrap_or(shift.at)
     };
-    let b = formula.as_bytes();
-    match shift.axis {
-        crate::refs::Axis::Row => {
-            let threshold = min_at as u64 + 1;
-            let mut i = 0usize;
-            let mut saw_colon = false;
-            let mut prev_num: Option<u64> = None;
-            while i < b.len() {
-                let ch = b[i];
-                if ch.is_ascii_lowercase() {
-                    return true;
-                }
-                if ch == b':' {
-                    saw_colon = true;
-                    i += 1;
-                    continue;
-                }
-                if ch.is_ascii_digit() {
-                    let start = i;
-                    let mut val = 0u64;
-                    while i < b.len() && b[i].is_ascii_digit() {
-                        val = val.saturating_mul(10).saturating_add((b[i] - b'0') as u64);
-                        i += 1;
-                    }
-                    if i - start > 1 && b[start] == b'0' {
-                        return true;
-                    }
-                    if val >= threshold {
-                        return true;
-                    }
-                    if saw_colon {
-                        if prev_num.is_some_and(|p| p > val) {
-                            return true;
-                        }
-                        saw_colon = false;
-                    }
-                    prev_num = Some(val);
-                    continue;
-                }
-                i += 1;
-            }
-            false
-        }
-        crate::refs::Axis::Col => {
-            let mut i = 0usize;
-            let mut saw_colon = false;
-            let mut prev_col: Option<u32> = None;
-            while i < b.len() {
-                let ch = b[i];
-                if ch.is_ascii_lowercase() {
-                    return true;
-                }
-                if ch == b':' {
-                    saw_colon = true;
-                    i += 1;
-                    continue;
-                }
-                if ch.is_ascii_digit() {
-                    let start = i;
-                    while i < b.len() && b[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    if i - start > 1 && b[start] == b'0' {
-                        return true;
-                    }
-                    continue;
-                }
-                if ch.is_ascii_uppercase() {
-                    let start = i;
-                    let mut col = 0u32;
-                    while i < b.len() && b[i].is_ascii_uppercase() {
-                        col = col
-                            .saturating_mul(26)
-                            .saturating_add((b[i] - b'A') as u32 + 1);
-                        i += 1;
-                    }
-                    let len = i - start;
-                    if len <= 3 && col > 0 && col <= 16_384 && b.get(i) != Some(&b'(') {
-                        let c0 = col - 1;
-                        if c0 >= min_at {
-                            return true;
-                        }
-                        if saw_colon {
-                            if prev_col.is_some_and(|p| p > c0) {
-                                return true;
-                            }
-                            saw_colon = false;
-                        }
-                        prev_col = Some(c0);
-                    }
-                    continue;
-                }
-                i += 1;
-            }
-            false
-        }
-    }
+    crate::transform::formula_may_be_affected_from(formula, shift.axis, min_at)
 }
 
 impl Sheet {
     /// 把所有公式里的引用按 shift 改写（含条件格式、数据验证里的公式）
     pub fn rewrite_references(&mut self, shift: &crate::refs::Shift) {
         self.rewrite_mapped_references(&MappedShift { shift, insertions: &[] });
-    }
-
-    /// 整行/整列移动（置换 `[min(from,at), max(from+n,at+n))` 区间）后，按真实置换关系
-    /// 重写本表所有单元格、条件格式和数据验证中指向 `target_sheet` 的公式引用。
-    pub(crate) fn rewrite_permuted_references(
-        &mut self,
-        axis: crate::refs::Axis,
-        from: u32,
-        n: u32,
-        at: u32,
-        target_sheet: &str,
-    ) {
-        if n == 0 || from == at {
-            return;
-        }
-        let own_name = self.name.clone();
-        let lo = from.min(at);
-        let hi = (from + n).max(at + n);
-        let probe_shift = crate::refs::Shift {
-            axis,
-            at: lo,
-            n: hi - lo,
-            delete: false,
-            target_sheet: target_sheet.to_string(),
-            own_sheet: own_name.clone(),
-            ..Default::default()
-        };
-        let probe_mapped = MappedShift { shift: &probe_shift, insertions: &[] };
-        let foreign_sheet = (!own_name.eq_ignore_ascii_case(target_sheet)).then_some(target_sheet);
-        let changed = self
-            .cells_mut()
-            .rewrite_formulas_parallel(foreign_sheet, |old| {
-                if !formula_may_be_affected(old, &probe_mapped) {
-                    return None;
-                }
-                let new = crate::refs::permute_axis(old, axis, from, n, at, target_sheet, &own_name);
-                (new != old).then(|| new.into())
-            });
-        self.edited |= changed;
-        for blk in self.cf.blocks.iter_mut() {
-            for rule in blk.rules.iter_mut() {
-                let mut rewrite_threshold = |formula: &mut String| {
-                    let rewritten =
-                        crate::refs::permute_axis(formula, axis, from, n, at, target_sheet, &own_name);
-                    if *formula != rewritten {
-                        *formula = rewritten;
-                        self.cf_dirty = true;
-                    }
-                };
-                match &mut rule.kind {
-                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
-                    crate::cf::CfKind::CellIs { a, b, .. } => {
-                        rewrite_threshold(a);
-                        rewrite_threshold(b);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for dv in self.dv.iter_mut() {
-            let f1 = crate::refs::permute_axis(&dv.f1, axis, from, n, at, target_sheet, &own_name);
-            let f2 = crate::refs::permute_axis(&dv.f2, axis, from, n, at, target_sheet, &own_name);
-            self.dv_dirty |= dv.f1 != f1 || dv.f2 != f2;
-            (dv.f1, dv.f2) = (f1, f2);
-        }
     }
 
     fn rewrite_mapped_references(&mut self, shift: &MappedShift) {
@@ -334,20 +173,11 @@ impl Sheet {
         self.edited |= changed;
         for blk in self.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
-                let mut rewrite_threshold = |formula: &mut String| {
-                    let rewritten = crate::refs::rewrite_mapped(formula, shift);
-                    if *formula != rewritten {
-                        *formula = rewritten;
-                        self.cf_dirty = true;
-                    }
-                };
-                match &mut rule.kind {
-                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
-                    crate::cf::CfKind::CellIs { a, b, .. } => {
-                        rewrite_threshold(a);
-                        rewrite_threshold(b);
-                    }
-                    _ => {}
+                if rule
+                    .kind
+                    .rewrite_formulas(|f| crate::refs::rewrite_mapped(f, shift))
+                {
+                    self.cf_dirty = true;
                 }
             }
         }
@@ -687,388 +517,767 @@ impl Sheet {
     /// 把 [from, from+n) 这段整行移动到 `to`（`to` 是「删掉源行之后」的插入位置，
     /// 也就是拖放时画出的那条插入线的位置）。
     pub fn move_rows(&mut self, from: u32, n: u32, to: u32) {
-        if n == 0 || to == from {
+        let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Row, from, n, to) else {
             return;
-        }
-        let at = if to > from { to - n } else { to };
-        if at == from {
-            return;
-        }
-        let lo = from.min(at);
-        let hi = (from + n).max(at + n);
-        let r2 = from + n - 1;
-        let perm = |r: u32| -> u32 {
-            if r < lo || r >= hi {
-                r
-            } else if r >= from && r < from + n {
-                at + (r - from)
-            } else if at > from {
-                r - n
-            } else {
-                r + n
-            }
         };
-
-        let notes: Vec<_> = self
-            .notes
-            .iter()
-            .filter(|(k, _)| k.row >= from && k.row <= r2)
-            .map(|(k, v)| (k.row - from, k.col, v.clone()))
-            .collect();
-        let threads: Vec<_> = self
-            .threads
-            .iter()
-            .filter(|(k, _)| k.row >= from && k.row <= r2)
-            .map(|(k, v)| (k.row - from, k.col, v.clone()))
-            .collect();
-        let links: Vec<_> = self
-            .hyperlinks
-            .iter()
-            .filter(|((r, _), _)| *r >= from && *r <= r2)
-            .map(|((r, c), v)| (r - from, *c, v.clone()))
-            .collect();
-        let moved_merges: Vec<_> = self
-            .merges
-            .iter()
-            .filter(|&&(mr1, _, mr2, _)| mr1 >= from && mr2 <= r2)
-            .map(|&(mr1, mc1, mr2, mc2)| (mr1 - from, mc1, mr2 - from, mc2))
-            .collect();
-        let moved_cf: Vec<_> = self
-            .cf
-            .blocks
-            .iter()
-            .filter_map(|blk| {
-                let inside: Vec<_> = blk
-                    .ranges
-                    .iter()
-                    .filter(|&&(cr1, _, cr2, _)| cr1 >= from && cr2 <= r2)
-                    .map(|&(cr1, cc1, cr2, cc2)| (cr1 - from, cc1, cr2 - from, cc2))
-                    .collect();
-                (!inside.is_empty()).then(|| (blk.rules.clone(), inside))
-            })
-            .collect();
-        let moved_dv: Vec<_> = self
-            .dv
-            .iter()
-            .filter_map(|rule| {
-                let inside: Vec<_> = rule
-                    .ranges
-                    .iter()
-                    .filter(|&&(dr1, _, dr2, _)| dr1 >= from && dr2 <= r2)
-                    .map(|&(dr1, dc1, dr2, dc2)| (dr1 - from, dc1, dr2 - from, dc2))
-                    .collect();
-                if inside.is_empty() {
-                    return None;
-                }
-                let mut cloned = rule.clone();
-                cloned.ranges = inside;
-                Some(cloned)
-            })
-            .collect();
-        let moved_sparks: Vec<_> = self
-            .sparklines
-            .iter()
-            .filter(|sp| sp.r >= from && sp.r <= r2)
-            .cloned()
-            .collect();
-        let moved_rich: Vec<_> = self
-            .rich
-            .iter()
-            .filter(|&(&(r, _), _)| r >= from && r <= r2)
-            .map(|(&(r, c), v)| (r - from, c, v.clone()))
-            .collect();
-        let heights: Vec<f32> = (from..=r2).map(|r| self.rows.size(r)).collect();
-        let hidden: Vec<bool> = (from..=r2)
-            .map(|r| self.hidden_rows_user.contains(&r) || self.hidden_rows.contains(&r))
-            .collect();
-        let levels: Vec<u8> = (from..=r2)
-            .map(|r| self.row_levels.get(&r).copied().unwrap_or(0))
-            .collect();
-        let row_styles: Vec<u16> = (from..=r2)
-            .map(|r| self.row_styles.get(&r).copied().unwrap_or(0))
-            .collect();
-
-        // Single-pass bounded `[lo..hi)` permutation on cells and explicit styles:
-        // pages `< lo / PAGE_ROWS` and `> (hi - 1) / PAGE_ROWS` are 100% untouched.
-        self.permute_cell_band(true, lo, hi, perm);
-
-        self.delete_rows_inner(from, n, false);
-        self.insert_rows_inner(at, n, false);
-
-        for (dr, c, v) in moved_rich {
-            self.rich.insert((at + dr, c), v);
-            self.rich_dirty = true;
-        }
-        for (dr1, mc1, dr2, mc2) in moved_merges {
-            let m = (at + dr1, mc1, at + dr2, mc2);
-            if !self.merges.contains(&m) {
-                self.merges.push(m);
-            }
-            self.merges_dirty = true;
-        }
-        for (rules, ranges) in moved_cf {
-            let shifted: Vec<_> = ranges
-                .into_iter()
-                .map(|(dr1, cc1, dr2, cc2)| (at + dr1, cc1, at + dr2, cc2))
-                .collect();
-            if let Some(blk) = self.cf.blocks.iter_mut().find(|b| b.rules == rules) {
-                for r in shifted {
-                    if !blk.ranges.contains(&r) {
-                        blk.ranges.push(r);
-                    }
-                }
-            } else {
-                self.cf.blocks.push(crate::cf::CfBlock { ranges: shifted, rules });
-            }
-            self.cf_dirty = true;
-        }
-        for mut rule in moved_dv {
-            rule.ranges = rule
-                .ranges
-                .into_iter()
-                .map(|(dr1, dc1, dr2, dc2)| (at + dr1, dc1, at + dr2, dc2))
-                .collect();
-            self.dv.push(rule);
-            self.dv_dirty = true;
-        }
-        for mut sp in moved_sparks {
-            sp.r = at + (sp.r - from);
-            if sp.source_sheet.is_none() && sp.rect.0 >= from && sp.rect.2 <= r2 {
-                sp.rect.0 = at + (sp.rect.0 - from);
-                sp.rect.2 = at + (sp.rect.2 - from);
-            }
-            self.sparklines.push(sp);
-            self.sparklines_dirty = true;
-        }
-        for (dr, c, mut v) in notes {
-            v.r = at + dr;
-            v.c = c;
-            self.notes.insert(CellRef::new(at + dr, c), v);
-            self.notes_dirty = true;
-        }
-        for (dr, c, mut v) in threads {
-            v.r = at + dr;
-            v.c = c;
-            self.threads.insert(CellRef::new(at + dr, c), v);
-            self.threads_dirty = true;
-        }
-        for (dr, c, v) in links {
-            self.hyperlinks.insert((at + dr, c), v);
-            self.hyperlinks_dirty = true;
-        }
-        self.rows.set_many(heights.into_iter().enumerate().map(|(i, h)| (at + i as u32, h)));
-        for (i, hid) in hidden.into_iter().enumerate() {
-            let i = i as u32;
-            if hid {
-                self.hidden_rows_user.insert(at + i);
-            }
-        }
-        for (i, lv) in levels.into_iter().enumerate() {
-            let i = i as u32;
-            if lv > 0 {
-                self.row_levels.insert(at + i, lv);
-            }
-        }
-        for (i, st) in row_styles.into_iter().enumerate() {
-            if st != 0 {
-                self.set_row_style(at + i as u32, st);
-            }
-        }
-        // 按真实行置换更新本表公式与条件格式/数据验证引用（不动置换区间外与跨表引用）
-        let own_name = self.name.clone();
-        self.rewrite_permuted_references(crate::refs::Axis::Row, from, n, at, &own_name);
-        self.layout_dirty = true;
-        self.edited = true;
+        self.move_axis_inner(mv, true);
     }
 
     /// 列版本的移动，语义同 `move_rows`
     pub fn move_cols(&mut self, from: u32, n: u32, to: u32) {
-        if n == 0 || to == from {
+        let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Col, from, n, to) else {
+            return;
+        };
+        self.move_axis_inner(mv, true);
+    }
+
+    /// Single-pass lossless axis block permutation (`[from, from+n) -> [at, at+n)`)
+    /// covering every coordinate-bearing field on `Sheet` without destructive
+    /// delete+insert passes.
+    pub(crate) fn move_axis_inner(&mut self, mv: crate::refs::AxisMove, rewrite_own_refs: bool) {
+        let (axis, from, n, at) = (mv.axis, mv.from, mv.n, mv.at);
+        if n == 0 || from == at {
             return;
         }
-        let at = if to > from { to - n } else { to };
-        if at == from {
-            return;
-        }
+        let rows = axis == crate::refs::Axis::Row;
         let lo = from.min(at);
         let hi = (from + n).max(at + n);
-        let c2 = from + n - 1;
-        let perm = |c: u32| -> u32 {
-            if c < lo || c >= hi {
-                c
-            } else if c >= from && c < from + n {
-                at + (c - from)
-            } else if at > from {
-                c - n
-            } else {
-                c + n
-            }
+        let end = from + n - 1;
+        let limit = if rows {
+            crate::sync::MAX_ROWS
+        } else {
+            crate::sync::MAX_COLS
+        };
+        let perm = |v: u32| crate::refs::permute_index(v, from, n, at);
+        let transform = crate::transform::CoordTransform::from_raw_axis_move(0, mv);
+        let del_sh = (if rows {
+            Structural::DeleteRows { at: from, n }
+        } else {
+            Structural::DeleteCols { at: from, n }
+        })
+        .reference_shift();
+        let ins_sh = (if rows {
+            Structural::InsertRows { at, n }
+        } else {
+            Structural::InsertCols { at, n }
+        })
+        .reference_shift();
+        let del_ms = MappedShift { shift: &del_sh, insertions: &[] };
+        let ins_ms = MappedShift { shift: &ins_sh, insertions: &[] };
+        let map_anchor_fallback = |v: u32| -> u32 {
+            let after_del = del_ms.map(v).unwrap_or(from);
+            ins_ms.map(after_del).unwrap_or(after_del)
         };
 
-        let notes: Vec<_> = self
-            .notes
-            .iter()
-            .filter(|(k, _)| k.col >= from && k.col <= c2)
-            .map(|(k, v)| (k.row, k.col - from, v.clone()))
-            .collect();
-        let threads: Vec<_> = self
-            .threads
-            .iter()
-            .filter(|(k, _)| k.col >= from && k.col <= c2)
-            .map(|(k, v)| (k.row, k.col - from, v.clone()))
-            .collect();
-        let links: Vec<_> = self
-            .hyperlinks
-            .iter()
-            .filter(|((_, c), _)| *c >= from && *c <= c2)
-            .map(|((r, c), v)| (*r, c - from, v.clone()))
-            .collect();
-        let moved_merges: Vec<_> = self
-            .merges
-            .iter()
-            .filter(|&&(_, mc1, _, mc2)| mc1 >= from && mc2 <= c2)
-            .map(|&(mr1, mc1, mr2, mc2)| (mr1, mc1 - from, mr2, mc2 - from))
-            .collect();
-        let moved_cf: Vec<_> = self
-            .cf
-            .blocks
-            .iter()
-            .filter_map(|blk| {
-                let inside: Vec<_> = blk
-                    .ranges
-                    .iter()
-                    .filter(|&&(_, cc1, _, cc2)| cc1 >= from && cc2 <= c2)
-                    .map(|&(cr1, cc1, cr2, cc2)| (cr1, cc1 - from, cr2, cc2 - from))
-                    .collect();
-                (!inside.is_empty()).then(|| (blk.rules.clone(), inside))
-            })
-            .collect();
-        let moved_dv: Vec<_> = self
-            .dv
-            .iter()
-            .filter_map(|rule| {
-                let inside: Vec<_> = rule
-                    .ranges
-                    .iter()
-                    .filter(|&&(_, dc1, _, dc2)| dc1 >= from && dc2 <= c2)
-                    .map(|&(dr1, dc1, dr2, dc2)| (dr1, dc1 - from, dr2, dc2 - from))
-                    .collect();
-                if inside.is_empty() {
-                    return None;
+        self.coordinates_shifted();
+
+        // 1. Pre-register legacy CSE array tails and permute spilled / spill_shapes / arrays.
+        let mut orphan_tails: Vec<(u32, u32, u32, u32)> = Vec::new();
+        if !self.arrays.is_empty() {
+            for &(anchor, (r1, c1, r2, c2)) in &self.arrays {
+                let (a, b) = if rows { (r1, r2) } else { (c1, c2) };
+                if b < lo || a >= hi {
+                    continue;
                 }
-                let mut cloned = rule.clone();
-                cloned.ranges = inside;
-                Some(cloned)
+                for r in r1..=r2 {
+                    for c in c1..=c2 {
+                        let key = CellRef::new(r, c);
+                        if key != anchor && self.get(r, c).is_none_or(|cell| cell.formula.is_none())
+                        {
+                            self.spilled.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if !self.spilled.is_empty()
+            && self.spilled.iter().any(|k| {
+                let v = if rows { k.row } else { k.col };
+                v >= lo && v < hi
             })
-            .collect();
-        let moved_sparks: Vec<_> = self
-            .sparklines
-            .iter()
-            .filter(|sp| sp.c >= from && sp.c <= c2)
-            .cloned()
-            .collect();
-        let moved_rich: Vec<_> = self
-            .rich
-            .iter()
-            .filter(|&(&(_, c), _)| c >= from && c <= c2)
-            .map(|(&(r, c), v)| (r, c - from, v.clone()))
-            .collect();
-        let widths: Vec<f32> = (from..=c2).map(|c| self.cols.size(c)).collect();
-        let hidden: Vec<bool> = (from..=c2).map(|c| self.hidden_cols.contains(&c)).collect();
-        let levels: Vec<u8> = (from..=c2)
-            .map(|c| self.col_levels.get(&c).copied().unwrap_or(0))
-            .collect();
-        let col_styles: Vec<u16> = (from..=c2)
-            .map(|c| self.col_styles.get(&c).copied().unwrap_or(0))
-            .collect();
+        {
+            self.spilled = self
+                .spilled
+                .iter()
+                .map(|k| {
+                    if rows {
+                        CellRef::new(perm(k.row), k.col)
+                    } else {
+                        CellRef::new(k.row, perm(k.col))
+                    }
+                })
+                .collect();
+        }
+        if !self.spill_shapes.is_empty()
+            && self.spill_shapes.iter().any(|(k, &(h, w))| {
+                let (s, e) = if rows {
+                    (k.row, k.row.saturating_add(h.saturating_sub(1)))
+                } else {
+                    (k.col, k.col.saturating_add(w.saturating_sub(1)))
+                };
+                e >= lo && s < hi
+            })
+        {
+            let mut next_shapes = crate::model::CellMetadata::default();
+            for (&anchor, &(h, w)) in &self.spill_shapes {
+                let new_anchor = if rows {
+                    CellRef::new(perm(anchor.row), anchor.col)
+                } else {
+                    CellRef::new(anchor.row, perm(anchor.col))
+                };
+                if h == 0 || w == 0 {
+                    next_shapes.insert(new_anchor, (0, 0));
+                    continue;
+                }
+                let r1 = anchor.row;
+                let c1 = anchor.col;
+                let r2 = r1.saturating_add(h.saturating_sub(1));
+                let c2 = c1.saturating_add(w.saturating_sub(1));
+                let intact = transform.map_rect((r1, c1, r2, c2)).is_some_and(
+                    |(nr1, nc1, nr2, nc2)| {
+                        nr1 == new_anchor.row
+                            && nc1 == new_anchor.col
+                            && nr2 - nr1 + 1 == h
+                            && nc2 - nc1 + 1 == w
+                    },
+                );
+                if intact {
+                    next_shapes.insert(new_anchor, (h, w));
+                } else {
+                    let (a, b) = if rows { (r1, r2) } else { (c1, c2) };
+                    for (pa, pb) in crate::transform::permute_axis_range_split(a, b, from, n, at) {
+                        if rows {
+                            orphan_tails.push((pa, c1, pb, c2));
+                        } else {
+                            orphan_tails.push((r1, pa, r2, pb));
+                        }
+                    }
+                    next_shapes.insert(new_anchor, (0, 0));
+                }
+            }
+            self.spill_shapes = next_shapes;
+        }
+        if !self.arrays.is_empty() {
+            self.arrays = self
+                .arrays
+                .iter()
+                .filter_map(|&(anchor, rect)| {
+                    let new_anchor = if rows {
+                        CellRef::new(perm(anchor.row), anchor.col)
+                    } else {
+                        CellRef::new(anchor.row, perm(anchor.col))
+                    };
+                    let new_rect = transform.map_rect(rect)?;
+                    (new_anchor.row >= new_rect.0
+                        && new_anchor.row <= new_rect.2
+                        && new_anchor.col >= new_rect.1
+                        && new_anchor.col <= new_rect.3)
+                        .then_some((new_anchor, new_rect))
+                })
+                .collect();
+        }
 
-        self.permute_cell_band(false, lo, hi, perm);
+        // 2. Single-pass bounded `[lo..hi)` permutation on cells and explicit styles.
+        self.permute_cell_band(rows, lo, hi, perm);
+        self.clear_orphan_spill_tails(&orphan_tails);
 
-        self.delete_cols_inner(from, n, false);
-        self.insert_cols_inner(at, n, false);
+        // 3. Merges.
+        if !self.merges.is_empty() {
+            let mut changed = false;
+            let mut next = Vec::with_capacity(self.merges.len());
+            for &(r1, c1, r2, c2) in self.merges.iter() {
+                let mapped = if let Some(nm) = transform.map_rect((r1, c1, r2, c2)) {
+                    Some(nm)
+                } else if rows {
+                    del_ms
+                        .map_range(r1, r2)
+                        .and_then(|(a, b)| ins_ms.map_range(a, b))
+                        .filter(|&(a, b)| b > a || c2 > c1)
+                        .map(|(a, b)| (a, c1, b, c2))
+                } else {
+                    del_ms
+                        .map_range(c1, c2)
+                        .and_then(|(a, b)| ins_ms.map_range(a, b))
+                        .filter(|&(a, b)| r2 > r1 || b > a)
+                        .map(|(a, b)| (r1, a, r2, b))
+                };
+                if let Some(m) = mapped {
+                    if m != (r1, c1, r2, c2) {
+                        changed = true;
+                    }
+                    if !next.contains(&m) {
+                        next.push(m);
+                    }
+                } else {
+                    changed = true;
+                }
+            }
+            if changed {
+                self.merges = next.into();
+                self.merges_dirty = true;
+            }
+        }
 
-        for (r, dc, v) in moved_rich {
-            self.rich.insert((r, at + dc), v);
+        // 4. Notes, threads, rich text, ignored errors (exact bijective point permutation).
+        if !self.notes.is_empty()
+            && self.notes.keys().any(|k| {
+                let v = if rows { k.row } else { k.col };
+                v >= lo && v < hi
+            })
+        {
+            let old = std::mem::take(&mut self.notes);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for (k, mut v) in old {
+                let nk = if rows {
+                    CellRef::new(perm(k.row), k.col)
+                } else {
+                    CellRef::new(k.row, perm(k.col))
+                };
+                v.r = nk.row;
+                v.c = nk.col;
+                out.insert(nk, v);
+            }
+            self.notes = out.into();
+            self.notes_dirty = true;
+        }
+        if !self.threads.is_empty()
+            && self.threads.keys().any(|k| {
+                let v = if rows { k.row } else { k.col };
+                v >= lo && v < hi
+            })
+        {
+            let old = std::mem::take(&mut self.threads);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for (k, mut v) in old {
+                let nk = if rows {
+                    CellRef::new(perm(k.row), k.col)
+                } else {
+                    CellRef::new(k.row, perm(k.col))
+                };
+                v.r = nk.row;
+                v.c = nk.col;
+                out.insert(nk, v);
+            }
+            self.threads = out;
+            self.threads_dirty = true;
+        }
+        if !self.rich.is_empty()
+            && self.rich.keys().any(|&(r, c)| {
+                let v = if rows { r } else { c };
+                v >= lo && v < hi
+            })
+        {
+            let old = std::mem::take(&mut self.rich);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for ((r, c), runs) in old {
+                let nk = if rows { (perm(r), c) } else { (r, perm(c)) };
+                out.insert(nk, runs);
+            }
+            self.rich = out.into();
             self.rich_dirty = true;
         }
-        for (mr1, dc1, mr2, dc2) in moved_merges {
-            let m = (mr1, at + dc1, mr2, at + dc2);
-            if !self.merges.contains(&m) {
-                self.merges.push(m);
+        if !self.ignored_errors.is_empty()
+            && self.ignored_errors.iter().any(|&(r, c)| {
+                let v = if rows { r } else { c };
+                v >= lo && v < hi
+            })
+        {
+            let old = std::mem::take(&mut self.ignored_errors);
+            let mut out = HashSet::with_capacity(old.len());
+            for (r, c) in old {
+                let nk = if rows { (perm(r), c) } else { (r, perm(c)) };
+                out.insert(nk);
             }
-            self.merges_dirty = true;
+            self.ignored_errors = out.into();
+            self.ignored_errors_dirty = true;
         }
-        for (rules, ranges) in moved_cf {
-            let shifted: Vec<_> = ranges
-                .into_iter()
-                .map(|(cr1, dc1, cr2, dc2)| (cr1, at + dc1, cr2, at + dc2))
+
+        // 5. Hyperlinks (anchors, spans, and internal `location`).
+        if !self.hyperlinks.is_empty() {
+            let own_name = self.name.clone();
+            let need_keys = self.hyperlinks.iter().any(|(&(r, c), link)| {
+                let (s, e) = if rows {
+                    (r, r.saturating_add(link.span.0))
+                } else {
+                    (c, c.saturating_add(link.span.1))
+                };
+                e >= lo && s < hi
+            });
+            let need_locs = self.hyperlinks.values().any(|l| !l.location.is_empty());
+            if need_keys || need_locs {
+                let old = std::mem::take(&mut self.hyperlinks);
+                let mut next = std::collections::HashMap::with_capacity(old.len());
+                let mut changed = false;
+                for ((r, c), mut link) in old {
+                    if !link.location.is_empty()
+                        && let Some(updated) = crate::transform::rewrite_internal_link_location(
+                            &link.location,
+                            &own_name,
+                            &transform,
+                        )
+                        && updated != link.location
+                    {
+                        link.location = updated;
+                        changed = true;
+                    }
+                    let nk = if link.span == (0, 0) {
+                        if rows { (perm(r), c) } else { (r, perm(c)) }
+                    } else {
+                        let rect = (r, c, r.saturating_add(link.span.0), c.saturating_add(link.span.1));
+                        if let Some((nr1, nc1, nr2, nc2)) = transform.map_rect(rect) {
+                            link.span = (nr2 - nr1, nc2 - nc1);
+                            (nr1, nc1)
+                        } else {
+                            link.span = (0, 0);
+                            changed = true;
+                            if rows { (perm(r), c) } else { (r, perm(c)) }
+                        }
+                    };
+                    if nk != (r, c) {
+                        changed = true;
+                    }
+                    next.insert(nk, link);
+                }
+                self.hyperlinks = next.into();
+                self.hyperlinks_dirty |= changed;
+            }
+        }
+
+        // 6. Conditional formatting & data validation ranges (exact cell-set preservation).
+        let permute_rect_list = |ranges: &mut Vec<(u32, u32, u32, u32)>| -> bool {
+            let mut changed = false;
+            let mut out = Vec::with_capacity(ranges.len());
+            for &(r1, c1, r2, c2) in ranges.iter() {
+                let (a, b) = if rows { (r1, r2) } else { (c1, c2) };
+                if a == 0 && b == limit - 1 {
+                    out.push((r1, c1, r2, c2));
+                    continue;
+                }
+                let pieces = crate::transform::permute_axis_range_split(a, b, from, n, at);
+                if pieces.len() == 1 && pieces[0] == (a.min(b), a.max(b)) {
+                    out.push((r1, c1, r2, c2));
+                } else {
+                    changed = true;
+                    for (pa, pb) in pieces {
+                        let nr = if rows { (pa, c1, pb, c2) } else { (r1, pa, r2, pb) };
+                        if !out.contains(&nr) {
+                            out.push(nr);
+                        }
+                    }
+                }
+            }
+            if changed {
+                *ranges = out;
+            }
+            changed
+        };
+        for blk in &mut self.cf.blocks {
+            if permute_rect_list(&mut blk.ranges) {
+                self.cf_dirty = true;
+            }
+        }
+        for rule in &mut self.dv {
+            if permute_rect_list(&mut rule.ranges) {
+                self.dv_dirty = true;
+            }
+        }
+
+        // 7. Target-sheet sparklines (anchors & unqualified same-sheet data rects).
+        if !self.sparklines.is_empty() {
+            let mut changed = false;
+            for sp in &mut self.sparklines {
+                if rows {
+                    let nr = perm(sp.r);
+                    if nr != sp.r {
+                        sp.r = nr;
+                        changed = true;
+                    }
+                } else {
+                    let nc = perm(sp.c);
+                    if nc != sp.c {
+                        sp.c = nc;
+                        changed = true;
+                    }
+                }
+                if sp.source_sheet.is_none() {
+                    match transform.map_rect(sp.rect) {
+                        Some(nr) => {
+                            if nr != sp.rect {
+                                sp.rect = nr;
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            sp.source_sheet = Some(String::new());
+                            sp.rect = (0, 0, 0, 0);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            self.sparklines_dirty |= changed;
+        }
+
+        // 8. Protected ranges & scenarios.
+        if !self.protected_ranges.is_empty() {
+            let mut changed = false;
+            for pr in &mut self.protected_ranges {
+                changed |= permute_rect_list(&mut pr.sqref);
+            }
+            self.protected_ranges_dirty |= changed;
+        }
+        crate::scenarios::transform_references(self, &transform);
+
+        // 9. Axis layout: sizes, hidden intervals, outline levels, row/col default styles.
+        {
+            let ax = if rows { &mut self.rows } else { &mut self.cols };
+            let moved_sizes: Vec<(u32, f32)> = ax
+                .spans()
+                .iter()
+                .filter(|sp| sp.end >= from && sp.start <= end)
+                .flat_map(|sp| {
+                    let s = sp.start.max(from);
+                    let e = sp.end.min(end);
+                    let sz = sp.size;
+                    (s..=e).map(move |idx| (at + (idx - from), sz))
+                })
                 .collect();
-            if let Some(blk) = self.cf.blocks.iter_mut().find(|b| b.rules == rules) {
-                for r in shifted {
-                    if !blk.ranges.contains(&r) {
-                        blk.ranges.push(r);
+            let mut ax_changed = ax.shift_axis(from, n, true);
+            ax_changed |= ax.shift_axis(at, n, false);
+            if !moved_sizes.is_empty() {
+                ax.set_many(moved_sizes);
+                ax_changed = true;
+            }
+            self.layout_dirty |= ax_changed;
+        }
+        let permute_hidden = |hidden: &mut crate::layout::HiddenIndices| -> bool {
+            if hidden.is_empty() || !hidden.intersects_range(lo, hi - 1) {
+                return false;
+            }
+            let mut mapped = Vec::with_capacity(hidden.intervals().len() + 2);
+            for &(a, b) in hidden.intervals() {
+                mapped.extend(crate::transform::permute_axis_range_split(a, b, from, n, at));
+            }
+            let next = crate::layout::HiddenIndices::from_intervals(mapped);
+            if next != *hidden {
+                *hidden = next;
+                true
+            } else {
+                false
+            }
+        };
+        if rows {
+            self.layout_dirty |= permute_hidden(&mut self.hidden_rows);
+            self.layout_dirty |= permute_hidden(&mut self.hidden_rows_user);
+        } else {
+            self.layout_dirty |= permute_hidden(&mut self.hidden_cols);
+        }
+        let levels = if rows { &mut self.row_levels } else { &mut self.col_levels };
+        if !levels.is_empty() && levels.keys().any(|&p| p >= lo && p < hi) {
+            *levels = std::mem::take(levels)
+                .into_iter()
+                .map(|(p, lv)| (perm(p), lv))
+                .collect();
+            self.layout_dirty = true;
+        }
+        let axis_styles = if rows { &mut self.row_styles } else { &mut self.col_styles };
+        if !axis_styles.is_empty() && axis_styles.keys().any(|&p| p >= lo && p < hi) {
+            let old = std::mem::take(axis_styles);
+            let mut out = std::collections::HashMap::with_capacity(old.len());
+            for (p, st) in old {
+                out.insert(perm(p), st);
+            }
+            if rows {
+                self.row_styles = out.into();
+                self.row_styles_dirty = true;
+            } else {
+                self.col_styles = out.into();
+                self.col_styles_dirty = true;
+            }
+            self.styles_dirty = true;
+        }
+
+        // 10. Freeze pane.
+        if let Some((fr, fc)) = self.freeze {
+            let next = if rows {
+                let after_del = if fr >= from + n { fr - n } else { from.min(fr) };
+                let after_ins = if after_del > at { after_del + n } else { after_del };
+                (after_ins, fc)
+            } else {
+                let after_del = if fc >= from + n { fc - n } else { from.min(fc) };
+                let after_ins = if after_del > at { after_del + n } else { after_del };
+                (fr, after_ins)
+            };
+            if next != (fr, fc) {
+                self.freeze = Some(next);
+                self.freeze_dirty = true;
+            }
+        }
+
+        // 11. AutoFilter.
+        if let Some(f) = &mut self.filter {
+            if let Some(nr) = transform.map_rect(f.range) {
+                if nr != f.range {
+                    f.range = nr;
+                    self.filter_dirty = true;
+                }
+                if !rows {
+                    if !f.allows.is_empty() {
+                        f.allows = std::mem::take(&mut f.allows)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
+                    }
+                    if !f.criteria.is_empty() {
+                        f.criteria = std::mem::take(&mut f.criteria)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
+                    }
+                    if !f.date_groups.is_empty() {
+                        f.date_groups = std::mem::take(&mut f.date_groups)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
+                    }
+                    if !f.color_filters.is_empty() {
+                        f.color_filters = std::mem::take(&mut f.color_filters)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
+                    }
+                    if !f.top_filters.is_empty() {
+                        f.top_filters = std::mem::take(&mut f.top_filters)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
+                    }
+                    if !f.dynamic_filters.is_empty() {
+                        f.dynamic_filters = std::mem::take(&mut f.dynamic_filters)
+                            .into_iter()
+                            .map(|(c, v)| (perm(c), v))
+                            .collect();
+                        self.filter_dirty = true;
                     }
                 }
             } else {
-                self.cf.blocks.push(crate::cf::CfBlock { ranges: shifted, rules });
-            }
-            self.cf_dirty = true;
-        }
-        for mut rule in moved_dv {
-            rule.ranges = rule
-                .ranges
-                .into_iter()
-                .map(|(dr1, dc1, dr2, dc2)| (dr1, at + dc1, dr2, at + dc2))
-                .collect();
-            self.dv.push(rule);
-            self.dv_dirty = true;
-        }
-        for mut sp in moved_sparks {
-            sp.c = at + (sp.c - from);
-            if sp.source_sheet.is_none() && sp.rect.1 >= from && sp.rect.3 <= c2 {
-                sp.rect.1 = at + (sp.rect.1 - from);
-                sp.rect.3 = at + (sp.rect.3 - from);
-            }
-            self.sparklines.push(sp);
-            self.sparklines_dirty = true;
-        }
-        for (r, dc, mut v) in notes {
-            v.r = r;
-            v.c = at + dc;
-            self.notes.insert(CellRef::new(r, at + dc), v);
-            self.notes_dirty = true;
-        }
-        for (r, dc, mut v) in threads {
-            v.r = r;
-            v.c = at + dc;
-            self.threads.insert(CellRef::new(r, at + dc), v);
-            self.threads_dirty = true;
-        }
-        for (r, dc, v) in links {
-            self.hyperlinks.insert((r, at + dc), v);
-            self.hyperlinks_dirty = true;
-        }
-        self.cols.set_many(widths.into_iter().enumerate().map(|(i, w)| (at + i as u32, w)));
-        for (i, hid) in hidden.into_iter().enumerate() {
-            let i = i as u32;
-            if hid {
-                self.hidden_cols.insert(at + i);
+                self.shift_filter(&del_ms);
+                self.shift_filter(&ins_ms);
             }
         }
-        for (i, lv) in levels.into_iter().enumerate() {
-            let i = i as u32;
-            if lv > 0 {
-                self.col_levels.insert(at + i, lv);
+
+        // 12. Tables.
+        if !self.tables.is_empty() {
+            let mut changed = false;
+            let mut kept = Vec::with_capacity(self.tables.len());
+            let mut straddling = Vec::new();
+            for mut t in std::mem::take(&mut self.tables) {
+                let (_, c1, _, c2) = t.range;
+                if let Some(nr) = transform.map_rect(t.range) {
+                    if !rows
+                        && lo >= c1
+                        && hi <= c2 + 1
+                        && t.columns.len() == (c2 - c1 + 1) as usize
+                    {
+                        let mut reordered = vec![String::new(); t.columns.len()];
+                        for (i, col_name) in t.columns.iter().enumerate() {
+                            let dest = (perm(c1 + i as u32) - nr.1) as usize;
+                            reordered[dest] = col_name.clone();
+                        }
+                        if reordered != t.columns {
+                            t.columns = reordered;
+                            changed = true;
+                        }
+                    }
+                    if nr != t.range {
+                        t.range = nr;
+                        changed = true;
+                    }
+                    kept.push(t);
+                } else {
+                    straddling.push(t);
+                }
+            }
+            if !straddling.is_empty() {
+                self.tables = straddling;
+                self.shift_tables(&del_ms);
+                if rows {
+                    self.adjust_tables_for_row_insert(at, n);
+                } else {
+                    self.shift_tables(&ins_ms);
+                }
+                kept.extend(std::mem::take(&mut self.tables));
+                changed = true;
+            }
+            self.tables = kept;
+            self.tables_dirty |= changed;
+        }
+
+        // 13. Drawing anchors (pictures, textboxes, chart anchors) & PageSetup.
+        if !self.pictures.is_empty() {
+            let mut changed = false;
+            for pic in &mut self.pictures {
+                let next = if let Some(nr) = transform.map_rect(pic.rect) {
+                    nr
+                } else if rows {
+                    let nr1 = map_anchor_fallback(pic.rect.0);
+                    let nr2 = map_anchor_fallback(pic.rect.2).max(nr1);
+                    (nr1, pic.rect.1, nr2, pic.rect.3)
+                } else {
+                    let nc1 = map_anchor_fallback(pic.rect.1);
+                    let nc2 = map_anchor_fallback(pic.rect.3).max(nc1);
+                    (pic.rect.0, nc1, pic.rect.2, nc2)
+                };
+                if next != pic.rect {
+                    pic.rect = next;
+                    changed = true;
+                }
+            }
+            self.pictures_dirty |= changed;
+        }
+        if !self.textboxes.is_empty() {
+            let mut changed = false;
+            for tb in &mut self.textboxes {
+                let (c1, dx1, r1, dy1) = tb.from;
+                let (c2, dx2, r2, dy2) = tb.to;
+                if let Some((nr1, nc1, nr2, nc2)) = transform.map_rect((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2))) {
+                    if (nr1, nc1, nr2, nc2) != (r1, c1, r2, c2) {
+                        tb.from = (nc1, dx1, nr1, dy1);
+                        tb.to = (nc2, dx2, nr2, dy2);
+                        changed = true;
+                    }
+                } else if rows {
+                    let nr1 = map_anchor_fallback(r1);
+                    let nr2 = map_anchor_fallback(r2).max(nr1);
+                    if (nr1, nr2) != (r1, r2) {
+                        tb.from = (c1, dx1, nr1, dy1);
+                        tb.to = (c2, dx2, nr2, dy2);
+                        changed = true;
+                    }
+                } else {
+                    let nc1 = map_anchor_fallback(c1);
+                    let nc2 = map_anchor_fallback(c2).max(nc1);
+                    if (nc1, nc2) != (c1, c2) {
+                        tb.from = (nc1, dx1, r1, dy1);
+                        tb.to = (nc2, dx2, r2, dy2);
+                        changed = true;
+                    }
+                }
+            }
+            self.textboxes_dirty |= changed;
+        }
+        if !self.charts.is_empty() {
+            let mut changed = false;
+            for ch in &mut self.charts {
+                let (r1, c1, r2, c2) = ch.anchor;
+                let next = if let Some(nr) = transform.map_rect((r1, c1, r2, c2)) {
+                    nr
+                } else if rows {
+                    let nr1 = map_anchor_fallback(r1);
+                    let nr2 = map_anchor_fallback(r2).max(nr1);
+                    (nr1, c1, nr2, c2)
+                } else {
+                    let nc1 = map_anchor_fallback(c1);
+                    let nc2 = map_anchor_fallback(c2).max(nc1);
+                    (r1, nc1, r2, nc2)
+                };
+                if next != ch.anchor {
+                    ch.anchor = next;
+                    changed = true;
+                }
+            }
+            self.charts_dirty |= changed;
+        }
+        let mut page_changed = false;
+        if let Some((r1, c1, r2, c2)) = self.page.print_area {
+            let next = transform.map_rect((r1, c1, r2, c2)).or_else(|| {
+                if rows {
+                    del_ms
+                        .map_range(r1, r2)
+                        .and_then(|(a, b)| ins_ms.map_range(a, b))
+                        .map(|(a, b)| (a, c1, b, c2))
+                } else {
+                    del_ms
+                        .map_range(c1, c2)
+                        .and_then(|(a, b)| ins_ms.map_range(a, b))
+                        .map(|(a, b)| (r1, a, r2, b))
+                }
+            });
+            if next != self.page.print_area {
+                self.page.print_area = next;
+                page_changed = true;
             }
         }
-        for (i, st) in col_styles.into_iter().enumerate() {
-            if st != 0 {
-                self.set_col_style(at + i as u32, st);
+        if rows {
+            if let Some((a, b)) = self.page.title_rows {
+                let next = transform
+                    .map_range(a, b)
+                    .or_else(|| del_ms.map_range(a, b).and_then(|(x, y)| ins_ms.map_range(x, y)));
+                if next != self.page.title_rows {
+                    self.page.title_rows = next;
+                    page_changed = true;
+                }
+            }
+            if !self.page.row_breaks.is_empty() {
+                let mut next: Vec<u32> = self
+                    .page
+                    .row_breaks
+                    .iter()
+                    .map(|&b| perm(b))
+                    .filter(|&b| b > 0)
+                    .collect();
+                next.sort_unstable();
+                next.dedup();
+                if next != self.page.row_breaks {
+                    self.page.row_breaks = next;
+                    page_changed = true;
+                }
+            }
+        } else {
+            if let Some((a, b)) = self.page.title_cols {
+                let next = transform
+                    .map_range(a, b)
+                    .or_else(|| del_ms.map_range(a, b).and_then(|(x, y)| ins_ms.map_range(x, y)));
+                if next != self.page.title_cols {
+                    self.page.title_cols = next;
+                    page_changed = true;
+                }
+            }
+            if !self.page.col_breaks.is_empty() {
+                let mut next: Vec<u32> = self
+                    .page
+                    .col_breaks
+                    .iter()
+                    .map(|&b| perm(b))
+                    .filter(|&b| b > 0)
+                    .collect();
+                next.sort_unstable();
+                next.dedup();
+                if next != self.page.col_breaks {
+                    self.page.col_breaks = next;
+                    page_changed = true;
+                }
             }
         }
-        // 按真实列置换更新本表公式与条件格式/数据验证引用（不动置换区间外与跨表引用）
-        let own_name = self.name.clone();
-        self.rewrite_permuted_references(crate::refs::Axis::Col, from, n, at, &own_name);
+        self.page_dirty |= page_changed;
+
+        // 14. Standalone `Sheet::move_rows`/`move_cols` rewrites own-sheet refs immediately;
+        //     `move_rows_wb`/`move_cols_wb` delegates all sheets to `CoordTransform::apply_workbook_references`.
+        if rewrite_own_refs {
+            let own_name = self.name.clone();
+            transform.rewrite_sheet_formulas_cf_dv(self, &own_name);
+            for ch in self.charts.iter_mut() {
+                if ch.rewrite_with_transform(&transform, &own_name, &own_name) {
+                    self.charts_dirty = true;
+                }
+            }
+            transform.remap_sheet_qualified_sparklines(self, &own_name);
+        }
         self.layout_dirty = true;
         self.edited = true;
     }
@@ -1893,6 +2102,63 @@ impl crate::layout::Axis {
     }
 }
 
+/// Reason a partial cell shift (`CellShift`) cannot safely execute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellShiftConflict {
+    InvalidTarget,
+    Overflow,
+    PartialMerge,
+    Table,
+    Pivot,
+    ArrayOrSpill,
+    AutoFilter,
+    Chart,
+    Sparkline,
+    ProtectedRange,
+    Scenario,
+    PartialHyperlink,
+}
+
+impl CellShiftConflict {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Self::InvalidTarget => "插入/删除单元格的目标区域无效，未执行操作",
+            Self::Overflow => "插入/删除区域超出工作表边界，无法移动单元格",
+            Self::PartialMerge => "位移区域与合并单元格部分交叉，请先取消合并或改用整行/整列插入删除",
+            Self::Table => "位移区域与表格对象相交，请改用整行/整列插入删除或先转换为普通区域",
+            Self::Pivot => "位移区域与数据透视表相交，无法部分移动单元格",
+            Self::ArrayOrSpill => "位移区域涉及数组公式或动态数组溢出区，无法部分移动单元格",
+            Self::AutoFilter => "位移区域与自动筛选区域相交，请先关闭筛选或改用整行/整列插入删除",
+            Self::Chart => "位移区域涉及图表数据源，无法部分移动单元格，请改用整行/整列插入删除",
+            Self::Sparkline => "位移区域涉及迷你图或迷你图数据源，无法部分移动单元格，请改用整行/整列插入删除",
+            Self::ProtectedRange => "位移区域与允许编辑区域相交，请改用整行/整列插入删除",
+            Self::Scenario => "位移区域涉及方案管理器可变单元格，无法部分移动单元格，请改用整行/整列插入删除",
+            Self::PartialHyperlink => "位移区域与多格超链接区域部分交叉，请改用整行/整列插入删除",
+        }
+    }
+}
+
+impl std::fmt::Display for CellShiftConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+#[inline]
+fn norm_rect((r1, c1, r2, c2): (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    (r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2))
+}
+
+#[inline]
+fn rects_intersect(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+#[inline]
+fn point_in_rect((r, c): (u32, u32), rect: (u32, u32, u32, u32)) -> bool {
+    r >= rect.0 && r <= rect.2 && c >= rect.1 && c <= rect.3
+}
+
 /// A local shift moves the selected rows or columns by the width or height of
 /// the selection. The same geometry drives cell storage, references and bindings.
 #[derive(Clone, Copy, Debug)]
@@ -1918,6 +2184,308 @@ impl CellShift {
         }
     }
 
+    fn moving_ray(&self) -> Option<(u32, u32, u32, u32)> {
+        if self.count() == 0 {
+            return None;
+        }
+        let (r1, c1, r2, c2) = self.rect;
+        Some(match self.direction {
+            crate::cells::Shift::Vertical => (r1, c1, crate::sync::MAX_ROWS - 1, c2),
+            crate::cells::Shift::Horizontal => (r1, c1, r2, crate::sync::MAX_COLS - 1),
+        })
+    }
+
+    pub(crate) fn preflight_objects(
+        &self,
+        wb: &crate::Workbook,
+        sheet_idx: usize,
+    ) -> Result<(), CellShiftConflict> {
+        let Some(sheet) = wb.sheets.get(sheet_idx) else {
+            return Err(CellShiftConflict::InvalidTarget);
+        };
+        let Some(ray) = self.moving_ray() else {
+            return Err(CellShiftConflict::InvalidTarget);
+        };
+        if sheet.tables.iter().any(|t| rects_intersect(norm_rect(t.range), ray)) {
+            return Err(CellShiftConflict::Table);
+        }
+        let target_sid = sheet.identity;
+        let target_name = sheet.name.as_str();
+        let pivot_hit = wb.pivots.iter().any(|p| {
+            let is_src = p.source_sheet_id == Some(target_sid)
+                || p.source_sheet.eq_ignore_ascii_case(target_name);
+            (is_src && rects_intersect(norm_rect(p.spec.source), ray))
+                || (p.target_sheet == sheet_idx
+                    && (rects_intersect(norm_rect(p.rect), ray) || point_in_rect(p.anchor, ray)))
+        }) || wb.pivots_pending.iter().any(|(idx, spec, _, out, _)| {
+            *idx == sheet_idx
+                && (rects_intersect(norm_rect(spec.source), ray)
+                    || rects_intersect(norm_rect(*out), ray))
+        }) || wb.pivots_pending2.iter().any(|(idx, spec, _, out)| {
+            *idx == sheet_idx
+                && (rects_intersect(norm_rect(spec.source), ray)
+                    || rects_intersect(norm_rect(*out), ray))
+        });
+        if pivot_hit {
+            return Err(CellShiftConflict::Pivot);
+        }
+        let array_or_spill_hit = sheet.arrays.iter().any(|&(anchor, rect)| {
+            point_in_rect((anchor.row, anchor.col), ray) || rects_intersect(norm_rect(rect), ray)
+        }) || sheet.spill_shapes.iter().any(|(&anchor, &(h, w))| {
+            let spill_rect = (
+                anchor.row,
+                anchor.col,
+                anchor.row.saturating_add(h.saturating_sub(1)),
+                anchor.col.saturating_add(w.saturating_sub(1)),
+            );
+            rects_intersect(spill_rect, ray)
+        }) || sheet.spilled.iter().any(|k| point_in_rect((k.row, k.col), ray))
+            || (!sheet.spilled.is_empty()
+                && sheet.spill_shapes.is_empty()
+                && sheet.formula_cells().any(|(k, _)| {
+                    point_in_rect((k.row, k.col), ray)
+                        && (k
+                            .row
+                            .checked_add(1)
+                            .is_some_and(|r| sheet.spilled.contains(&CellRef::new(r, k.col)))
+                            || k.col
+                                .checked_add(1)
+                                .is_some_and(|c| sheet.spilled.contains(&CellRef::new(k.row, c))))
+                }));
+        if array_or_spill_hit {
+            return Err(CellShiftConflict::ArrayOrSpill);
+        }
+        if sheet
+            .filter
+            .as_ref()
+            .is_some_and(|f| rects_intersect(norm_rect(f.range), ray))
+        {
+            return Err(CellShiftConflict::AutoFilter);
+        }
+        // Guard chart data references (target & foreign sheets) referencing the moving ray.
+        let transform = crate::transform::CoordTransform::from_cell_shift(sheet_idx, self);
+        let chart_hit = wb.sheets.iter().enumerate().any(|(si, sh)| {
+            let own_is_target = si == sheet_idx;
+            sh.charts.iter().any(|ch| {
+                crate::transform::chart_ref_intersects_ray(
+                    &ch.source_range,
+                    own_is_target,
+                    &sh.name,
+                    target_name,
+                    ray,
+                    &transform,
+                ) || ch.series.iter().any(|s| {
+                    [&s.name_ref, &s.cat_ref, &s.val_ref, &s.size_ref]
+                        .into_iter()
+                        .any(|r| {
+                            crate::transform::chart_ref_intersects_ray(
+                                r,
+                                own_is_target,
+                                &sh.name,
+                                target_name,
+                                ray,
+                                &transform,
+                            )
+                        })
+                })
+            })
+        });
+        if chart_hit {
+            return Err(CellShiftConflict::Chart);
+        }
+        // Guard sparklines whose anchor sits in the ray or whose data rect targets the ray.
+        let sparkline_hit = sheet.sparklines.iter().any(|sp| point_in_rect((sp.r, sp.c), ray))
+            || wb.sheets.iter().enumerate().any(|(si, sh)| {
+                sh.sparklines.iter().any(|sp| {
+                    let targets_sheet = (si == sheet_idx && sp.source_sheet.is_none())
+                        || sp
+                            .source_sheet
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(target_name));
+                    targets_sheet && rects_intersect(norm_rect(sp.rect), ray)
+                })
+            });
+        if sparkline_hit {
+            return Err(CellShiftConflict::Sparkline);
+        }
+        // Guard protected ranges intersecting the moving ray.
+        if sheet
+            .protected_ranges
+            .iter()
+            .any(|pr| pr.sqref.iter().any(|&sq| rects_intersect(norm_rect(sq), ray)))
+        {
+            return Err(CellShiftConflict::ProtectedRange);
+        }
+        // Guard scenarios & scenario_settings.sqref intersecting the moving ray.
+        let scenario_hit = sheet
+            .scenarios
+            .iter()
+            .any(|sc| sc.cells.iter().any(|&(pos, _)| point_in_rect(pos, ray)))
+            || sheet.scenario_settings.sqref.as_deref().is_some_and(|sq| {
+                crate::scenarios::sqref_rects(sq)
+                    .into_iter()
+                    .any(|r| rects_intersect(r, ray))
+            });
+        if scenario_hit {
+            return Err(CellShiftConflict::Scenario);
+        }
+        // Guard multi-cell hyperlinks (`span != (0, 0)`) partially crossing the band/boundary.
+        let (r1, c1, r2, c2) = self.rect;
+        for (&(hr, hc), link) in sheet.hyperlinks.iter() {
+            if link.span == (0, 0) {
+                continue;
+            }
+            let rect = (hr, hc, hr.saturating_add(link.span.0), hc.saturating_add(link.span.1));
+            if !rects_intersect(rect, ray) {
+                continue;
+            }
+            let supported = match self.direction {
+                crate::cells::Shift::Vertical => {
+                    rect.1 >= c1
+                        && rect.3 <= c2
+                        && if self.insert {
+                            rect.0 >= r1
+                        } else {
+                            (rect.0 >= r1 && rect.2 <= r2) || rect.0 > r2
+                        }
+                }
+                crate::cells::Shift::Horizontal => {
+                    rect.0 >= r1
+                        && rect.2 <= r2
+                        && if self.insert {
+                            rect.1 >= c1
+                        } else {
+                            (rect.1 >= c1 && rect.3 <= c2) || rect.1 > c2
+                        }
+                }
+            };
+            if !supported {
+                return Err(CellShiftConflict::PartialHyperlink);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_merges(&self, sheet: &Sheet) -> Result<(), CellShiftConflict> {
+        let Some(ray) = self.moving_ray() else {
+            return Err(CellShiftConflict::InvalidTarget);
+        };
+        let (r1, c1, r2, c2) = self.rect;
+        for &raw in sheet.merges.iter() {
+            let m = norm_rect(raw);
+            if !rects_intersect(m, ray) {
+                continue;
+            }
+            let supported = match self.direction {
+                crate::cells::Shift::Vertical => {
+                    m.1 >= c1
+                        && m.3 <= c2
+                        && if self.insert {
+                            m.0 >= r1
+                        } else {
+                            (m.0 >= r1 && m.2 <= r2) || m.0 > r2
+                        }
+                }
+                crate::cells::Shift::Horizontal => {
+                    m.0 >= r1
+                        && m.2 <= r2
+                        && if self.insert {
+                            m.1 >= c1
+                        } else {
+                            (m.1 >= c1 && m.3 <= c2) || m.1 > c2
+                        }
+                }
+            };
+            if !supported {
+                return Err(CellShiftConflict::PartialMerge);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shifted_merges(
+        &self,
+        merges: &[(u32, u32, u32, u32)],
+    ) -> Option<Vec<(u32, u32, u32, u32)>> {
+        let n = self.count();
+        if n == 0 {
+            return None;
+        }
+        let (r1, c1, r2, c2) = self.rect;
+        let mut out = Vec::with_capacity(merges.len());
+        for &m in merges {
+            match (self.direction, self.insert) {
+                (crate::cells::Shift::Vertical, true) => {
+                    if m.0 >= r1 && m.1 >= c1 && m.3 <= c2 {
+                        let nr2 = m.2.checked_add(n)?;
+                        if nr2 >= crate::sync::MAX_ROWS {
+                            return None;
+                        }
+                        out.push((m.0 + n, m.1, nr2, m.3));
+                    } else {
+                        out.push(m);
+                    }
+                }
+                (crate::cells::Shift::Horizontal, true) => {
+                    if m.0 >= r1 && m.2 <= r2 && m.1 >= c1 {
+                        let nc2 = m.3.checked_add(n)?;
+                        if nc2 >= crate::sync::MAX_COLS {
+                            return None;
+                        }
+                        out.push((m.0, m.1 + n, m.2, nc2));
+                    } else {
+                        out.push(m);
+                    }
+                }
+                (crate::cells::Shift::Vertical, false) => {
+                    if m.1 >= c1 && m.3 <= c2 {
+                        if m.0 >= r1 && m.2 < r1 + n {
+                            continue;
+                        }
+                        if m.0 >= r1 + n {
+                            out.push((m.0 - n, m.1, m.2 - n, m.3));
+                            continue;
+                        }
+                    }
+                    out.push(m);
+                }
+                (crate::cells::Shift::Horizontal, false) => {
+                    if m.0 >= r1 && m.2 <= r2 {
+                        if m.1 >= c1 && m.3 < c1 + n {
+                            continue;
+                        }
+                        if m.1 >= c1 + n {
+                            out.push((m.0, m.1 - n, m.2, m.3 - n));
+                            continue;
+                        }
+                    }
+                    out.push(m);
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Validate that this partial cell shift can safely apply to `wb.sheets[sheet_idx]`.
+    pub fn preflight(
+        &self,
+        wb: &crate::Workbook,
+        sheet_idx: usize,
+    ) -> Result<(), CellShiftConflict> {
+        let Some(sheet) = wb.sheets.get(sheet_idx) else {
+            return Err(CellShiftConflict::InvalidTarget);
+        };
+        let n = self.count();
+        if n == 0 {
+            return Err(CellShiftConflict::InvalidTarget);
+        }
+        if self.insert && crate::cells::insert_would_overflow(sheet, self.rect, self.direction, n) {
+            return Err(CellShiftConflict::Overflow);
+        }
+        self.preflight_merges(sheet)?;
+        self.preflight_objects(wb, sheet_idx)
+    }
+
     pub(crate) fn reference_shift(&self) -> crate::refs::Shift {
         let (r1, c1, r2, c2) = self.rect;
         let (axis, at, row_filter, col_filter) = match self.direction {
@@ -1937,13 +2505,12 @@ impl CellShift {
 
     /// Positions whose formula text this edit rewrites, including references outside the moved band.
     pub fn affected_formula_positions(&self, sheet: &Sheet, target_name: &str) -> Vec<(u32, u32)> {
-        let mut mapping = self.reference_shift();
-        mapping.target_sheet = target_name.to_owned();
-        mapping.own_sheet.clone_from(&sheet.name);
-        let shift = MappedShift { shift: &mapping, insertions: &[] };
+        let transform = crate::transform::CoordTransform::from_cell_shift(0, self);
+        let own_name = sheet.name.as_str();
         let affected = |(key, cell): (CellRef, &Cell)| {
             let formula = cell.formula.as_deref()?;
-            (formula_may_be_affected(formula, &shift) && crate::refs::rewrite_mapped(formula, &shift) != formula)
+            (transform.formula_may_be_affected(formula)
+                && transform.rewrite_formula(formula, target_name, own_name) != formula)
                 .then_some((key.row, key.col))
         };
         if sheet.name.eq_ignore_ascii_case(target_name) {
@@ -1959,13 +2526,13 @@ impl CellShift {
         n == 0 || (self.insert && crate::cells::insert_would_overflow(sheet, self.rect, self.direction, n))
     }
 
-    /// Returns false without changing the workbook for an invalid target or overflowing insertion.
+    /// Returns false without changing the workbook when preflight fails.
     pub fn apply(&self, wb: &mut crate::Workbook, sheet_idx: usize) -> bool {
-        let Some(sheet) = wb.sheets.get_mut(sheet_idx) else { return false };
-        let n = self.count();
-        if n == 0 {
+        if self.preflight(wb, sheet_idx).is_err() {
             return false;
         }
+        let sheet = &mut wb.sheets[sheet_idx];
+        let n = self.count();
         if self.insert {
             if !crate::cells::try_insert(sheet, self.rect, self.direction, n) {
                 return false;
@@ -1981,30 +2548,8 @@ impl CellShift {
         let Some(target) = wb.sheets.get_mut(sheet_idx) else { return };
         if self.count() == 0 { return; }
         target.coordinates_shifted();
-        let mut shift = self.reference_shift();
-        shift.target_sheet.clone_from(&target.name);
-        crate::external::remap_sources(wb, sheet_idx, shift.axis, shift.row_filter.or(shift.col_filter), |a, b| {
-            shift.map_range(a, b)
-        });
-        for sheet in &mut wb.sheets {
-            shift.own_sheet.clone_from(&sheet.name);
-            sheet.rewrite_references(&shift);
-        }
-        rewrite_defined_names(wb, &mut shift, &[]);
-    }
-}
-
-fn rewrite_defined_names(wb: &mut crate::Workbook, shift: &mut crate::refs::Shift, insertions: &[u32]) {
-    for (_, scope, text) in &mut wb.names {
-        shift.own_sheet.clear();
-        if let Some(sheet) = scope.and_then(|i| wb.sheets.get(i)) {
-            shift.own_sheet.push_str(&sheet.name);
-        }
-        let rewritten = crate::refs::rewrite_mapped(text, &MappedShift { shift, insertions });
-        if rewritten != *text {
-            *text = rewritten;
-            wb.names_dirty = true;
-        }
+        crate::transform::CoordTransform::from_cell_shift(sheet_idx, self)
+            .apply_workbook_references(wb);
     }
 }
 
@@ -2020,57 +2565,28 @@ pub fn apply_cell_shift_wb(
 pub fn apply_structural_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, op: &Structural) {
     let Some(sheet) = wb.sheets.get_mut(sheet_idx) else { return; };
     sheet.apply_structural(op);
-    update_workbook_references(wb, sheet_idx, op.reference_shift(), &[]);
+    crate::transform::CoordTransform::from_structural(sheet_idx, op)
+        .apply_workbook_references(wb);
 }
 
-/// 整工作簿级行移动：先在目标表执行 `move_rows`，再按真实行置换更新其他工作表的跨表公式与自定义名称。
+/// 整工作簿级行移动：先在目标表执行无损行置换，再通过统一 `CoordTransform` 调度器同步
+/// 全工作簿公式、条件格式（含 CFVO）、数据验证、图表、迷你图、透视表、自定义名称与数据源。
 pub fn move_rows_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
     let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Row, from, n, to) else { return };
     if sheet_idx >= wb.sheets.len() { return; }
-    let at = mv.at;
-    crate::external::remap_sources(wb, sheet_idx, mv.axis, None, |lo, hi| mv.contiguous_range(lo, hi));
-    let target_name = wb.sheets[sheet_idx].name.clone();
-    wb.sheets[sheet_idx].move_rows(from, n, to);
-    update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Row, from, n, at, &target_name);
+    wb.sheets[sheet_idx].move_axis_inner(mv, false);
+    crate::transform::CoordTransform::from_raw_axis_move(sheet_idx, mv)
+        .apply_workbook_references(wb);
 }
 
-/// 整工作簿级列移动：先在目标表执行 `move_cols`，再按真实列置换更新其他工作表的跨表公式与自定义名称。
+/// 整工作簿级列移动：先在目标表执行无损列置换，再通过统一 `CoordTransform` 调度器同步
+/// 全工作簿公式、条件格式（含 CFVO）、数据验证、图表、迷你图、透视表、自定义名称与数据源。
 pub fn move_cols_wb(wb: &mut crate::model::Workbook, sheet_idx: usize, from: u32, n: u32, to: u32) {
     let Some(mv) = crate::refs::AxisMove::from_drop(crate::refs::Axis::Col, from, n, to) else { return };
     if sheet_idx >= wb.sheets.len() { return; }
-    let at = mv.at;
-    crate::external::remap_sources(wb, sheet_idx, mv.axis, None, |lo, hi| mv.contiguous_range(lo, hi));
-    let target_name = wb.sheets[sheet_idx].name.clone();
-    wb.sheets[sheet_idx].move_cols(from, n, to);
-    update_workbook_permuted_references(wb, sheet_idx, crate::refs::Axis::Col, from, n, at, &target_name);
-}
-
-fn update_workbook_permuted_references(
-    wb: &mut crate::model::Workbook,
-    sheet_idx: usize,
-    axis: crate::refs::Axis,
-    from: u32,
-    n: u32,
-    at: u32,
-    target_name: &str,
-) {
-    for (idx, sheet) in wb.sheets.iter_mut().enumerate() {
-        if idx == sheet_idx {
-            continue;
-        }
-        sheet.rewrite_permuted_references(axis, from, n, at, target_name);
-    }
-    for (_, scope, formula) in wb.names.iter_mut() {
-        let own_name = scope
-            .and_then(|i| wb.sheets.get(i))
-            .map(|s| s.name.as_str())
-            .unwrap_or("");
-        let rewritten = crate::refs::permute_axis(formula, axis, from, n, at, target_name, own_name);
-        if rewritten != *formula {
-            *formula = rewritten;
-            wb.names_dirty = true;
-        }
-    }
+    wb.sheets[sheet_idx].move_axis_inner(mv, false);
+    crate::transform::CoordTransform::from_raw_axis_move(sheet_idx, mv)
+        .apply_workbook_references(wb);
 }
 
 /// The final entry is the grand total and shares the last group's original
@@ -2078,276 +2594,54 @@ fn update_workbook_permuted_references(
 /// row, so defer only the grand total insertion when a table intersects the edit.
 pub(crate) fn insert_subtotal_rows(wb: &mut crate::model::Workbook, sheet_idx: usize, positions: &[u32]) {
     let Some(&at) = positions.first() else { return };
+    if positions.len() == 1 {
+        apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at, n: 1 });
+        return;
+    }
     let last = *positions.last().unwrap();
     let sheet = &wb.sheets[sheet_idx];
     let inherits = sheet.tables.iter().any(|t| t.range.0 < last && t.range.2.saturating_add(1) >= at);
     let grouped = if inherits { &positions[..positions.len() - 1] } else { positions };
-    let mut shift = (Structural::InsertRows { at, n: 1 }).reference_shift();
-    shift.own_sheet = sheet.name.clone();
-    shift.target_sheet = sheet.name.clone();
-    let mut fills = Vec::new();
-    if inherits {
-        for (i, &row) in grouped.iter().enumerate() {
-            // Translate from the pre-insertion source, then apply this and all
-            // earlier boundaries to the generated formula exactly once.
-            let prefix = MappedShift { shift: &shift, insertions: &grouped[..=i] };
-            for mut fill in sheet.capture_table_row_fills(row, 1, &grouped[i + 1..]) {
-                fill.row += i as u32;
-                fill.formula = crate::refs::rewrite_mapped(&fill.formula, &prefix).into();
-                fills.push(fill);
+    if !grouped.is_empty() {
+        let mut shift = (Structural::InsertRows { at, n: 1 }).reference_shift();
+        shift.own_sheet = sheet.name.clone();
+        shift.target_sheet = sheet.name.clone();
+        let mut fills = Vec::new();
+        if inherits {
+            for (i, &row) in grouped.iter().enumerate() {
+                // Translate from the pre-insertion source, then apply this and all
+                // earlier boundaries to the generated formula exactly once.
+                let prefix = MappedShift { shift: &shift, insertions: &grouped[..=i] };
+                for mut fill in sheet.capture_table_row_fills(row, 1, &grouped[i + 1..]) {
+                    fill.row += i as u32;
+                    fill.formula = crate::refs::rewrite_mapped(&fill.formula, &prefix).into();
+                    fills.push(fill);
+                }
             }
         }
+        let map = MappedShift { shift: &shift, insertions: grouped };
+        let sheet = &mut wb.sheets[sheet_idx];
+        sheet.insert_mapped_rows(&map);
+        for table in &mut sheet.tables {
+            let (r1, _, r2, _) = table.range;
+            let first = map.map(r1).unwrap();
+            // With no totals row, inserting immediately after the table expands it.
+            let end = r2 + grouped.partition_point(|&r| r <= r2 + u32::from(!table.totals_row)) as u32;
+            sheet.tables_dirty |= (first, end) != (r1, r2);
+            (table.range.0, table.range.2) = (first, end);
+        }
+        crate::transform::CoordTransform::from_multi_insert(
+            sheet_idx,
+            crate::refs::Axis::Row,
+            grouped.to_vec(),
+        )
+        .apply_workbook_references(wb);
+        wb.sheets[sheet_idx].apply_table_row_fills(fills);
     }
-    let map = MappedShift { shift: &shift, insertions: grouped };
-    let sheet = &mut wb.sheets[sheet_idx];
-    sheet.insert_mapped_rows(&map);
-    for table in &mut sheet.tables {
-        let (r1, _, r2, _) = table.range;
-        let first = map.map(r1).unwrap();
-        // With no totals row, inserting immediately after the table expands it.
-        let end = r2 + grouped.partition_point(|&r| r <= r2 + u32::from(!table.totals_row)) as u32;
-        sheet.tables_dirty |= (first, end) != (r1, r2);
-        (table.range.0, table.range.2) = (first, end);
-    }
-    update_workbook_references(wb, sheet_idx, shift, grouped);
-    wb.sheets[sheet_idx].apply_table_row_fills(fills);
     if inherits {
         let total = last + grouped.len() as u32;
         apply_structural_wb(wb, sheet_idx, &Structural::InsertRows { at: total, n: 1 });
     }
-}
-
-fn update_workbook_references(
-    wb: &mut crate::model::Workbook, sheet_idx: usize, mut shift: crate::refs::Shift, insertions: &[u32],
-) {
-    let name = wb.sheets[sheet_idx].name.clone();
-    shift.target_sheet.clone_from(&name);
-    let (axis, at, n, delete) = (shift.axis, shift.at, shift.n, shift.delete);
-    let mapped = MappedShift { shift: &shift, insertions };
-    crate::external::remap_sources(wb, sheet_idx, axis, None, |lo, hi| mapped.map_range(lo, hi));
-    for sheet in &mut wb.sheets {
-        shift.own_sheet.clone_from(&sheet.name);
-        let shift = MappedShift { shift: &shift, insertions };
-        sheet.rewrite_mapped_references(&shift);
-        // 图表系列引用
-        for ch in sheet.charts.iter_mut() {
-            if ch.rewrite_mapped_refs(&shift) {
-                sheet.charts_dirty = true;
-            }
-        }
-        // 迷你图：数据在别的表上的，引用跟着那张表一起位移
-        for sp in sheet.sparklines.iter_mut() {
-            if sp.source_sheet.as_deref() != Some(name.as_str()) {
-                continue;
-            }
-            let (r1, c1, r2, c2) = sp.rect;
-            if axis == crate::refs::Axis::Row {
-                let (nr1, nr2) = shift.map_range(r1, r2).unwrap_or((at, at));
-                sp.rect = (nr1, c1, nr2, c2);
-            } else {
-                let (nc1, nc2) = shift.map_range(c1, c2).unwrap_or((at, at));
-                sp.rect = (r1, nc1, r2, nc2);
-            }
-            sheet.sparklines_dirty = true;
-        }
-    }
-    // 记一笔，保存时搬透视表缓存
-    if insertions.is_empty() {
-        wb.pivot_shifts.push((name.clone(), u8::from(axis == crate::refs::Axis::Col), at, n, delete));
-    } else {
-        wb.pivot_shifts.extend(insertions.iter().rev().map(|&r| (name.clone(), 0, r, 1, false)));
-    }
-
-    rewrite_defined_names(wb, &mut shift, insertions);
-
-    // Session-created pivots keep absolute source-field and output coordinates.
-    // If an essential field or either complete region disappears, keep any
-    // remaining summary values but remove the now-invalid refreshable object.
-    let sh = MappedShift { shift: &shift, insertions };
-    let map_rect = |rect: (u32, u32, u32, u32)| {
-        let (r1, c1, r2, c2) = rect;
-        if r1 > r2 || c1 > c2 { return None; }
-        match axis {
-            crate::refs::Axis::Row => sh.map_range(r1, r2).map(|(a, b)| (a, c1, b, c2)),
-            crate::refs::Axis::Col => sh.map_range(c1, c2).map(|(a, b)| (r1, a, r2, b)),
-        }
-    };
-    wb.pivots_pending.retain_mut(|(idx, spec, _, rect, _)| {
-        if *idx != sheet_idx {
-            return true;
-        }
-        let mapped = (|| {
-            let source = map_rect(spec.source)?;
-            let output = map_rect(*rect)?;
-            let (row_field, col_field, value_field) = if axis == crate::refs::Axis::Col {
-                let col_field = match spec.col_field {
-                    Some(c) => Some(sh.map(c)?),
-                    None => None,
-                };
-                (sh.map(spec.row_field)?, col_field, sh.map(spec.value_field)?)
-            } else {
-                (spec.row_field, spec.col_field, spec.value_field)
-            };
-            Some((source, output, row_field, col_field, value_field))
-        })();
-        let Some((source, output, row_field, col_field, value_field)) = mapped else {
-            return false;
-        };
-        spec.source = source;
-        spec.row_field = row_field;
-        spec.col_field = col_field;
-        spec.value_field = value_field;
-        *rect = output;
-        true
-    });
-
-    wb.pivots_pending2.retain_mut(|(idx, spec, _, rect)| {
-        if *idx != sheet_idx {
-            return true;
-        }
-        let Some(source) = map_rect(spec.source) else {
-            return false;
-        };
-        let Some(output) = map_rect(*rect) else {
-            return false;
-        };
-        spec.source = source;
-        *rect = output;
-        if axis == crate::refs::Axis::Col {
-            spec.rows.retain_mut(|f| match sh.map(f.col) {
-                Some(nc) => {
-                    f.col = nc;
-                    true
-                }
-                None => false,
-            });
-            spec.cols.retain_mut(|f| match sh.map(f.col) {
-                Some(nc) => {
-                    f.col = nc;
-                    true
-                }
-                None => false,
-            });
-            spec.values.retain_mut(|f| match sh.map(f.col) {
-                Some(nc) => {
-                    f.col = nc;
-                    if let Some((bc, item)) = f.base.take() {
-                        f.base = sh.map(bc).map(|nbc| (nbc, item));
-                    }
-                    true
-                }
-                None => false,
-            });
-            spec.filters.retain_mut(|f| match sh.map(f.col) {
-                Some(nc) => {
-                    f.col = nc;
-                    true
-                }
-                None => false,
-            });
-            if spec.rows.is_empty() && spec.cols.is_empty() && spec.values.is_empty() {
-                return false;
-            }
-        }
-        true
-    });
-
-    // 同步一等公民 PivotTableModel 的源区域（按源表名/身份）与输出区域（按目标表索引）
-    let target_sid = wb.sheets[sheet_idx].identity;
-    let target_sname = wb.sheets[sheet_idx].name.clone();
-    wb.pivots.retain_mut(|p| {
-        let is_src = p.source_sheet_id == Some(target_sid)
-            || p.source_sheet.eq_ignore_ascii_case(&target_sname);
-        if is_src {
-            let Some(new_src) = map_rect(p.spec.source) else {
-                if let Some(part) = p.imported_part.take() {
-                    wb.pivots_removed_parts.push(part);
-                }
-                return false;
-            };
-            p.spec.source = new_src;
-            if axis == crate::refs::Axis::Col {
-                let mut keep_rows = Vec::new();
-                let mut keep_rext = Vec::new();
-                for (i, mut f) in std::mem::take(&mut p.spec.rows).into_iter().enumerate() {
-                    if let Some(nc) = sh.map(f.col) {
-                        f.col = nc;
-                        keep_rows.push(f);
-                        if let Some(ext) = p.options.row_ext.get(i).cloned() {
-                            keep_rext.push(ext);
-                        }
-                    }
-                }
-                p.spec.rows = keep_rows;
-                p.options.row_ext = keep_rext;
-
-                let mut keep_cols = Vec::new();
-                let mut keep_cext = Vec::new();
-                for (i, mut f) in std::mem::take(&mut p.spec.cols).into_iter().enumerate() {
-                    if let Some(nc) = sh.map(f.col) {
-                        f.col = nc;
-                        keep_cols.push(f);
-                        if let Some(ext) = p.options.col_ext.get(i).cloned() {
-                            keep_cext.push(ext);
-                        }
-                    }
-                }
-                p.spec.cols = keep_cols;
-                p.options.col_ext = keep_cext;
-
-                let mut keep_vals = Vec::new();
-                let mut keep_vext = Vec::new();
-                for (i, mut f) in std::mem::take(&mut p.spec.values).into_iter().enumerate() {
-                    if let Some(nc) = sh.map(f.col) {
-                        f.col = nc;
-                        if let Some((bc, item)) = f.base.take() {
-                            f.base = sh.map(bc).map(|nbc| (nbc, item));
-                        }
-                        keep_vals.push(f);
-                        if let Some(ext) = p.options.val_ext.get(i).cloned() {
-                            keep_vext.push(ext);
-                        }
-                    }
-                }
-                p.spec.values = keep_vals;
-                p.options.val_ext = keep_vext;
-
-                p.spec.filters.retain_mut(|f| match sh.map(f.col) {
-                    Some(nc) => {
-                        f.col = nc;
-                        true
-                    }
-                    None => false,
-                });
-                p.options.slicers.retain_mut(|s| match sh.map(s.col) {
-                    Some(nc) => {
-                        s.col = nc;
-                        true
-                    }
-                    None => false,
-                });
-            }
-            if p.imported_part.is_none() {
-                p.modified = true;
-            }
-        }
-        if p.target_sheet == sheet_idx {
-            let Some(new_out) = map_rect(p.rect) else {
-                if let Some(part) = p.imported_part.take() {
-                    wb.pivots_removed_parts.push(part);
-                }
-                return false;
-            };
-            p.anchor = (new_out.0, new_out.1);
-            p.rect = new_out;
-            p.last_meta.anchor = p.anchor;
-            p.last_meta.rect = new_out;
-            if p.imported_part.is_none() {
-                p.modified = true;
-            }
-        }
-        true
-    });
 }
 
 /// 供撤销用：一行/一列里有哪些格子
@@ -2882,20 +3176,11 @@ pub fn delete_row_intervals_wb(
 
         for blk in sheet.cf.blocks.iter_mut() {
             for rule in blk.rules.iter_mut() {
-                let mut rewrite_threshold = |formula: &mut String| {
-                    let rewritten = del_map.rewrite_formula(formula, &own_name, &target_name);
-                    if *formula != rewritten {
-                        *formula = rewritten;
-                        sheet.cf_dirty = true;
-                    }
-                };
-                match &mut rule.kind {
-                    crate::cf::CfKind::Expr { formula, .. } => rewrite_threshold(formula),
-                    crate::cf::CfKind::CellIs { a, b, .. } => {
-                        rewrite_threshold(a);
-                        rewrite_threshold(b);
-                    }
-                    _ => {}
+                if rule
+                    .kind
+                    .rewrite_formulas(|f| del_map.rewrite_formula(f, &own_name, &target_name))
+                {
+                    sheet.cf_dirty = true;
                 }
             }
         }
@@ -2928,7 +3213,11 @@ pub fn delete_row_intervals_wb(
             }
         }
         for sp in sheet.sparklines.iter_mut() {
-            if sp.source_sheet.as_deref() != Some(target_name.as_str()) {
+            if !sp
+                .source_sheet
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&target_name))
+            {
                 continue;
             }
             let (r1, c1, r2, c2) = sp.rect;
@@ -3027,6 +3316,7 @@ pub fn delete_row_intervals_wb(
         }
         true
     });
+    wb.bump_coord_epoch();
 }
 
 

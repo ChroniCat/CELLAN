@@ -278,7 +278,7 @@ impl SheetApp {
         });
         sh.dv_dirty = true;
         let after_dv = sh.dv.clone();
-        self.undo.push_meta(
+        self.commit_meta_tx(
             "拒绝录入重复项",
             (si, r1, c1),
             sheetcore::undo::MetaEdit {
@@ -286,9 +286,10 @@ impl SheetApp {
                 dv: Some((before_dv, after_dv)),
                 ..Default::default()
             },
+            sheetcore::tx::RecalcScope::None,
+            true,
+            Vec::new(),
         );
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         self.status = format!("已设置 {}:{} 拒绝录入重复值", cell_name(r1, c1), cell_name(r2, c2));
     }
 

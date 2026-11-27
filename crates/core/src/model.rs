@@ -842,14 +842,14 @@ pub struct Sheet {
     /// dimensions that require normalization before umya reads a temporary copy.
     pub(crate) source_needs_dom_repair: bool,
     /// 分页列式存储（见 store.rs）：页内按列连续，扫描快、每格只占 40 字节
-    cells: Store,
+    pub(crate) cells: Store,
     /// Cell storage revision represented by the current OOXML source part.
     /// Recalculation can change formula caches without marking a user edit.
     pub(crate) saved_cells: Option<crate::store::CellVersion>,
     /// Copy-on-write value snapshot matching a verified worksheet ZIP entry.
     pub(crate) source_cells: Option<crate::xlsx::SourceCells>,
-    display_style_revision: u64,
-    coordinate_revision: u64,
+    pub(crate) display_style_revision: u64,
+    pub(crate) coordinate_revision: u64,
     /// 被清空过的单元格：保存时要真的从文件里删掉，否则旧值会残留
     pub cleared: CellJournal,
     /// 被动态数组公式溢出占用的单元格（重算前要清掉）
@@ -2200,6 +2200,10 @@ pub struct Workbook {
     pub chart_edits: Vec<String>,
     /// 内嵌防篡改审计日志状态（`Arc` 克隆零开销）
     pub audit: crate::audit::WorkbookAudit,
+    /// Monotonic workbook coordinate/sheet-layout epoch incremented whenever any
+    /// coordinate transform, sheet-tab change, patch/overlay install, or
+    /// coordinate-changing undo/redo executes.
+    pub(crate) coord_epoch: u64,
 }
 
 impl Workbook {
@@ -2238,8 +2242,21 @@ impl Workbook {
             dirty: false,
             chart_edits: Vec::new(),
             audit: crate::audit::WorkbookAudit::default(),
+            coord_epoch: 0,
             styles: crate::style::StyleTable::new(),
         }
+    }
+
+    /// Monotonic coordinate/sheet-layout epoch for cache invalidation and stale-work detection.
+    #[inline]
+    pub fn coord_epoch(&self) -> u64 {
+        self.coord_epoch
+    }
+
+    /// Advance the monotonic coordinate/sheet-layout epoch.
+    #[inline]
+    pub(crate) fn bump_coord_epoch(&mut self) {
+        self.coord_epoch = self.coord_epoch.wrapping_add(1);
     }
 
     /// 日期序列 ↔ 日历日期都走这里，避免各处各写一套 1462

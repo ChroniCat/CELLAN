@@ -20,6 +20,7 @@ mod border_brush;
 use border_brush::{BorderBrush, BorderHit};
 mod data_reorder;
 mod cell_shift;
+mod tx_exec;
 mod validation;
 mod find_navigation;
 mod formula_edit;
@@ -1326,6 +1327,8 @@ struct SheetApp {
     history_last_epoch: u64,
     /// 工作簿被整体替换的次数（Loaded/Recalced 各算一次）
     wb_epoch: u64,
+    /// 已同步到 UI 缓存的 `self.wb.coord_epoch()` 值（任一本地/远端/撤销坐标变更自动失效缓存）
+    pub(crate) last_seen_coord_epoch: u64,
     /// 当前活动文档的唯一身份编号（跨标签页/跨后台重算稳定，切标签切换回来保持不变，新开/关闭重置）
     pub(crate) doc_uid: u64,
     probe_at: std::time::Instant,
@@ -1670,11 +1673,11 @@ struct SheetApp {
     /// 重连后的快照会覆盖本地副本；快照落定后再按「后写者胜」逐条补发，
     /// 断线期间的编辑不会被静默抹掉。
     rejoin_outbox: Option<(u64, Vec<sheetcore::sync::Op>)>,
-    /// 与 `rejoin_outbox` 配对的房间号和结构修订基线 `(doc_uid, room_id, base_struct_rev)`
-    rejoin_outbox_meta: Option<(u64, String, usize)>,
-    /// 断线期间暂存的本地样式与合并变更（重连后补发）
-    rejoin_style_outbox: Vec<(u64, usize, Vec<(u32, u32, sheetcore::style::CellStyle)>)>,
-    rejoin_merge_outbox: Vec<(u64, usize, (u32, u32, u32, u32), bool)>,
+    /// 与 `rejoin_outbox` 配对的房间号与统一坐标纪元 `(doc_uid, room_id, CoordEpoch)`
+    rejoin_outbox_meta: Option<cell_shift::RejoinOutboxMeta>,
+    /// 断线期间暂存的本地样式与合并变更（绑定房间号与统一坐标纪元，重连后按纪元补发或取消）
+    rejoin_style_outbox: Vec<cell_shift::RejoinStyleEntry>,
+    rejoin_merge_outbox: Vec<cell_shift::RejoinMergeEntry>,
     /// 页面设置对话框（UI-26）
     page_setup_open: bool,
     page_setup_draft: sheetcore::page::PageSetup,
@@ -2612,6 +2615,7 @@ impl SheetApp {
             history_planted: 0,
             history_last_epoch: u64::MAX,
             wb_epoch: 0,
+            last_seen_coord_epoch: 0,
             doc_uid: next_doc_uid(),
             probe_at: std::time::Instant::now(),
             lock_first_at: None,
@@ -8376,8 +8380,81 @@ impl SheetApp {
         }
     }
 
-    fn broadcast_cell_styles(&self, keys: &[(usize, u32, u32)]) {
-        let Some(net) = &self.net else { return };
+    fn should_queue_rejoin_outbox(&self) -> bool {
+        self.room_lost
+            || self
+                .net
+                .as_ref()
+                .is_some_and(|n| !n.hosting && !n.is_live() && self.joined_doc)
+    }
+
+    fn push_rejoin_style(&mut self, sheet: usize, items: Vec<(u32, u32, sheetcore::style::CellStyle)>) {
+        if items.is_empty() {
+            return;
+        }
+        let coord = self.current_outbox_coord();
+        self.rejoin_style_outbox.push(cell_shift::RejoinStyleEntry {
+            doc_uid: self.doc_uid,
+            coord,
+            sheet,
+            items,
+        });
+    }
+
+    fn push_rejoin_merge(&mut self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) {
+        let coord = self.current_outbox_coord();
+        self.rejoin_merge_outbox.push(cell_shift::RejoinMergeEntry {
+            doc_uid: self.doc_uid,
+            coord,
+            sheet,
+            rect,
+            on,
+        });
+    }
+
+    fn queue_or_broadcast_style(
+        &mut self,
+        sheet: usize,
+        items: Vec<(u32, u32, sheetcore::style::CellStyle)>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        if let Some(net) = self.net.as_ref().filter(|n| n.is_live() && !self.room_lost) {
+            net.broadcast_style(sheet, items);
+        } else if self.should_queue_rejoin_outbox() {
+            self.push_rejoin_style(sheet, items);
+        }
+    }
+
+    fn queue_or_broadcast_merge(&mut self, sheet: usize, rect: (u32, u32, u32, u32), on: bool) {
+        if let Some(net) = self.net.as_ref().filter(|n| n.is_live() && !self.room_lost) {
+            net.broadcast_merge(sheet, rect, on);
+        } else if self.should_queue_rejoin_outbox() {
+            self.push_rejoin_merge(sheet, rect, on);
+        }
+    }
+
+    fn clear_doc_rejoin_outboxes(&mut self) {
+        let uid = self.doc_uid;
+        if self.rejoin_outbox.as_ref().is_some_and(|(o, _)| *o == uid) {
+            self.rejoin_outbox = None;
+        }
+        if self
+            .rejoin_outbox_meta
+            .as_ref()
+            .is_some_and(|m| m.doc_uid == uid)
+        {
+            self.rejoin_outbox_meta = None;
+        }
+        self.rejoin_style_outbox.retain(|e| e.doc_uid != uid);
+        self.rejoin_merge_outbox.retain(|e| e.doc_uid != uid);
+    }
+
+    fn broadcast_cell_styles(&mut self, keys: &[(usize, u32, u32)]) {
+        if self.net.is_none() && !self.room_lost {
+            return;
+        }
         for chunk in keys.chunks(sheetcore::sync::STYLE_PALETTE_CHUNK_ITEMS) {
             for group in chunk.chunk_by(|a, b| a.0 == b.0) {
                 let sheet = group[0].0;
@@ -8395,7 +8472,7 @@ impl SheetApp {
                         (r, c, st)
                     })
                     .collect();
-                net.broadcast_style(sheet, items);
+                self.queue_or_broadcast_style(sheet, items);
             }
         }
     }
@@ -8855,11 +8932,7 @@ impl SheetApp {
                 .into_iter()
                 .map(|(r, c, sid)| (r, c, self.wb.styles.get(sid).clone()))
                 .collect();
-            if let Some(net) = self.net.as_ref() {
-                net.broadcast_style(si, wire);
-            } else if self.room_lost {
-                self.rejoin_style_outbox.push((self.doc_uid, si, wire));
-            }
+            self.queue_or_broadcast_style(si, wire);
         }
         self.recalc_and_broadcast(&filled_keys);
         self.doc_gen = self.doc_gen.wrapping_add(1);
@@ -9096,22 +9169,27 @@ impl SheetApp {
             sh.cols.set_many(updates.iter().copied());
             sh.layout_dirty = true;
         }
-        if let Some(before) = before {
-            let after = before.capture_after(&self.wb);
-            self.undo.push_structure(
-                "自动调整列宽",
-                before,
-                after,
-                (idx, self.sel.0, self.sel.1),
-            );
-        }
         let was_shared_only = self.only_shared_cell_edits();
         if let Some(net) = self.net.as_ref() {
             let synced = net.broadcast_sheet_meta(idx, sheetcore::sync::SheetMetaKind::ColWidths(updates));
             self.mark_sheet_layout_synced(idx, synced && layout_ok_before);
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let effects = sheetcore::tx::TxEffects {
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        if let Some(before) = before {
+            let after = before.capture_after(&self.wb);
+            self.commit_structure_tx(
+                "自动调整列宽",
+                (idx, self.sel.0, self.sel.1),
+                before,
+                after,
+                effects,
+            );
+        } else {
+            self.apply_tx_effects("自动调整列宽", &effects);
+        }
         if was_shared_only && self.is_delegated_collab_client() {
             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
         }
@@ -9158,15 +9236,6 @@ impl SheetApp {
             sh.rows.set_many(filtered_updates.iter().copied());
             sh.layout_dirty = true;
         }
-        if let Some(before) = before {
-            let after = before.capture_after(&self.wb);
-            self.undo.push_structure(
-                "自动调整行高",
-                before,
-                after,
-                (idx, self.sel.0, self.sel.1),
-            );
-        }
         let was_shared_only = self.only_shared_cell_edits();
         if let Some(net) = self.net.as_ref() {
             let synced = net.broadcast_sheet_meta(
@@ -9175,8 +9244,22 @@ impl SheetApp {
             );
             self.mark_sheet_layout_synced(idx, synced && layout_ok_before);
         }
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let effects = sheetcore::tx::TxEffects {
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        if let Some(before) = before {
+            let after = before.capture_after(&self.wb);
+            self.commit_structure_tx(
+                "自动调整行高",
+                (idx, self.sel.0, self.sel.1),
+                before,
+                after,
+                effects,
+            );
+        } else {
+            self.apply_tx_effects("自动调整行高", &effects);
+        }
         if was_shared_only && self.is_delegated_collab_client() {
             self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
         }
@@ -12078,18 +12161,28 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         if !self.can_change_sheets() {
             return false;
         }
-        if self.wb.sheets.get(idx).is_some_and(|sheet| sheet.name == name) {
+        let trimmed = name.trim();
+        if self.wb.sheets.get(idx).is_some_and(|sheet| sheet.name == trimmed) {
             return true;
         }
         let focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        if !self.undo.rename_sheet(&mut self.wb, idx, name, focus) {
-            self.status = "工作表名称无效或已存在".into();
-            return false;
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Rename {
+                index: idx,
+                name: name.to_string(),
+            },
+        );
+        match self.execute_local_tx(intent, None, focus) {
+            Ok(_) => {
+                self.status = format!("已重命名为 {trimmed}");
+                true
+            }
+            Err(sheetcore::tx::TxError::NoOp) => true,
+            Err(_) => {
+                self.status = "工作表名称无效或已存在".into();
+                false
+            }
         }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
-        self.status = format!("已重命名为 {name}");
-        true
     }
 
     fn add_sheet(&mut self) {
@@ -12104,15 +12197,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             k += 1;
             name = format!("Sheet{k}");
         }
-        let index = self.wb.sheets.len();
-        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, index, sheetcore::model::Sheet::new(&name)) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Append {
+                sheet: sheetcore::model::Sheet::new(&name),
+            },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             self.status = "无法创建工作表：名称无效或已存在".into();
             return;
         }
-        self.undo.record_appended_sheet(&self.wb, prev_focus);
-        self.switch_sheet_view(index);
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已新建 {name}");
     }
 
@@ -12125,25 +12218,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return;
         }
         let name = self.wb.sheets[idx].name.clone();
-        let deleted_id = self.wb.sheet(idx).identity;
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let was_current = self.sheet_idx == idx;
-        if was_current {
-            self.remember_sheet_view();
-        }
-        if !self.undo.delete_sheet(&mut self.wb, idx, prev_focus) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Delete { index: idx },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             return;
         }
-        self.sheet_views.remove(&deleted_id);
-        if self.sheet_idx > idx {
-            self.sheet_idx -= 1;
-        }
-        self.sheet_idx = self.sheet_idx.min(self.wb.sheets.len() - 1);
-        if was_current {
-            self.load_sheet_view(self.sheet_idx);
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已删除 {name}（可 Ctrl+Z 撤销）");
     }
 
@@ -12164,16 +12245,10 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             return false;
         }
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
-        if !self.undo.move_sheet(&mut self.wb, from, to, prev_focus) {
-            return false;
-        }
-        if let Some(new_idx) = self.wb.sheets.iter().position(|s| s.identity == active_id) {
-            self.sheet_idx = new_idx;
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
-        true
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Move { from, to },
+        );
+        self.execute_local_tx(intent, None, prev_focus).is_ok()
     }
 
     /// 撤销 / 重做
@@ -12367,6 +12442,7 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         } else {
             self.undo.top_undo_id()
         };
+        let prev_sheet_id = self.wb.sheets.get(self.sheet_idx).map(|s| s.identity);
         let applied = if redo {
             self.undo.redo_workbook(&mut self.wb, guard)
         } else {
@@ -12431,8 +12507,15 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
                 self.fast_recalc_cells(&keys);
             }
         }
-        self.cf_stats_gen = u64::MAX;
-        self.invalid_gen = u64::MAX;
+        let epoch_changed = self.sync_coord_epoch_side_effects();
+        if !epoch_changed {
+            self.cf_stats_gen = u64::MAX;
+            self.invalid_gen = u64::MAX;
+            if applied.coord_changed || applied.structural {
+                self.cf_cache = None;
+                self.cf_inputs.grid.invalidate_viewport();
+            }
+        }
         self.tasks.last_edit = Some(std::time::Instant::now());
         // 协作广播
         if applied.skipped == 0 && let Some(order) = permutation {
@@ -12460,8 +12543,26 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
         // 回到出事的格
         let (sheet, row, col) = applied.focus;
         let target = sheet.min(self.wb.sheets.len().saturating_sub(1));
-        if target != self.sheet_idx {
-            self.switch_sheet_view(target);
+        let cur_sheet_id = self.wb.sheets.get(target).map(|s| s.identity);
+        let idx_still_prev = prev_sheet_id.is_some()
+            && self.wb.sheets.get(self.sheet_idx).map(|s| s.identity) == prev_sheet_id;
+        if idx_still_prev {
+            if target != self.sheet_idx {
+                self.switch_sheet_view(target);
+            }
+        } else if prev_sheet_id.is_some() && cur_sheet_id == prev_sheet_id {
+            // 原活动表因撤销/重做移动了索引但仍是同一张表：保留其活动视图，仅同步索引。
+            self.sheet_idx = target;
+        } else {
+            // 当前 `self.sheet_idx` 上已换成了其他表或越界：若原活动表仍在工作簿中，
+            // 必须按其自身 `prev_sheet_id` 保存视图，不能借 `switch_sheet_view` 误写到新占位的表上。
+            if let Some(prev_id) = prev_sheet_id {
+                if self.wb.sheets.iter().any(|s| s.identity == prev_id) {
+                    self.remember_sheet_view_for(prev_id);
+                }
+            }
+            self.drop_merge_confirmation();
+            self.load_sheet_view(target);
         }
         // 目标表自己的多选区不能带进这次撤销的落点；否则后续清除/格式会误伤远端区域。
         self.extra_sel.clear();
@@ -13215,24 +13316,25 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
             } else {
                 format!("{sref}!{}:{}", abs_cell(r1, c1), abs_cell(r2, c2))
             };
-            let before = self.wb.names.clone();
-            self.wb.names.push((text.clone(), None, refers.clone()));
-            let after = self.wb.names.clone();
-            self.wb.names_dirty = true;
-            self.undo.push_meta(
-                format!("定义名称 {text}"),
-                (self.sheet_idx, r1, c1),
-                sheetcore::undo::MetaEdit {
-                    sheet: self.sheet_idx,
-                    names: Some((before, after)),
-                    ..Default::default()
+            let intent = sheetcore::tx::TxIntent::from_defined_names(
+                sheetcore::tx::DefinedNameIntent::Define {
+                    name: text.clone(),
+                    scope: None,
+                    formula: refers.clone(),
                 },
             );
-            self.wb.dirty = true;
-            self.doc_gen = self.doc_gen.wrapping_add(1);
-            self.tasks.last_edit = Some(std::time::Instant::now());
-            self.recalc_all_and_deps_adaptive();
-            self.status = format!("已定义名称：{text} = {refers}");
+            match self.execute_local_tx(
+                intent,
+                Some(format!("定义名称 {text}")),
+                (self.sheet_idx, r1, c1),
+            ) {
+                Ok(_) => {
+                    self.status = format!("已定义名称：{text} = {refers}");
+                }
+                Err(err) => {
+                    self.status = err.message().into();
+                }
+            }
             return;
         }
         self.status = format!("找不到名称：{text}");
@@ -14653,10 +14755,13 @@ fn search_opts(&self) -> sheetcore::search::SearchOpts {
 
     /// UI-16：把当前表的选区/滚动/缩放存到该表的 identity 下。
     fn remember_sheet_view(&mut self) {
-        let Some(sh) = self.wb.sheets.get(self.sheet_idx) else {
+        let Some(id) = self.wb.sheets.get(self.sheet_idx).map(|sh| sh.identity) else {
             return;
         };
-        let id = sh.identity;
+        self.remember_sheet_view_for(id);
+    }
+
+    fn remember_sheet_view_for(&mut self, id: u64) {
         self.sheet_views.insert(
             id,
             SheetViewState {
@@ -17210,6 +17315,9 @@ fn clear_values(&mut self) {
                 .push_structure(label.to_string(), before, after, (idx, self.sel.0, self.sel.1));
         }
         self.recalc_all_and_deps_adaptive();
+        self.cf_stats_gen = u64::MAX;
+        self.invalid_gen = u64::MAX;
+        self.tasks.last_edit = Some(std::time::Instant::now());
         self.doc_gen = self.doc_gen.wrapping_add(1);
         self.wb.dirty = true;
         self.sel = (dst_r1, dst_c1);
@@ -18683,11 +18791,7 @@ fn clear_selection(&mut self) {
             self.wb.sheet_mut(self.sheet_idx).set_style(r, c, id);
             wire.push((r, c, st));
         }
-        if let Some(net) = self.net.as_ref() {
-            net.broadcast_style(self.sheet_idx, wire);
-        } else if self.room_lost && !wire.is_empty() {
-            self.rejoin_style_outbox.push((self.doc_uid, self.sheet_idx, wire));
-        }
+        self.queue_or_broadcast_style(self.sheet_idx, wire);
         for &osi in &extra_sheets {
             let mut ewire: Vec<(u32, u32, sheetcore::style::CellStyle)> = Vec::new();
             for &(r, c) in &keys {
@@ -18700,13 +18804,7 @@ fn clear_selection(&mut self) {
                     ewire.push((r, c, st));
                 }
             }
-            if !ewire.is_empty() {
-                if let Some(net) = self.net.as_ref() {
-                    net.broadcast_style(osi, ewire);
-                } else if self.room_lost {
-                    self.rejoin_style_outbox.push((self.doc_uid, osi, ewire));
-                }
-            }
+            self.queue_or_broadcast_style(osi, ewire);
         }
         let mut all_deltas = sheetcore::undo::finish(before_main, self.wb.sheet(self.sheet_idx));
         for (osi, b) in before_extras {
@@ -18827,10 +18925,8 @@ fn clear_selection(&mut self) {
                     self.sel = (mr1, mc1);
                     self.sel_end = (mr2, mc2);
                 }
-                if let Some(net) = self.net.as_ref() {
-                    for &(sr1, sc1, sr2, sc2) in &rects {
-                        net.broadcast_merge(self.sheet_idx, (sr1, sc1, sr2, sc2), false);
-                    }
+                for &(sr1, sc1, sr2, sc2) in &rects {
+                    self.queue_or_broadcast_merge(self.sheet_idx, (sr1, sc1, sr2, sc2), false);
                 }
                 // 取消合并完全不修改任何单元格的值或公式：绝不触发同步 Deps::build 与全表 recalc_all
                 self.wb.dirty = true;
@@ -18975,16 +19071,17 @@ fn clear_selection(&mut self) {
                 refresh_sizes: None,
             });
         }
-        if let (Some(peer), Some(net)) = (self.peer.as_mut(), self.net.as_ref()) {
+        if let Some(peer) = self.peer.as_mut() {
+            let live_net = self.net.as_ref().filter(|n| n.is_live() && !self.room_lost);
             for (r, c, _) in removed_cells.iter() {
                 let cell = self.wb.sheet(self.sheet_idx).get(*r, *c).map(|c| c.into_owned()).unwrap_or_default();
                 let op = peer.local_set(self.sheet_idx, *r, *c, &cell);
-                net.broadcast_op(op);
+                if let Some(net) = live_net {
+                    net.broadcast_op(op);
+                }
             }
-            net.broadcast_merge(self.sheet_idx, (r1, c1, r2, c2), true);
-        } else if self.room_lost {
-            self.rejoin_merge_outbox.push((self.doc_uid, self.sheet_idx, (r1, c1, r2, c2), true));
         }
+        self.queue_or_broadcast_merge(self.sheet_idx, (r1, c1, r2, c2), true);
         if !removed_cells.is_empty() {
             let touched: Vec<(usize, u32, u32)> = removed_cells
                 .iter()
@@ -23004,23 +23101,17 @@ fn clear_selection(&mut self) {
             }
         }
         if let Some(i) = del {
-            if i < self.wb.names.len() {
-                let before_names = self.wb.names.clone();
-                self.wb.names.remove(i);
-                let after_names = self.wb.names.clone();
-                self.undo.push_meta(
-                    "删除名称",
+            let intent = sheetcore::tx::TxIntent::from_defined_names(
+                sheetcore::tx::DefinedNameIntent::Remove { index: i },
+            );
+            if self
+                .execute_local_tx(
+                    intent,
+                    Some("删除名称".into()),
                     (self.sheet_idx, self.sel.0, self.sel.1),
-                    sheetcore::undo::MetaEdit {
-                        sheet: self.sheet_idx,
-                        names: Some((before_names, after_names)),
-                        ..Default::default()
-                    },
-                );
-                self.wb.names_dirty = true;
-                self.wb.dirty = true;
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.recalc_all_and_deps_adaptive();
+                )
+                .is_ok()
+            {
                 self.status = "已删除名称".into();
             }
         }
@@ -23028,52 +23119,47 @@ fn clear_selection(&mut self) {
             let name = self.name_new.trim().to_string();
             let refers = self.name_refers.trim().to_string();
             let valid = Self::valid_defined_name(&name) && self.valid_name_refers(&refers);
-            let dup = self
-                .wb
-                .names
-                .iter()
-                .enumerate()
-                .any(|(k, (n, sh, _))| {
-                    k != self.name_edit_idx.unwrap_or(usize::MAX)
-                        && n.eq_ignore_ascii_case(&name)
-                        && *sh == if self.name_scope_local { Some(self.sheet_idx) } else { None }
-                });
             if !valid {
                 self.name_err = "名称要以字母/下划线开头且不能是 A1/R1C1；引用要写成 Sheet1!$A$1:$B$3、={...} 或 =SUM(...)".into();
-            } else if dup {
-                self.name_err = "名称已存在".into();
             } else {
-                self.name_err.clear();
-                let before_names = self.wb.names.clone();
-                match self.name_edit_idx.take() {
-                    Some(i) if i < self.wb.names.len() => {
-                        self.wb.names[i].0 = name;
-                        self.wb.names[i].1 = if self.name_scope_local { Some(self.sheet_idx) } else { None };
-                        self.wb.names[i].2 = refers;
-                    }
-                    _ => self.wb.names.push((
+                let scope = if self.name_scope_local {
+                    Some(self.sheet_idx)
+                } else {
+                    None
+                };
+                let edit_idx = self.name_edit_idx.filter(|&i| i < self.wb.names.len());
+                let intent = sheetcore::tx::TxIntent::from_defined_names(match edit_idx {
+                    Some(index) => sheetcore::tx::DefinedNameIntent::Update {
+                        index,
                         name,
-                        if self.name_scope_local { Some(self.sheet_idx) } else { None },
-                        refers,
-                    )),
-                }
-                let after_names = self.wb.names.clone();
-                self.undo.push_meta(
-                    "编辑名称",
-                    (self.sheet_idx, self.sel.0, self.sel.1),
-                    sheetcore::undo::MetaEdit {
-                        sheet: self.sheet_idx,
-                        names: Some((before_names, after_names)),
-                        ..Default::default()
+                        scope,
+                        formula: refers,
                     },
-                );
-                self.wb.names_dirty = true;
-                self.wb.dirty = true;
-                self.name_new.clear();
-                self.name_refers.clear();
-                self.doc_gen = self.doc_gen.wrapping_add(1);
-                self.recalc_all_and_deps_adaptive();
-                self.status = "名称已保存".into();
+                    None => sheetcore::tx::DefinedNameIntent::Define {
+                        name,
+                        scope,
+                        formula: refers,
+                    },
+                });
+                match self.execute_local_tx(
+                    intent,
+                    Some("编辑名称".into()),
+                    (self.sheet_idx, self.sel.0, self.sel.1),
+                ) {
+                    Ok(_) | Err(sheetcore::tx::TxError::NoOp) => {
+                        self.name_edit_idx = None;
+                        self.name_err.clear();
+                        self.name_new.clear();
+                        self.name_refers.clear();
+                        self.status = "名称已保存".into();
+                    }
+                    Err(sheetcore::tx::TxError::DuplicateDefinedName) => {
+                        self.name_err = "名称已存在".into();
+                    }
+                    Err(err) => {
+                        self.name_err = err.message().into();
+                    }
+                }
             }
         }
     }
@@ -23489,21 +23575,18 @@ fn clear_selection(&mut self) {
         if !self.can_change_sheets() {
             return false;
         }
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
         let mut dest = if target > from { target - 1 } else { target };
         dest = dest.min(len - 1);
         if dest == from {
             return false;
         }
-        if !self.undo.move_sheet(&mut self.wb, from, dest, prev_focus) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Move { from, to: dest },
+        );
+        if self.execute_local_tx(intent, None, prev_focus).is_err() {
             return false;
         }
-        if let Some(new_idx) = self.wb.sheets.iter().position(|s| s.identity == active_id) {
-            self.sheet_idx = new_idx;
-        }
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!(
             "已移动「{}」到第 {} 位（可 Ctrl+Z 撤销）",
             self.wb.sheet(dest).name,
@@ -23522,8 +23605,6 @@ fn clear_selection(&mut self) {
             return false;
         }
         let prev_focus = (self.sheet_idx, self.sel.0, self.sel.1);
-        let active_id = self.wb.sheet(self.sheet_idx).identity;
-        self.remember_sheet_view();
         let mut copy = self.wb.sheets[from].clone();
         let base = copy.name.clone();
         let mut n = 2;
@@ -23545,20 +23626,19 @@ fn clear_selection(&mut self) {
         copy.hidden = false;
         copy.very_hidden = false;
         let at = target.min(self.wb.sheets.len());
-        if !sheetcore::sheet_ops::insert_sheet(&mut self.wb, at, copy) {
+        let intent = sheetcore::tx::TxIntent::from_sheet_tab(
+            sheetcore::tx::SheetTabIntent::Insert {
+                index: at,
+                sheet: copy,
+            },
+        );
+        if self
+            .execute_local_tx(intent, Some("复制工作表".into()), prev_focus)
+            .is_err()
+        {
             self.status = "复制工作表失败：名称无效或已存在".into();
             return false;
         }
-        self.undo.record_inserted_sheet(&self.wb, at, "复制工作表", prev_focus);
-        self.sheet_idx = self
-            .wb
-            .sheets
-            .iter()
-            .position(|s| s.identity == active_id)
-            .unwrap_or(at);
-        self.switch_sheet_view(at);
-        self.selected_sheets.clear();
-        self.refresh_after_sheet_change();
         self.status = format!("已复制为「{name}」（可 Ctrl+Z 撤销）");
         true
     }
@@ -24607,9 +24687,20 @@ fn clear_selection(&mut self) {
         self.deps = sheetcore::formula::deps::Deps::build_after_recalc(&self.wb).into();
         self.deps_built = true;
         let after = before.capture_after(&self.wb);
-        self.undo.push_structure("分类汇总", before, after, (idx, self.sel.0, self.sel.1));
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
+        let effects = sheetcore::tx::TxEffects {
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: true,
+            touched_sheets: vec![idx],
+            ..Default::default()
+        };
+        self.commit_structure_tx(
+            "分类汇总",
+            (idx, self.sel.0, self.sel.1),
+            before,
+            after,
+            effects,
+        );
         self.status = format!("分类汇总：{} 组，插了 {} 行（{}）", rep.groups, rep.rows, f.label());
         Ok(self.status.clone())
     }
@@ -32149,19 +32240,28 @@ impl SheetApp {
 
     fn apply_local_structural(&mut self, idx: usize, op: sheetcore::structural::Structural) {
         let updates = self.structural_updates(idx, &op);
-        let before = sheetcore::undo::snapshot_structure(&self.wb, idx, &op);
         let pending_pivots_before = self.wb.pivots_pending.len();
-        sheetcore::structural::apply_structural_wb(&mut self.wb, idx, &op);
-        let detached_source = before.detached_source(&self.wb);
-        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
-        let after = before.capture_after(&self.wb);
         let label = op.label();
-        self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
-        self.recalc_after_structural(updates);
+        let intent = sheetcore::tx::TxIntent::from_structural(idx, &op);
+        let (entry_id, effects) = match self.execute_local_tx_with_recalc(
+            intent,
+            Some(label.clone()),
+            (idx, self.sel.0, self.sel.1),
+            Some(updates),
+        ) {
+            Ok(ok) => ok,
+            Err(sheetcore::tx::TxError::NoOp) => return,
+            Err(err) => {
+                self.status = err.message().into();
+                return;
+            }
+        };
+        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
         self.shift_collab_coordinates(idx, &op);
-        self.audit_note_structural(None, idx, &op, self.undo.top_undo_id());
+        if let Some(net) = &self.net {
+            self.shift_intro.sync_struct_rev(net.structure_seen());
+        }
+        self.audit_note_structural(None, idx, &op, (entry_id != 0).then_some(entry_id));
         self.status = if self.net.is_some() {
             format!("{label}（已提交协作队列）")
         } else {
@@ -32170,7 +32270,7 @@ impl SheetApp {
         if removed_pivots > 0 {
             self.status.push_str(&format!("；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"));
         }
-        if detached_source {
+        if effects.detached_sources {
             self.status.push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
         }
     }
@@ -32248,12 +32348,26 @@ impl SheetApp {
         let pending_pivots_before = self.wb.pivots_pending.len();
         apply_delete_row_intervals_wb(&mut self.wb, idx, &intervals);
         let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
-        self.wb.dirty = true;
-        self.doc_gen = self.doc_gen.wrapping_add(1);
         let after = before.capture_after(&self.wb);
         let label = summary_op.label();
-        self.undo.push_structure(label.clone(), before, after, (idx, self.sel.0, self.sel.1));
-        self.recalc_after_structural(StructuralRecalc::Full);
+        let effects = sheetcore::tx::TxEffects {
+            recalc: sheetcore::tx::RecalcScope::Full,
+            invalidate_deps: true,
+            invalidate_render_caches: true,
+            coord_changed: true,
+            structural: true,
+            detached_sources: false,
+            revision_deltas: Vec::new(),
+            touched_sheets: vec![idx],
+            new_focus: None,
+        };
+        self.commit_structure_tx(
+            label.clone(),
+            (idx, self.sel.0, self.sel.1),
+            before,
+            after,
+            effects,
+        );
         self.shift_collab_coordinates(idx, &summary_op);
         self.status = format!("{label}（已保留筛选隐藏行，可 Ctrl+Z 撤销）");
         if removed_pivots > 0 {
@@ -32261,6 +32375,70 @@ impl SheetApp {
                 "；已移除 {removed_pivots} 个源字段或区域被删除的透视表定义"
             ));
         }
+    }
+
+    /// 整行/整列拖拽移动（统一走结构快照、全簿重算与渲染/验证缓存失效）。
+    pub(crate) fn move_axis_headers(
+        &mut self,
+        is_rows: bool,
+        from: u32,
+        n: u32,
+        drop: u32,
+    ) -> bool {
+        if self.edit_blocked() {
+            return false;
+        }
+        if self.deps_pending {
+            self.status = "大型工作簿正在后台构建依赖图，请稍候再操作".into();
+            return false;
+        }
+        if !self.finish_pending_edit() {
+            return false;
+        }
+        let idx = self.sheet_idx;
+        let axis = if is_rows {
+            sheetcore::refs::Axis::Row
+        } else {
+            sheetcore::refs::Axis::Col
+        };
+        let Some(intent) = sheetcore::tx::TxIntent::from_axis_move(idx, axis, from, n, drop) else {
+            return false;
+        };
+        let label = if is_rows { "移动行" } else { "移动列" };
+        let pending_pivots_before = self.wb.pivots_pending.len();
+        let (_entry_id, effects) = match self.execute_local_tx(
+            intent,
+            Some(label.to_string()),
+            (idx, self.sel.0, self.sel.1),
+        ) {
+            Ok(ok) => ok,
+            Err(sheetcore::tx::TxError::NoOp) => return false,
+            Err(err) => {
+                self.status = err.message().into();
+                return false;
+            }
+        };
+        let removed_pivots = pending_pivots_before.saturating_sub(self.wb.pivots_pending.len());
+        self.status = if is_rows {
+            format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
+        } else {
+            format!(
+                "已把 {}–{} 列移动到 {} 列前",
+                sheetcore::model::col_label(from),
+                sheetcore::model::col_label(from + n - 1),
+                sheetcore::model::col_label(drop)
+            )
+        };
+        if removed_pivots > 0 {
+            self.status.push_str(&format!(
+                "；已移除 {removed_pivots} 个源字段或区域被破坏的透视表定义"
+            ));
+        }
+        if effects.detached_sources {
+            self.status
+                .push_str("；部分数据源的绑定区域已失效，请重新选择区域并导入");
+        }
+        true
     }
 
     /// 读宏代码，开窗口
@@ -39338,7 +39516,7 @@ impl SheetApp {
                     let after_charts = sh.charts.clone();
                     let after_deleted = sh.deleted_charts.clone();
                     if changed {
-                        self.undo.push_chart_edit(
+                        self.commit_chart_tx(
                             if d.mode == 0 { "移动图表" } else { "调整图表大小" },
                             (sh_idx, self.sel.0, self.sel.1),
                             sheetcore::undo::ChartUndoEdit {
@@ -39349,8 +39527,9 @@ impl SheetApp {
                                 deleted_after: after_deleted,
                             },
                         );
+                    } else {
+                        self.wb.dirty = true;
                     }
-                    self.wb.dirty = true;
                     self.status = "图表位置已更新（Ctrl+Z 可撤销，保存后写回 Excel）".into();
                 }
             }
@@ -40595,47 +40774,7 @@ impl SheetApp {
                 painter.rect_filled(line, 0.0, Color32::from_rgb(26, 115, 232));
                 if resp.drag_stopped() {
                     self.header_move = None;
-                    // 落在被拖动块内部 = 不动
-                    let inside = drop >= from && drop <= from + n;
-                    if !inside {
-                        // 和插入/删除一样走结构快照，撤销才有东西可回
-                        let idx = self.sheet_idx;
-                        let axis = if is_rows { sheetcore::refs::Axis::Row } else { sheetcore::refs::Axis::Col };
-                        let snap = if self.wb.sheet(idx).len() <= 200_000 {
-                            sheetcore::undo::snapshot_axis_move(&self.wb, idx, axis, from, n, drop)
-                        } else {
-                            None
-                        };
-                        if is_rows {
-                            sheetcore::structural::move_rows_wb(&mut self.wb, idx, from, n, drop);
-                        } else {
-                            sheetcore::structural::move_cols_wb(&mut self.wb, idx, from, n, drop);
-                        }
-                        if let Some(before) = snap {
-                            let after = before.capture_after(&self.wb);
-                            let label = if is_rows { "移动行" } else { "移动列" };
-                            self.undo.push_structure(
-                                label.to_string(),
-                                before,
-                                after,
-                                (idx, self.sel.0, self.sel.1),
-                            );
-                        }
-                        self.wb.calc_manual |= self.manual_calc;
-                        self.recalc_all_and_deps_adaptive();
-                        self.doc_gen = self.doc_gen.wrapping_add(1);
-                        self.wb.dirty = true;
-                        self.status = if is_rows {
-                            format!("已把第 {}–{} 行移动到第 {} 行前", from + 1, from + n, drop + 1)
-                        } else {
-                            format!(
-                                "已把 {}–{} 列移动到 {} 列前",
-                                sheetcore::model::col_label(from),
-                                sheetcore::model::col_label(from + n - 1),
-                                sheetcore::model::col_label(drop)
-                            )
-                        };
-                    }
+                    self.move_axis_headers(is_rows, from, n, drop);
                 }
             }
         } else if resp.drag_stopped() {
@@ -42919,7 +43058,7 @@ impl SheetApp {
         None
     }
 
-    fn shift_rejoin_outboxes(
+    fn shift_rejoin_cell_ops(
         &mut self,
         sheet: usize,
         op: &sheetcore::structural::Structural,
@@ -42952,39 +43091,164 @@ impl SheetApp {
                 }
             }
         }
+    }
+
+    fn shift_rejoin_outboxes(
+        &mut self,
+        sheet: usize,
+        op: &sheetcore::structural::Structural,
+    ) {
+        let uid = self.doc_uid;
+        let cur_room = self.current_outbox_coord().room_id;
+        let ops_match = self.rejoin_outbox_meta.as_ref().is_none_or(|meta| {
+            meta.doc_uid == uid && meta.coord.matches_room(&cur_room)
+        });
+        if ops_match {
+            self.shift_rejoin_cell_ops(sheet, op);
+            if let Some(meta) = self.rejoin_outbox_meta.as_mut() {
+                if meta.doc_uid == uid && meta.coord.matches_room(&cur_room) {
+                    meta.coord.epoch.struct_rev = meta.coord.epoch.struct_rev.saturating_add(1);
+                }
+            }
+        }
         if !self.rejoin_style_outbox.is_empty() {
             let mut next_styles = Vec::with_capacity(self.rejoin_style_outbox.len());
-            for (owner, sh, items) in std::mem::take(&mut self.rejoin_style_outbox) {
-                if owner == uid && sh == sheet {
-                    let shifted: Vec<_> = items
-                        .into_iter()
-                        .filter_map(|(r, c, st)| {
-                            sheetcore::sync::shift_structural_coord(r, c, op)
-                                .map(|(nr, nc)| (nr, nc, st))
-                        })
-                        .collect();
-                    if !shifted.is_empty() {
-                        next_styles.push((owner, sh, shifted));
+            for mut entry in std::mem::take(&mut self.rejoin_style_outbox) {
+                if entry.doc_uid == uid && entry.coord.matches_room(&cur_room) {
+                    entry.coord.epoch.struct_rev = entry.coord.epoch.struct_rev.saturating_add(1);
+                    if entry.sheet == sheet {
+                        entry.items = entry
+                            .items
+                            .into_iter()
+                            .filter_map(|(r, c, st)| {
+                                sheetcore::sync::shift_structural_coord(r, c, op)
+                                    .map(|(nr, nc)| (nr, nc, st))
+                            })
+                            .collect();
+                        if !entry.items.is_empty() {
+                            next_styles.push(entry);
+                        }
+                    } else {
+                        next_styles.push(entry);
                     }
                 } else {
-                    next_styles.push((owner, sh, items));
+                    next_styles.push(entry);
                 }
             }
             self.rejoin_style_outbox = next_styles;
         }
         if !self.rejoin_merge_outbox.is_empty() {
             let mut next_merges = Vec::with_capacity(self.rejoin_merge_outbox.len());
-            for (owner, sh, rect, on) in std::mem::take(&mut self.rejoin_merge_outbox) {
-                if owner == uid && sh == sheet {
-                    if let Some(nrect) = sheetcore::sync::shift_structural_merge_rect(rect, op) {
-                        next_merges.push((owner, sh, nrect, on));
+            for mut entry in std::mem::take(&mut self.rejoin_merge_outbox) {
+                if entry.doc_uid == uid && entry.coord.matches_room(&cur_room) {
+                    entry.coord.epoch.struct_rev = entry.coord.epoch.struct_rev.saturating_add(1);
+                    if entry.sheet == sheet {
+                        if let Some(nrect) =
+                            sheetcore::sync::shift_structural_merge_rect(entry.rect, op)
+                        {
+                            entry.rect = nrect;
+                            next_merges.push(entry);
+                        }
+                    } else {
+                        next_merges.push(entry);
                     }
                 } else {
-                    next_merges.push((owner, sh, rect, on));
+                    next_merges.push(entry);
                 }
             }
             self.rejoin_merge_outbox = next_merges;
         }
+        self.advance_deferred_paste_struct_rev(&cur_room, None);
+    }
+
+    fn shift_rejoin_outboxes_from_history(
+        &mut self,
+        items: &[(usize, sheetcore::structural::Structural)],
+    ) {
+        let uid = self.doc_uid;
+        let cur_room = self
+            .net
+            .as_ref()
+            .map(|n| n.connected_room_id())
+            .unwrap_or_default();
+        if cur_room.is_empty() {
+            return;
+        }
+        if let Some(meta) = self.rejoin_outbox_meta.clone() {
+            if meta.doc_uid == uid
+                && meta.coord.room_id == cur_room
+                && meta.coord.epoch.struct_rev < items.len()
+            {
+                for (sh, op) in &items[meta.coord.epoch.struct_rev..] {
+                    self.shift_rejoin_cell_ops(*sh, op);
+                }
+                if let Some(meta_mut) = self.rejoin_outbox_meta.as_mut() {
+                    meta_mut.coord.epoch.struct_rev = items.len();
+                }
+            }
+        }
+        if !self.rejoin_style_outbox.is_empty() {
+            let mut next_styles = Vec::with_capacity(self.rejoin_style_outbox.len());
+            for mut entry in std::mem::take(&mut self.rejoin_style_outbox) {
+                if entry.doc_uid == uid
+                    && entry.coord.room_id == cur_room
+                    && entry.coord.epoch.struct_rev < items.len()
+                {
+                    let base = entry.coord.epoch.struct_rev;
+                    for (sh, op) in &items[base..] {
+                        if *sh == entry.sheet {
+                            entry.items = entry
+                                .items
+                                .into_iter()
+                                .filter_map(|(r, c, st)| {
+                                    sheetcore::sync::shift_structural_coord(r, c, op)
+                                        .map(|(nr, nc)| (nr, nc, st))
+                                })
+                                .collect();
+                        }
+                    }
+                    entry.coord.epoch.struct_rev = items.len();
+                    if !entry.items.is_empty() {
+                        next_styles.push(entry);
+                    }
+                } else {
+                    next_styles.push(entry);
+                }
+            }
+            self.rejoin_style_outbox = next_styles;
+        }
+        if !self.rejoin_merge_outbox.is_empty() {
+            let mut next_merges = Vec::with_capacity(self.rejoin_merge_outbox.len());
+            for mut entry in std::mem::take(&mut self.rejoin_merge_outbox) {
+                if entry.doc_uid == uid
+                    && entry.coord.room_id == cur_room
+                    && entry.coord.epoch.struct_rev < items.len()
+                {
+                    let base = entry.coord.epoch.struct_rev;
+                    let mut survived = true;
+                    for (sh, op) in &items[base..] {
+                        if *sh == entry.sheet {
+                            if let Some(nrect) =
+                                sheetcore::sync::shift_structural_merge_rect(entry.rect, op)
+                            {
+                                entry.rect = nrect;
+                            } else {
+                                survived = false;
+                                break;
+                            }
+                        }
+                    }
+                    if survived {
+                        entry.coord.epoch.struct_rev = items.len();
+                        next_merges.push(entry);
+                    }
+                } else {
+                    next_merges.push(entry);
+                }
+            }
+            self.rejoin_merge_outbox = next_merges;
+        }
+        self.advance_deferred_paste_struct_rev(&cur_room, Some(items.len()));
     }
 
     fn shift_collab_coordinates(
@@ -42998,11 +43262,6 @@ impl SheetApp {
             peer.shift_structural_with_formulas(&names, sheet, op);
         }
         self.shift_rejoin_outboxes(sheet, op);
-        if let Some((muid, _, ref mut srev)) = self.rejoin_outbox_meta {
-            if muid == self.doc_uid {
-                *srev = srev.saturating_add(1);
-            }
-        }
         if let Some((ls, lr, lc)) = self.my_lock {
             if ls == sheet {
                 match sheetcore::sync::shift_structural_coord(lr, lc, op) {
@@ -43043,20 +43302,29 @@ impl SheetApp {
     /// 重连前暂存本副本里「尚未被宿主确认的」单元格操作（只在客户端侧；宿主侧的权威状态不需要补发）。
     /// 已被宿主提交确认的操作（`ts <= acked_op_ts`）绝不再入队，避免断线期间结构性插删行列后被错位重放。
     fn stash_own_ops_for_rejoin(&mut self) {
+        let coord = self.current_outbox_coord();
+        self.stash_own_ops_for_rejoin_at(coord);
+    }
+
+    fn stash_own_ops_for_rejoin_at(&mut self, coord: cell_shift::OutboxCoord) {
         if self.net.as_ref().is_some_and(|n| n.hosting) {
             return;
         }
         let uid = self.doc_uid;
         let acked_ts = self.net.as_ref().map(|n| n.acked_op_ts()).unwrap_or(0);
-        let room_id = self.net.as_ref().map(|n| n.connected_room_id()).unwrap_or_default();
-        let cur_srev = self.net.as_ref().map(|n| n.structure_seen()).unwrap_or(0);
+        let cur_net_room = self.net.as_ref().map(|n| n.connected_room_id()).unwrap_or_default();
         if acked_ts > 0 {
-            if let Some((owner, ops)) = self.rejoin_outbox.as_mut() {
-                if *owner == uid {
-                    ops.retain(|o| o.ts > acked_ts);
-                    if ops.is_empty() {
-                        self.rejoin_outbox = None;
-                        self.rejoin_outbox_meta = None;
+            let same_room_meta = self.rejoin_outbox_meta.as_ref().is_none_or(|meta| {
+                meta.doc_uid == uid && meta.coord.matches_room(&cur_net_room)
+            });
+            if same_room_meta {
+                if let Some((owner, ops)) = self.rejoin_outbox.as_mut() {
+                    if *owner == uid {
+                        ops.retain(|o| o.ts > acked_ts);
+                        if ops.is_empty() {
+                            self.rejoin_outbox = None;
+                            self.rejoin_outbox_meta = None;
+                        }
                     }
                 }
             }
@@ -43064,17 +43332,51 @@ impl SheetApp {
         let Some(peer) = self.peer.as_ref() else { return };
         // ts = 1 是宿主播种的磁盘基准格；ts <= acked_ts 已由宿主确认提交，均不属于待补发的断线编辑
         let sorts = self.net.as_ref().map(|n| n.sort_clock_ranges()).unwrap_or_default();
-        let mine: Vec<sheetcore::sync::Op> = peer
-            .cells
-            .values()
-            .filter(|o| o.site == peer.site && o.ts > 1 && o.ts > acked_ts && {
-                let i = sorts.partition_point(|(first,_)| *first <= o.ts);
-                i == 0 || o.ts >= sorts[i-1].1
-            })
-            .map(|op| op.as_ref().clone())
-            .collect();
+        let pre_shift_stale_ts = self.shift_intro.pre_shift_stale_ts;
+        let mut stale_pre_shift_count = 0usize;
+        let mut mine: Vec<sheetcore::sync::Op> = Vec::new();
+        for op in peer.cells.values() {
+            if op.site != peer.site || op.ts <= 1 || op.ts <= acked_ts {
+                continue;
+            }
+            if self.shift_intro.is_committed_shift_ts(op.ts) {
+                continue;
+            }
+            let i = sorts.partition_point(|(first, _)| *first <= op.ts);
+            if i > 0 && op.ts < sorts[i - 1].1 {
+                continue;
+            }
+            if pre_shift_stale_ts > 0 && op.ts <= pre_shift_stale_ts {
+                stale_pre_shift_count += 1;
+                continue;
+            }
+            mine.push(op.as_ref().clone());
+        }
+        if stale_pre_shift_count > 0 {
+            self.shift_intro.pending_cancelled_edits = self
+                .shift_intro
+                .pending_cancelled_edits
+                .saturating_add(stale_pre_shift_count);
+            self.shift_intro.needs_delta_resync_for_stale = true;
+        }
         if mine.is_empty() {
             return;
+        }
+        let existing_compatible = self
+            .rejoin_outbox_meta
+            .as_ref()
+            .is_some_and(|meta| meta.doc_uid == uid && meta.coord == coord);
+        if !existing_compatible {
+            if let Some((owner, old_ops)) = self.rejoin_outbox.take() {
+                if owner == uid && !old_ops.is_empty() {
+                    self.shift_intro.pending_cancelled_edits = self
+                        .shift_intro
+                        .pending_cancelled_edits
+                        .saturating_add(old_ops.len());
+                    self.shift_intro.needs_delta_resync_for_stale = true;
+                }
+            }
+            self.rejoin_outbox_meta = None;
         }
         match self.rejoin_outbox.as_mut() {
             Some((owner, ops)) if *owner == uid => {
@@ -43119,9 +43421,12 @@ impl SheetApp {
         if self
             .rejoin_outbox_meta
             .as_ref()
-            .is_none_or(|(muid, mroom, _)| *muid != uid || *mroom != room_id)
+            .is_none_or(|meta| meta.doc_uid != uid || meta.coord != coord)
         {
-            self.rejoin_outbox_meta = Some((uid, room_id, cur_srev));
+            self.rejoin_outbox_meta = Some(cell_shift::RejoinOutboxMeta {
+                doc_uid: uid,
+                coord,
+            });
         }
     }
 
@@ -43410,13 +43715,11 @@ impl SheetApp {
     /// 本地更新的才写回表格并发给宿主；宿主上更新的（别人断线期间改过）则保留宿主版本。
     fn replay_rejoin_outbox(&mut self) {
         let uid = self.doc_uid;
-        self.rejoin_outbox_meta = None;
         if self.net.as_ref().is_none_or(|n| n.hosting) {
-            self.rejoin_outbox = None;
-            self.rejoin_style_outbox.retain(|(o, ..)| *o != uid);
-            self.rejoin_merge_outbox.retain(|(o, ..)| *o != uid);
+            self.clear_doc_rejoin_outboxes();
             return;
         }
+        self.rejoin_outbox_meta = None;
         let acked_ts = self.net.as_ref().map(|n| n.acked_op_ts()).unwrap_or(0);
         let mut replayed_count = 0usize;
         if let Some((owner, ops)) = self.rejoin_outbox.take() {
@@ -43454,11 +43757,11 @@ impl SheetApp {
         let style_items: Vec<_> = {
             let mut keep = Vec::new();
             let mut take = Vec::new();
-            for item in std::mem::take(&mut self.rejoin_style_outbox) {
-                if item.0 == uid {
-                    take.push((item.1, item.2));
+            for entry in std::mem::take(&mut self.rejoin_style_outbox) {
+                if entry.doc_uid == uid {
+                    take.push((entry.sheet, entry.items));
                 } else {
-                    keep.push(item);
+                    keep.push(entry);
                 }
             }
             self.rejoin_style_outbox = keep;
@@ -43479,11 +43782,11 @@ impl SheetApp {
         let merge_items: Vec<_> = {
             let mut keep = Vec::new();
             let mut take = Vec::new();
-            for item in std::mem::take(&mut self.rejoin_merge_outbox) {
-                if item.0 == uid {
-                    take.push((item.1, item.2, item.3));
+            for entry in std::mem::take(&mut self.rejoin_merge_outbox) {
+                if entry.doc_uid == uid {
+                    take.push((entry.sheet, entry.rect, entry.on));
                 } else {
-                    keep.push(item);
+                    keep.push(entry);
                 }
             }
             self.rejoin_merge_outbox = keep;
@@ -43582,6 +43885,7 @@ impl SheetApp {
         self.room_lost = false;
         self.joined_doc = false;
         self.in_snapshot = false;
+        self.shift_intro = Default::default();
         self.snapshot_is_delta = false;
         self.fw_blocked_peer = None;
         self.bg_beat_rx = None;
@@ -43619,6 +43923,7 @@ impl SheetApp {
         self.room_lost = false;
         self.joined_doc = false;
         self.in_snapshot = false;
+        self.shift_intro = Default::default();
         self.snapshot_is_delta = false;
         self.fw_blocked_peer = None;
         self.bg_beat_rx = None;
@@ -43652,10 +43957,8 @@ impl SheetApp {
         self.collab_ui_cache = None;
         self.auto_probe = None;
         // 主动离开就不会再重连补发；本地表格里的修改仍在，按普通未保存修改处理
-        self.rejoin_outbox = None;
-        self.rejoin_outbox_meta = None;
-        self.rejoin_style_outbox.retain(|(o, ..)| *o != self.doc_uid);
-        self.rejoin_merge_outbox.retain(|(o, ..)| *o != self.doc_uid);
+        self.clear_doc_rejoin_outboxes();
+        self.shift_intro = Default::default();
         self.release_lock();
         let host_session = self
             .net
@@ -43711,6 +44014,8 @@ impl SheetApp {
             .and_then(|p| session_lock::read(p))
             .filter(|info| old_addr.is_empty() || info.host == old_addr)
             .map(|info| info.session);
+        self.clear_doc_rejoin_outboxes();
+        self.shift_intro = Default::default();
         if let Some(n) = self.net.take() {
             n.shutdown();
         }
@@ -44155,6 +44460,7 @@ impl SheetApp {
                 self.collab_ui_cache = None;
                 // 从断线的旧会话换到新会话：旧副本里自己的编辑先暂存，快照后补发
                 self.stash_own_ops_for_rejoin();
+                self.shift_intro.clear_peer_shift_tracking();
                 self.peer = Some(Peer::new(site));
                 self.peers_list = vec![(site, self.my_name.clone(), (site % 7) as u8)];
                 n.enable_fast_snapshot_handoff_with_styles(&self.wb.styles);
@@ -46700,6 +47006,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.auto_join_tried = None;
         self.cf_stats_gen = doc.cf_stats_gen;
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
+        self.last_seen_coord_epoch = self.wb.coord_epoch();
         self.cancel_edit();
         self.cf_stats_gen = u64::MAX;
         self.confirm_close_target = None;
@@ -47009,6 +47316,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.confirm_close_target = None;
         self.doc_gen = 0;
         self.cf_stats_gen = u64::MAX;
+        self.last_seen_coord_epoch = 0;
         self.undo = sheetcore::undo::UndoStack::new();
         self.audit_state = audit_ui::DocAuditState::default();
         self.audit_archive_msg = None;
@@ -47055,6 +47363,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 self.collab_ui_cache = None;
                 // 从断线的旧会话换到新会话：旧副本里自己的编辑先暂存，快照后补发
                 self.stash_own_ops_for_rejoin();
+                self.shift_intro.clear_peer_shift_tracking();
                 self.peer = Some(Peer::new(site));
                 self.peers_list = vec![(site, self.my_name.clone(), (site % 7) as u8)];
                 n.enable_fast_snapshot_handoff_with_styles(&self.wb.styles);
@@ -47121,10 +47430,34 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 net::NetEvent::CellShiftCommitted { site, id, phase, patch, first_ts, snapshot, seq } => {
                     if snapshot {
+                        let local_author = self
+                            .net
+                            .as_ref()
+                            .is_some_and(|n| !n.hosting && n.site == site);
+                        if local_author && !patch.cells.is_empty() {
+                            let last_ts =
+                                first_ts.saturating_add(patch.cells.len() as u64 - 1);
+                            self.shift_intro
+                                .committed_shift_ts_ranges
+                                .push((first_ts, last_ts));
+                        }
                         self.shift_intro.receipt = Some((id, phase, patch));
-                    } else if self.commit_room_cell_shift(site, id, phase, patch, first_ts) {
-                        self.shift_intro.applied_seq = seq;
-                        if let Some(net) = &self.net { net.ack_cell_shift(seq); }
+                    } else {
+                        let pre_clock = self.peer.as_ref().map(|p| p.clock).unwrap_or(0);
+                        let old_seq = self.shift_intro.applied_seq;
+                        let patch_ref = patch.clone();
+                        if self.commit_room_cell_shift(site, id, phase, patch, first_ts) {
+                            self.on_live_cell_shift_committed(
+                                site,
+                                phase,
+                                &patch_ref,
+                                first_ts,
+                                seq,
+                                old_seq,
+                                pre_clock,
+                            );
+                            if let Some(net) = &self.net { net.ack_cell_shift(seq); }
+                        }
                     }
                 }
                 net::NetEvent::Sort(plan, reply) => {
@@ -47223,33 +47556,19 @@ fn elide(s: &str, max_chars: usize) -> String {
                 }
                 crate::net::NetEvent::StructuralHistory(items) => {
                     // 先存着：文件还在后台读/重算，这会儿改会被随后的整份替换冲掉
-                    if let Some(net) = &self.net { net.note_structure(items.len()); }
-                    // 全量重连到同一房间时，把重连暂存的未确认断线操作按断线期间新增的结构改动平移/过滤
+                    if let Some(net) = &self.net {
+                        net.note_structure(items.len());
+                        self.shift_intro.sync_struct_rev(net.structure_seen());
+                    }
+                    // 全量重连到同一房间时，把重连暂存的未确认断线操作（单元格/样式/合并/粘贴）按断线期间新增的结构改动平移/过滤
                     if self.in_snapshot && !self.snapshot_is_delta {
-                        let cur_room = self
-                            .net
-                            .as_ref()
-                            .map(|n| n.connected_room_id())
-                            .unwrap_or_default();
-                        if let Some((muid, mroom, base_srev)) = self.rejoin_outbox_meta.clone() {
-                            if muid == self.doc_uid
-                                && !cur_room.is_empty()
-                                && mroom == cur_room
-                                && base_srev < items.len()
-                            {
-                                for (sh, op) in &items[base_srev..] {
-                                    self.shift_rejoin_outboxes(*sh, op);
-                                }
-                                if let Some((_, _, ref mut rev)) = self.rejoin_outbox_meta {
-                                    *rev = items.len();
-                                }
-                            }
-                        }
+                        self.shift_rejoin_outboxes_from_history(&items);
                     }
                     self.struct_history.extend(items);
                 }
                 crate::net::NetEvent::StructureRevision(revision) => {
                     if let Some(net) = &self.net { net.set_structure_revision(revision); }
+                    self.shift_intro.sync_struct_rev(revision);
                 }
                 crate::net::NetEvent::StructuralRejected(reason) => {
                     if let Some(net) = &self.net { net.finish_structure(); }
@@ -47258,6 +47577,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 crate::net::NetEvent::Structural { site, sheet, op } => {
                     if let Some(net) = &self.net {
                         net.note_structure(1);
+                        self.shift_intro.sync_struct_rev(net.structure_seen());
                         if !net.hosting && net.site == site {
                             net.finish_structure();
                             if sheet < self.wb.sheets.len() {
@@ -47276,6 +47596,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.tasks.last_edit = Some(std::time::Instant::now());
                         self.wb.dirty = true;
                         self.doc_gen = self.doc_gen.wrapping_add(1);
+                        if !self.sync_coord_epoch_side_effects() {
+                            self.cf_stats_gen = u64::MAX;
+                            self.invalid_gen = u64::MAX;
+                            self.cf_cache = None;
+                            self.cf_inputs.grid.invalidate_viewport();
+                        }
                         self.recalc_after_structural(updates);
                         self.audit_note_structural(Some(site), sheet, &op, None);
                         self.record_remote_note_revision(site, "远端结构改动", sheet, label.clone());
@@ -47507,6 +47833,13 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.status = "已连接".into();
                 }
                 net::NetEvent::Welcome { peers, delta_sync, clock } => {
+                    let was_in_snapshot = self.in_snapshot;
+                    let prev_coord = self.current_outbox_coord();
+                    let new_room = self
+                        .net
+                        .as_ref()
+                        .map(|n| n.connected_room_id())
+                        .unwrap_or_default();
                     // 握手完成前发出去的光标会被丢掉；清一下，下一帧重发。
                     self.last_cursor = None;
                     self.locks = sheetcore::sync::LockTable::default();
@@ -47517,17 +47850,17 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.room_lost = false;
                     self.joined_doc = false;
                     self.in_snapshot = true;
-                    self.shift_intro.overlay = None;
-                    self.shift_intro.receipt = None;
-                    self.shift_intro.applied_seq = 0;
                     self.snapshot_is_delta = delta_sync;
                     self.collab_ui_cache = None;
-                    // 重连：宿主的快照会覆盖本地副本。先把自己写过的格子暂存起来，
-                    // 快照落定后再补发（断线期间的编辑原本会被这里静默清掉）。
-                    self.stash_own_ops_for_rejoin();
+                    // 重连：必须在重置 shift_intro.applied_seq 和 structure_seen 之前按旧坐标纪元暂存未确认编辑，
+                    // 快照落定后再按统一坐标纪元校验并决定补发或取消。
+                    if !was_in_snapshot {
+                        self.stash_own_ops_for_rejoin_at(prev_coord);
+                    }
+                    self.shift_intro.begin_welcome(new_room);
                     if let Some(net) = &self.net {
                         net.finish_unconfirmed_axis_structure();
-                        net.reset_structure();
+                        net.reset_coord_epoch();
                         for ts in net.discard_pending_sorts() { self.undo.reject_sort(ts); }
                     }
                     if !delta_sync {
@@ -47572,12 +47905,16 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if let Some((seq, overlay)) = self.shift_intro.overlay.take() {
                         if overlay.apply_to(&mut self.wb) {
                             self.shift_intro.applied_seq = seq;
-                            if let Some(net) = &self.net { net.ack_cell_shift(seq); }
+                            if let Some(net) = &self.net {
+                                net.set_shift_seq(seq);
+                                net.ack_cell_shift(seq);
+                            }
                         } else {
                             self.resync_room_cell_shift();
                             continue;
                         }
                     }
+                    self.sync_coord_epoch_side_effects();
                     if self.snapshot_is_delta {
                         let delta_keys: Vec<(usize, u32, u32)> = self
                             .peer
@@ -47620,17 +47957,28 @@ fn elide(s: &str, max_chars: usize) -> String {
                     if let Some((id, phase, patch)) = self.shift_intro.receipt.take() {
                         self.finish_room_shift_history(id, phase, patch);
                     }
-                    let obsolete = self.discard_stale_deferred_pastes(self.shift_intro.applied_seq);
-                    if obsolete > 0 && self.snapshot_is_delta {
-                        // Delta snapshots need not mention the old paste coordinates.
-                        // Replace the optimistic cells from the host before replaying
-                        // the remaining ordinary outbox edits.
+                    let stale_discarded = self.discard_stale_rejoin_outboxes();
+                    if stale_discarded > 0 {
+                        self.shift_intro.pending_cancelled_edits = self
+                            .shift_intro
+                            .pending_cancelled_edits
+                            .saturating_add(stale_discarded);
+                    }
+                    let needs_delta_resync = self.snapshot_is_delta
+                        && (stale_discarded > 0 || self.shift_intro.needs_delta_resync_for_stale);
+                    if needs_delta_resync {
+                        // Delta snapshots do not overwrite optimistic local writes at untouched
+                        // coordinates. Force a full authoritative resync before replaying any
+                        // remaining valid outbox edits.
+                        self.shift_intro.needs_delta_resync_for_stale = false;
                         self.resync_room_cell_shift();
                         continue;
                     }
+                    self.shift_intro.needs_delta_resync_for_stale = false;
                     self.replay_rejoin_outbox();
-                    if obsolete > 0 {
-                        self.status = format!("工作表坐标已改变，已取消断线前后台粘贴的 {obsolete} 格未确认写入");
+                    let cancelled = std::mem::take(&mut self.shift_intro.pending_cancelled_edits);
+                    if cancelled > 0 {
+                        self.status = format!("工作表坐标已改变，已取消断线前未确认的 {cancelled} 处修改");
                     }
                     if shared_cells_only {
                         self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
@@ -49291,6 +49639,7 @@ impl eframe::App for SheetApp {
         self.poll_open();
         self.poll_reorder();
         self.sync_history();
+        self.sync_coord_epoch_side_effects();
         self.poll_save();
         self.tick_autosave(Some(ctx));
         self.poll_auto_xlinks(ctx);

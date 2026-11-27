@@ -70,6 +70,7 @@ pub(super) struct CellShiftHost {
     pub(super) delta_styles: SharedStyles,
     pub(super) threads: HostThreads,
     pub(super) merges: Arc<Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>>,
+    pub(super) acked_ts: Arc<Mutex<HashMap<u32, u64>>>,
     pub(super) transactions: Mutex<ShiftJournal>,
     pub(super) seed: Mutex<Option<(u64, Arc<CellShiftOverlay>)>>,
     pub(super) has_app: AtomicBool,
@@ -343,6 +344,15 @@ impl CellShiftHost {
             }
         }
         drop(merges);
+        let last_ts = (!canonical.cells.is_empty())
+            .then(|| first_ts.saturating_add(canonical.cells.len() as u64 - 1));
+        if let Some(ack_ts) = last_ts {
+            let mut acks = lock_unpoison(&self.acked_ts);
+            let entry = acks.entry(site).or_insert(0);
+            if ack_ts > *entry {
+                *entry = ack_ts;
+            }
+        }
         let seq = wm.bump();
         let mut journal = lock_unpoison(&self.transactions);
         journal
@@ -378,7 +388,11 @@ impl CellShiftHost {
             patch: canonical,
             snapshot: false,
         });
-        emit_room_watermark(&self.cmd, &self.roster, seq, revision);
+        if let Some(ack_ts) = last_ts {
+            emit_room_watermark_ack(&self.cmd, &self.roster, seq, revision, site, ack_ts);
+        } else {
+            emit_room_watermark(&self.cmd, &self.roster, seq, revision);
+        }
         Ok(())
     }
 

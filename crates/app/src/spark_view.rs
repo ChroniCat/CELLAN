@@ -27,7 +27,7 @@ const MARKER: Color32 = Color32::from_rgb(0xD0, 0x00, 0x00);
 /// 取迷你图的数据点（行优先；空/非数字按 empty 规则处理）
 pub fn values(wb: &Workbook, sheet_idx: usize, sp: &Sparkline) -> Vec<Option<f64>> {
     let sheet = match sp.source_sheet.as_deref() {
-        Some(name) => match wb.sheets.iter().find(|s| s.name == name) {
+        Some(name) => match wb.sheets.iter().find(|s| s.name.eq_ignore_ascii_case(name)) {
             Some(s) => s,
             None => return Vec::new(),
         },
