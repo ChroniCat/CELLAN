@@ -1293,6 +1293,7 @@ pub(super) fn parse_styles_from_zip<R: Read + Seek>(
 }
 
 pub(super) struct Header {
+    date_system: crate::DateSystem,
     dynamic: std::collections::HashSet<u32>,
     pub names: Vec<String>,
     types: Vec<calamine::SheetType>,
@@ -1507,6 +1508,7 @@ pub(super) fn header<R: Read + Seek>(
         Default::default()
     };
     Ok(Some(Header {
+        date_system: if crate::patch::date1904_xml(workbook) { crate::DateSystem::D1904 } else { crate::DateSystem::D1900 },
         dynamic,
         names,
         types,
@@ -1585,6 +1587,7 @@ impl<'a> StyleLookup<'a> {
 
 #[derive(Default)]
 struct Strings {
+    date_system: crate::DateSystem,
     dynamic: std::collections::HashSet<u32>,
     text: TextPool,
     rich: HashMap<usize, Vec<RichRun>>,
@@ -1964,7 +1967,7 @@ fn cell(
                             }
                             "inlineStr" | "is" => continue,
                             "str" => Value::Text(office_text(&v).as_ref().into()),
-                            "d" => Value::Text(v.as_ref().into()),
+                            "d" if !v.is_empty() => super::iso_date_value(&v, table.date_system),
                             _ if v.is_empty() => Value::Empty,
                             "b" => match v.trim() {
                                 "" => Value::Empty,
@@ -1982,7 +1985,7 @@ fn cell(
                                 } else {
                                     super::data_to_value(&calamine::Data::Error(
                                         v.parse().map_err(|_| anyhow::anyhow!("无效错误值 {v}"))?,
-                                    ))
+                                    ), table.date_system)
                                 }
                             }
                             "" => fast_parse_f64(&v)
@@ -2441,6 +2444,7 @@ pub(super) fn worksheets<'a>(
     let names = &header.names;
     let mut shared = strings(zip).context("读取 xl/sharedStrings.xml 失败")?;
     shared.dynamic.clone_from(&header.dynamic);
+    shared.date_system = header.date_system;
     let signatures: Vec<_> = names
         .iter()
         .map(|n| targets.get(n).and_then(|p| signature(zip, p)))
@@ -2765,7 +2769,7 @@ mod tests {
         assert!(!sh.rich.contains_key(&(3, 1)));
         assert!(sh.rich[&(3, 2)][0].italic);
         assert_eq!(sh.rich[&(3, 3)][0].text, " A&B 😀 ");
-        assert_eq!(sh.value(3, 4), Value::Text("2026-06-01".into()));
+        assert_eq!(sh.value(3, 4), Value::Number(44_712.));
         assert_eq!(sh.get(5, 1).unwrap().formula.as_deref(), Some("=A6+$D$2"));
         assert_eq!(sh.value(5, 1), Value::Number(12.));
         assert_eq!(sh.value(6, 2), Value::Error(crate::formula::ErrKind::Ref));

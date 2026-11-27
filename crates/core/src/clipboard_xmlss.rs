@@ -93,10 +93,17 @@ pub fn iso_to_serial(sys: crate::model::DateSystem, iso: &str) -> Option<(f64, (
 }
 
 /// "12:34:56.789" → 0.5242683…（一天的分数）；空串 → 0；格式不对 → None
-fn time_fraction(t: &str) -> Option<f64> {
+pub(crate) fn time_fraction(t: &str) -> Option<f64> {
     let t = t.trim();
     if t.is_empty() {
         return Some(0.0);
+    }
+    // ISO 8601 uses 24:00 for the end of the day. Check the spelling so even
+    // a nonzero subsecond too small to survive f64 parsing cannot roll over.
+    if t == "24:00" || t == "24:00:00" || t.strip_prefix("24:00:00.").is_some_and(|fraction| {
+        !fraction.is_empty() && fraction.bytes().all(|digit| digit == b'0')
+    }) {
+        return Some(1.0);
     }
     let mut parts = t.split(':');
     let h: f64 = parts.next()?.parse().ok()?;

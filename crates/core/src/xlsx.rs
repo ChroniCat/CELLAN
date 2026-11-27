@@ -1,4 +1,6 @@
-use crate::model::{Cell, Sheet, Value, Workbook};
+use crate::model::{Cell, DateSystem, Sheet, Value, Workbook};
+#[path = "ods_formula.rs"]
+mod ods_formula;
 use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
 use std::borrow::Cow;
@@ -7,8 +9,10 @@ use std::path::Path;
 /// 从单次读取的 BIFF `Workbook` 流中还原列宽、行高与预去重样式，避免多次整包重读 `.xls`。
 fn apply_xls_meta_stream(stream: &[u8], wb: &mut Workbook) {
     let sizes = crate::xls_layout::parse(stream);
-    for (i, sheet) in wb.sheets.iter_mut().enumerate() {
-        let Some(sz) = sizes.sheets.get(i) else { continue };
+    let by_name: std::collections::HashMap<_, _> = sizes.sheets.iter()
+        .map(|sizes| (sizes.name.as_str(), sizes)).collect();
+    for sheet in &mut wb.sheets {
+        let Some(sz) = by_name.get(sheet.name.as_str()) else { continue };
         for (a, b, w) in sz.cols.iter() {
             if b.saturating_sub(*a) < 1024 {
                 sheet.cols.set_many((*a..=*b).map(|c| (c, *w)));
@@ -17,6 +21,10 @@ fn apply_xls_meta_stream(stream: &[u8], wb: &mut Workbook) {
             }
         }
         sheet.rows.set_many(sz.rows.iter().map(|(r, h)| (*r, *h)));
+        sheet.hidden_cols = crate::layout::HiddenIndices::from_intervals(sz.hidden_cols.iter().copied());
+        sheet.hidden_rows_user = crate::layout::HiddenIndices::from_intervals(sz.hidden_rows.iter().map(|&r| (r, r)));
+        sheet.hidden = sz.visibility != crate::model::SheetVisibility::Visible;
+        sheet.very_hidden = sz.visibility == crate::model::SheetVisibility::VeryHidden;
     }
     crate::xls_style::apply_stream_to_workbook(stream, wb);
 }
@@ -48,7 +56,7 @@ mod structure;
 #[path = "xlsx_pivots.rs"]
 mod pivots;
 
-fn data_to_value(d: &Data) -> Value {
+fn data_to_value(d: &Data, sys: DateSystem) -> Value {
     match d {
         Data::Empty => Value::Empty,
         Data::String(s) => Value::Text(s.as_str().into()),
@@ -56,7 +64,7 @@ fn data_to_value(d: &Data) -> Value {
         Data::Int(i) => Value::Number(*i as f64),
         Data::Bool(b) => Value::Bool(*b),
         Data::DateTime(dt) => Value::Number(dt.as_f64()),
-        Data::DateTimeIso(s) => Value::Text(s.as_str().into()),
+        Data::DateTimeIso(s) => iso_date_value(s, sys),
         Data::DurationIso(s) => Value::Text(s.as_str().into()),
         // 低层错误类型要映射回我们自己的 ErrKind，不能 Debug 拼字符串：
         // `Data::Error` 的 Debug 输出和我们显示/存盘用的文本并不是一回事。
@@ -73,7 +81,16 @@ fn data_to_value(d: &Data) -> Value {
     }
 }
 
-/// 读取 xlsx/xls/ods（按扩展名自动识别）
+/// Excel uses numeric serials for ISO-typed date and time cells too.
+fn iso_date_value(s: &str, sys: DateSystem) -> Value {
+    let local = s.trim().strip_suffix('Z').unwrap_or(s.trim());
+    let serial = if local.as_bytes().get(2) == Some(&b':') {
+        crate::clipboard_xmlss::time_fraction(local)
+    } else {
+        crate::clipboard_xmlss::iso_to_serial(sys, local).map(|(serial, _)| serial)
+    };
+    serial.map(Value::Number).unwrap_or_else(|| Value::Text(s.into()))
+}
 
 /// 一次加载中发现的问题。`fatal` 表示"覆盖保存会丢掉用户的真实数据"，
 /// 调用方（应用层）必须据此禁止普通覆盖保存，只能只读查看或另存抢救副本。
@@ -133,6 +150,7 @@ fn load_legacy_sheet(
     reader: &mut calamine::Sheets<std::io::BufReader<std::fs::File>>,
     sheet: &mut Sheet,
     styles: &mut crate::style::StyleTable,
+    sys: DateSystem,
     diag: &mut LoadDiag,
 ) {
     let name = sheet.name.clone();
@@ -141,7 +159,7 @@ fn load_legacy_sheet(
         Ok(range) => {
             let (r0, c0) = range.start().unwrap_or((0, 0));
             for (row, col, data) in range.cells() {
-                let value = data_to_value(data);
+                let value = data_to_value(data, sys);
                 if !value.is_empty() {
                     sheet.set(r0 + row as u32, c0 + col as u32, Cell { value, formula: None });
                 }
@@ -174,8 +192,19 @@ fn load_legacy_sheet(
                 let r = r0 + row as u32;
                 let c = c0 + col as u32;
                 let mut cell = sheet.get(r, c).map(|c| c.into_owned()).unwrap_or_default();
-                let f = f.strip_prefix('=').unwrap_or(f);
-                cell.formula = Some(crate::normalize_formula(&format!("={f}")).into());
+                let converted = if matches!(reader, calamine::Sheets::Ods(_)) {
+                    match ods_formula::to_excel(f) {
+                        Ok(f) => f,
+                        Err(err) => {
+                            diag.push(Some(&name), &part, "OpenDocument 公式",
+                                format!("{}：{err}，已保留缓存值", crate::model::cell_name(r, c)), true);
+                            continue;
+                        }
+                    }
+                } else {
+                    format!("={}", f.trim_start_matches('='))
+                };
+                cell.formula = Some(crate::normalize_formula(&converted).into());
                 sheet.set(r, c, cell);
             }
         }
@@ -188,6 +217,7 @@ fn load_legacy_sheet(
 fn load_xlsx_cells(
     book: &mut calamine::Xlsx<std::io::BufReader<std::fs::File>>,
     sheet: &mut Sheet,
+    sys: DateSystem,
 ) -> Result<()> {
     use calamine::XlsxFormulaMetadata as F;
     let mut reader = match book.worksheet_cells_reader(&sheet.name) {
@@ -214,7 +244,7 @@ fn load_xlsx_cells(
         let value = match record.value {
             calamine::DataRef::SharedString(text) => Value::Text(text.into()),
             calamine::DataRef::String(text) => Value::Text(text.into()),
-            other => data_to_value(&other.into()),
+            other => data_to_value(&other.into(), sys),
         };
         let formula = formula.filter(|f| !f.is_empty()).map(|f| {
             crate::normalize_formula(&format!("={}", f.trim_start_matches('='))).into()
@@ -360,6 +390,12 @@ pub fn load_diag_with_control(
     // .xls：先让 calamine 读（它对真实 Excel 文件最稳），读不了再走内置 BIFF 读取器
     //（我们自己写出的容器就属于后一种）。
     let is_ooxml = crate::crypto::has_magic(path, b"PK");
+    let is_cfb = !is_ooxml && crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
+    let biff_vba = if is_cfb {
+        crate::xls_read::has_vba_project(path).context("无法核验 .xls 宏工程目录")?
+    } else {
+        false
+    };
     let archive_bytes = is_ooxml.then(|| sheets::ArchiveBytes::open(path)).transpose()?;
     let (mut shared_zip, package_stamp) = match archive_bytes.as_ref() {
         Some(ab) => {
@@ -445,6 +481,7 @@ pub fn load_diag_with_control(
                 set_load_kind(LOAD_KIND_BIFF_BUILTIN);
                 if let Some(stream) = crate::cfb::read_workbook_stream_file(path) {
                     let mut wb = crate::xls_read::load_from_stream(path, &stream)?;
+                    wb.has_vba = biff_vba;
                     apply_xls_meta_fallback(path, &stream, &mut wb);
                     return Ok((wb, diag));
                 }
@@ -467,7 +504,6 @@ pub fn load_diag_with_control(
         None => reader.as_ref().unwrap().sheet_names(),
     };
 
-    let is_cfb = !is_ooxml && crate::crypto::has_magic(path, &[0xD0, 0xCF, 0x11, 0xE0]);
     let mut defined_names = crate::patch::defined_names_xml(&workbook_xml);
     let manual_hidden = crate::patch::manual_hidden_intervals_from_names(&defined_names);
     defined_names.retain(|(name, _, _)| name != crate::patch::MANUAL_HIDDEN_NAME);
@@ -493,7 +529,7 @@ pub fn load_diag_with_control(
         pivot_shifts: Vec::new(),
         pivot_cache_base: Default::default(),
         pivot_session: Default::default(),
-        has_vba: if is_ooxml { zip_has_vba } else { false },
+        has_vba: zip_has_vba || biff_vba,
         date_system: if crate::patch::date1904_xml(&workbook_xml) {
             crate::model::DateSystem::D1904
         } else {
@@ -690,12 +726,12 @@ pub fn load_diag_with_control(
             sheet.source_part = targets.get(name).cloned();
             sheet.loading = true;
             if let calamine::Sheets::Xlsx(book) = reader {
-                if let Err(err) = load_xlsx_cells(book, &mut sheet) {
+                if let Err(err) = load_xlsx_cells(book, &mut sheet, wb.date_system) {
                     diag.push(Some(name), sheet.source_part.as_deref().unwrap_or("xl/worksheets"),
                         "稀疏单元格数据和公式", format!("{err:#}"), true);
                 }
             } else {
-                load_legacy_sheet(reader, &mut sheet, &mut wb.styles, &mut diag);
+                load_legacy_sheet(reader, &mut sheet, &mut wb.styles, wb.date_system, &mut diag);
             }
             if let (Some(zip), Some(part)) = (shared_zip.as_mut(), targets.get(name)) {
                 match read_zip_text(zip, part) {
@@ -3709,6 +3745,9 @@ fn save_plain_at(
         Some(p) => p,
         None => path.to_path_buf(),
     };
+    if wb.has_vba && crate::crypto::has_magic(&original_base, &[0xD0, 0xCF, 0x11, 0xE0]) {
+        anyhow::bail!("无法转换旧版 .xls 的 VBA 工程。请先在 Excel 中将原文件另存为 .xlsm，再用 CELLAN 编辑");
+    }
     delta::verify_note_sources(&original_base, wb)?;
     // .xls / .xlsb 这类二进制基准不是 zip 包：不能当包结构模板，按全新文件从模型重建。
     let original_base = if crate::fixups::read_part(&original_base, "xl/workbook.xml").is_some() {
@@ -3720,6 +3759,9 @@ fn save_plain_at(
     let prepared_base = structure::prepare_base(&original_base, path, wb)?;
     let base = prepared_base.path.clone();
     let vba = crate::vba::read_vba(&base);
+    if wb.has_vba && vba.is_none() {
+        anyhow::bail!("找不到工作簿的 VBA 工程，已中止保存以保留原文件");
+    }
     // 原地保存时，写盘会把 base 覆盖掉——先把基准复制一份出来
     let restore_src = if base == path && base.exists() {
         let tmp = path.with_extension("preserve.tmp");

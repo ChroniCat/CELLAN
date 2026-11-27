@@ -12,7 +12,7 @@
 use crate::model::{Sheet, Value, Workbook};
 use crate::style::CellStyle;
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 const BOF: u16 = 0x0809;
@@ -776,7 +776,11 @@ fn sheet_stream(
     }
 
     // 列宽
-    for (c, w) in sheet.cols.custom_pairs() {
+    let mut widths: BTreeMap<_, _> = sheet.cols.custom_pairs().into_iter().collect();
+    for &col in &sheet.hidden_cols {
+        widths.entry(col).or_insert_with(|| sheet.cols.size(col));
+    }
+    for (c, w) in widths {
         let s = begin_rec(&mut out, COLINFO);
         push_u16(&mut out, c as u16);
         push_u16(&mut out, c as u16);
@@ -784,13 +788,17 @@ fn sheet_stream(
         let chars = ((w - 5.0) / 8.0).max(0.0);
         push_u16(&mut out, (chars * 256.0).round().min(65535.0) as u16);
         push_u16(&mut out, 0x0F);
-        push_u16(&mut out, 0);
+        push_u16(&mut out, u16::from(sheet.hidden_cols.contains(&c)));
         push_u16(&mut out, 0);
         end_rec(&mut out, s);
     }
 
     // 行高
-    for (r, h) in sheet.rows.custom_pairs() {
+    let mut heights: BTreeMap<_, _> = sheet.rows.custom_pairs().into_iter().collect();
+    for &row in sheet.hidden_rows_user.iter().chain(sheet.hidden_rows.iter()) {
+        heights.entry(row).or_insert_with(|| sheet.rows.size(row));
+    }
+    for (r, h) in heights {
         let s = begin_rec(&mut out, ROW);
         push_u16(&mut out, r as u16);
         push_u16(&mut out, 0);
@@ -798,7 +806,8 @@ fn sheet_stream(
         push_u16(&mut out, (h * 15.0).round().min(65535.0) as u16); // px → twips (px*15 = pt*20)
         push_u16(&mut out, 0);
         push_u16(&mut out, 0);
-        push_u16(&mut out, 0x0140); // 自定义行高（照 Excel 自己的样）
+        let hidden = sheet.hidden_rows_user.contains(&r) || sheet.hidden_rows.contains(&r);
+        push_u16(&mut out, 0x0140 | (u16::from(hidden) << 5));
         push_u16(&mut out, 0x0F);
         end_rec(&mut out, s);
     }
@@ -1012,7 +1021,7 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
         bail!("当前 .xls 写入器无法保留打开密码，请另存为 .xlsx 或 .xlsm");
     }
     if wb.has_vba {
-        bail!("当前 .xls 写入器无法保留 VBA 宏，请另存为 .xlsm");
+        bail!("当前 .xls 写入器无法保留 VBA 工程。请用 Excel 将原文件另存为 .xlsm，再用 CELLAN 编辑");
     }
     if wb.sheets.len() > 255 {
         bail!(".xls 最多 255 张工作表");
@@ -1040,6 +1049,12 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
                     );
                 }
             }
+        }
+        if sheet.hidden_cols.intervals().last().is_some_and(|&(_, c)| c > 255)
+            || [&sheet.hidden_rows_user, &sheet.hidden_rows].iter()
+                .any(|rows| rows.intervals().last().is_some_and(|&(_, r)| r > 65535))
+        {
+            bail!("工作表 {} 的隐藏行列超出 .xls 范围，请另存为 .xlsx", sheet.name);
         }
         let meta_coords = sheet
             .notes
@@ -1178,7 +1193,11 @@ pub fn write(path: &Path, wb: &Workbook) -> Result<()> {
     for s in &wb.sheets {
         let mut b = Vec::new();
         b.extend_from_slice(&w32(0)); // 占位
-        b.extend_from_slice(&w16(0));
+        b.extend_from_slice(&w16(match s.visibility() {
+            crate::SheetVisibility::Visible => 0,
+            crate::SheetVisibility::Hidden => 1,
+            crate::SheetVisibility::VeryHidden => 2,
+        }));
         b.push(s.name.encode_utf16().count().min(31) as u8);
         b.push(1);
         for u in s.name.encode_utf16().take(31) {

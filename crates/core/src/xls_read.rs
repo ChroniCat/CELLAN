@@ -153,7 +153,7 @@ pub fn read_stream(stream: &[u8]) -> Result<Vec<SheetData>> {
             let flags = body[7];
             let raw = &body[8..(8 + if flags & 1 == 0 { cch } else { cch * 2 }).min(body.len())];
             let name = if flags & 1 == 0 {
-                String::from_utf8_lossy(raw).to_string()
+                raw.iter().map(|&ch| char::from(ch)).collect()
             } else {
                 let u: Vec<u16> = raw
                     .chunks(2)
@@ -498,6 +498,16 @@ fn parse_sst(stream: &[u8], start: usize, len: usize) -> Vec<String> {
     out
 }
 
+/// BIFF8 stores its VBA project in a CFB storage beside the Workbook stream.
+pub(crate) fn has_vba_project(path: &Path) -> Result<bool> {
+    if let Ok(cfb) = cfb::open(path) {
+        return Ok(cfb.is_storage("/_VBA_PROJECT_CUR"));
+    }
+    // The built-in reader also accepts some files that the general CFB reader rejects.
+    let cfb = crate::cfb::Compound::open(std::fs::read(path)?)?;
+    Ok(cfb.entries.iter().any(|e| e.kind == 1 && e.name.eq_ignore_ascii_case("_VBA_PROJECT_CUR")))
+}
+
 /// 读一个 .xls 文件（CFB → Workbook 流 → BIFF）
 pub fn load(path: &Path) -> Result<Workbook> {
     let stream = if let Some(s) = crate::cfb::read_workbook_stream_file(path) {
@@ -509,7 +519,9 @@ pub fn load(path: &Path) -> Result<Workbook> {
             .or_else(|| cf.stream_by_path("Book"))
             .ok_or_else(|| anyhow::anyhow!("没有 Workbook 流"))?
     };
-    load_from_stream(path, &stream)
+    let mut wb = load_from_stream(path, &stream)?;
+    wb.has_vba = has_vba_project(path)?;
+    Ok(wb)
 }
 
 pub fn load_from_stream(path: &Path, stream: &[u8]) -> Result<Workbook> {

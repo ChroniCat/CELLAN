@@ -12,6 +12,10 @@ use std::path::Path;
 /// 一张表的尺寸
 #[derive(Clone, Debug, Default)]
 pub struct SheetSizes {
+    pub name: String,
+    pub visibility: crate::model::SheetVisibility,
+    pub hidden_cols: Vec<(u32, u32)>,
+    pub hidden_rows: Vec<u32>,
     /// (起列, 止列, 像素宽) —— 起止都含，0-based
     pub cols: Vec<(u32, u32, f32)>,
     /// (行, 像素高)
@@ -52,7 +56,7 @@ fn u32le(b: &[u8], at: usize) -> Option<u32> {
 /// 解析 `Workbook` 流。公开出来是为了能用内存里的字节做测试。
 pub fn parse(stream: &[u8]) -> XlsSizes {
     // 第一遍：BOUNDSHEET 给出每张表的 BOF 偏移（也就是表顺序）
-    let mut bounds: Vec<(u32, String)> = Vec::new();
+    let mut bounds = Vec::new();
     let mut i = 0usize;
     while i + 4 <= stream.len() {
         let (typ, len) = (u16le(stream, i).unwrap(), u16le(stream, i + 2).unwrap() as usize);
@@ -64,7 +68,7 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
             let flags = body[7];
             let raw = &body[8..(8 + if flags & 1 == 0 { cch } else { cch * 2 }).min(body.len())];
             let name = if flags & 1 == 0 {
-                String::from_utf8_lossy(raw).to_string()
+                raw.iter().map(|&ch| char::from(ch)).collect()
             } else {
                 let units: Vec<u16> = raw
                     .chunks(2)
@@ -72,7 +76,12 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
                     .collect();
                 String::from_utf16_lossy(&units)
             };
-            bounds.push((pos, name));
+            let visibility = match body[4] & 3 {
+                1 => crate::model::SheetVisibility::Hidden,
+                2 => crate::model::SheetVisibility::VeryHidden,
+                _ => crate::model::SheetVisibility::Visible,
+            };
+            bounds.push((pos, name, visibility));
         }
         let next = (i + 4 + len).min(stream.len());
         if next <= i {
@@ -80,10 +89,14 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
         }
         i = next;
     }
-    bounds.sort_by_key(|(p, _)| *p);
+    bounds.sort_by_key(|(p, _, _)| *p);
 
     let mut out = XlsSizes {
-        sheets: vec![SheetSizes::default(); bounds.len()],
+        sheets: bounds.iter().map(|(_, name, visibility)| SheetSizes {
+            name: name.clone(),
+            visibility: *visibility,
+            ..Default::default()
+        }).collect(),
     };
 
     // 第二遍：按当前所在表分配 COLINFO / ROW
@@ -101,6 +114,11 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
         if let Some(si) = cur {
             match typ {
                 COLINFO if body.len() >= 6 => {
+                    if let Some(span) = physical_columns(body)
+                        && u16le(body, 8).is_some_and(|bits| bits & 1 != 0)
+                    {
+                        out.sheets[si].hidden_cols.push(span);
+                    }
                     let chars = u16le(body, 4).unwrap() as f32 / 256.0;
                     if let Some((first, last)) = physical_columns(body).filter(|_| chars > 0.0) {
                         let px = crate::layout::col_width_to_px(chars);
@@ -112,6 +130,9 @@ pub fn parse(stream: &[u8]) -> XlsSizes {
                 ROW if body.len() >= 8 => {
                     // ROW: rw(0) colMic(2) colMac(4) miyRw(6) ... 行高在偏移 6
                     let r = u16le(body, 0).unwrap() as u32;
+                    if u16le(body, 12).is_some_and(|bits| bits & 0x20 != 0) {
+                        out.sheets[si].hidden_rows.push(r);
+                    }
                     let twips = u16le(body, 6).unwrap();
                     // 255 twips 是 Excel 的默认行高（12.75pt），不必记
                     if twips != 0 && twips != 0x00FF {
