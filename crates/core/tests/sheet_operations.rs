@@ -175,3 +175,91 @@ fn invalid_operations_leave_the_workbook_unchanged() {
     assert!(!wb.dirty && !wb.names_dirty);
     assert!(!delete_sheet(&mut Workbook::new_blank(), 0));
 }
+
+#[test]
+fn partial_shift_updates_named_ranges_through_undo_redo_and_room_replay() {
+    use sheetcore::{cells::Shift, structural::CellShift, undo::{UndoStack, snapshot_cell_shift_if_metadata},
+        cell_shift_patch::{CellShiftPatch, CellShiftOverlay}};
+    let mut seed = Workbook::new_blank();
+    seed.sheets.push(Sheet::new("Report"));
+    seed.sheets[0].set(2, 0, number(99.));
+    seed.sheets[0].set(3, 0, number(11.));
+    seed.names = vec![("Amount".into(), None, "Sheet1!$A$4".into()),
+        ("ThisCell".into(), Some(0), "$A$4".into()), ("Other".into(), Some(1), "$A$4".into())];
+    seed.sheets[1].set(0, 0, formula_cell("=Amount"));
+    let shift = CellShift::new((0,0,0,0), Shift::Vertical, true);
+    let mut wb = seed.clone();
+    let before = snapshot_cell_shift_if_metadata(&wb, 0, &shift).unwrap();
+    assert!(shift.apply(&mut wb, 0));
+    assert!(before.cell_shift_changed_metadata(&wb));
+    let after = before.capture_after(&wb);
+    let mut history = UndoStack::new();
+    history.push_structure("insert", before, after, (0,0,0));
+    let check = |wb: &Workbook, row| {
+        assert_eq!(wb.names[0].2, format!("Sheet1!$A${row}"));
+        assert_eq!(wb.names[1].2, format!("$A${row}"));
+        assert_eq!(wb.names[2].2, "$A$4");
+        assert_eq!(formula::eval_cell(wb, 1, 0, 0), formula::FValue::Number(11.));
+    };
+    check(&wb, 5);
+    assert!(history.undo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    check(&wb, 4);
+    assert!(history.redo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    check(&wb, 5);
+
+    let mut guest = seed.clone();
+    guest.names.clear();
+    let request = CellShiftPatch::prepare(&guest, 0, shift).unwrap();
+    let accepted = request.canonical_forward(&seed).unwrap();
+    assert!(accepted.apply(&mut seed, true));
+    assert!(accepted.apply_committed(&mut guest, true));
+    assert_eq!(guest.names[0].2, "Sheet1!$A$5");
+    assert!(CellShiftOverlay::capture(&seed).apply_to(&mut guest));
+    check(&guest, 5);
+    assert!(accepted.apply(&mut guest, false));
+    check(&guest, 4);
+    seed.names.push(("Later".into(), None, "Sheet1!A5".into()));
+    assert!(!accepted.apply(&mut seed, false));
+}
+
+#[test]
+fn rename_replays_source_endpoints_independently_and_preserves_sparkline_identity() {
+    use sheetcore::{external::{Kind,Source}, sparkline::Sparkline, undo::UndoStack};
+    let mut wb = workbook();
+    wb.sources.push(Source { name: "_sc_src_1".into(), kind: Kind::Internal {
+        sheet:"Sheet1".into(), rect:(0,0,0,0)
+    }, target_sheet:Some("Result".into()), at:(2,0), rows:1, cols:1, csv_opts:None });
+    let mut same_sheet = wb.sources[0].clone();
+    same_sheet.name = "_sc_src_2".into();
+    same_sheet.target_sheet = Some("Sheet1".into());
+    wb.sources.push(same_sheet);
+    wb.sheets[1].sparklines.push(Sparkline { r: 2, c: 2, source_sheet:Some("Sheet1".into()), ..Default::default() });
+    wb.sheets[1].sparklines_dirty = true;
+    let mut history = UndoStack::new();
+    let original = wb.sources.clone();
+    assert!(history.rename_sheet(&mut wb, 0, "Raw Data", (0,0,0)));
+    let renamed = wb.sources.clone();
+    assert_eq!(renamed[0].target_sheet.as_deref(), Some("Result"));
+    assert_eq!(renamed[1].target_sheet.as_deref(), Some("Raw Data"));
+    assert!(matches!(&renamed[0].kind, Kind::Internal{sheet,..} if sheet == "Raw Data"));
+    assert!(history.undo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    assert_eq!(wb.sources, original);
+    assert_eq!(wb.sheets[1].sparklines[0].source_sheet.as_deref(), Some("Sheet1"));
+    assert!(history.redo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    assert_eq!(wb.sources, renamed);
+    assert!(insert_sheet(&mut wb, 2, Sheet::new("Sheet1")));
+    let fixture = Fixture::new();
+    xlsx::save_atomic(&fixture.path(), &wb).unwrap();
+    let back = xlsx::load(&fixture.path()).unwrap();
+    assert_eq!(back.sheets[1].sparklines[0].source_sheet.as_deref(), Some("Raw Data"));
+    assert_eq!(back.sources[0].target_sheet.as_deref(), Some("Result"));
+    assert!(history.delete_sheet(&mut wb, 0, (0,0,0)));
+    assert_eq!(wb.sheets[0].sparklines[0].data_ref("Result"), "#REF!");
+    assert!(history.undo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    assert_eq!(wb.sheets[1].sparklines[0].source_sheet.as_deref(), Some("Raw Data"));
+    assert!(history.redo_workbook(&mut wb, |_,_,_,_|true).is_some());
+    assert!(insert_sheet(&mut wb, 1, Sheet::new("#REF!")));
+    xlsx::save_atomic(&fixture.path(), &wb).unwrap();
+    let back = xlsx::load(&fixture.path()).unwrap();
+    assert_eq!(back.sheets[0].sparklines[0].data_ref("Result"), "#REF!");
+}

@@ -21,6 +21,7 @@ pub struct CellShiftOverlay {
     sheets: Vec<SheetOverlay>,
     palette: Vec<(CellStyle, StyleExtras)>,
     sources: Vec<(String, SourceGeometry)>,
+    names: Vec<(String, Option<usize>, String)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -169,7 +170,9 @@ impl CellShiftOverlay {
                 })
                 .sum::<u64>()
                 <= crate::sync::MAX_BATCH_ITEMS as u64
-            && count + self.sources.len() <= crate::sync::MAX_BATCH_ITEMS
+            && count + self.sources.len() + self.names.len() <= crate::sync::MAX_BATCH_ITEMS
+            && self.names.iter().all(|(n, scope, _)| valid_defined_name(n, *scope)
+                && scope.is_none_or(|i| i < self.sheets.len()))
             && self.sheets.iter().all(|s| {
                 s.name.len() <= crate::sync::MAX_SHORT_TEXT
                     && s.styles.valid(self.palette.len())
@@ -219,6 +222,7 @@ impl CellShiftOverlay {
                 })
                 .collect(),
             palette,
+            names: wb.names.iter().filter(|(n, _, _)| shared_name(n)).cloned().collect(),
             sources: wb
                 .sources
                 .iter()
@@ -265,6 +269,11 @@ impl CellShiftOverlay {
                 sh.dv_dirty = true;
             }
             sh.coordinates_shifted();
+        }
+        if !wb.names.iter().filter(|(n, _, _)| shared_name(n)).eq(&self.names) {
+            wb.names.retain(|(n, _, _)| !shared_name(n));
+            wb.names.extend_from_slice(&self.names);
+            wb.names_dirty = true;
         }
         for (name, geo) in &self.sources {
             if let Some(src) = wb.sources.iter_mut().find(|local| local.name == *name) {

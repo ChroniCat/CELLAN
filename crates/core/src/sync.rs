@@ -683,7 +683,8 @@ pub enum Msg {
         auth: String,
         #[serde(default)]
         base_hash: String,
-        #[serde(default)]
+        // Older peers cannot replay defined-name changes in cell-shift history.
+        #[serde(default, rename = "cell_shifts_v2")]
         cell_shifts: bool,
         #[serde(default)]
         sort_permutation: bool,
@@ -710,7 +711,8 @@ pub enum Msg {
         delta_sync: bool,
         #[serde(default)]
         batch_ops: bool,
-        #[serde(default)]
+        // Older peers cannot replay defined-name changes in cell-shift history.
+        #[serde(default, rename = "cell_shifts_v2")]
         cell_shifts: bool,
         #[serde(default)]
         sort_permutation: bool,

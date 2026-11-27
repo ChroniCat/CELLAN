@@ -77,7 +77,7 @@ pub struct Sparkline {
     /// 锚点格（0-based）
     pub r: u32,
     pub c: u32,
-    /// 数据所在工作表名；None = 和锚点同一张表
+    /// 数据所在工作表名；None = 和锚点同一张表，空名称表示来源表已删除。
     pub source_sheet: Option<String>,
     /// 数据区（0-based，含端点）
     pub rect: (u32, u32, u32, u32),
@@ -122,6 +122,7 @@ impl Default for Sparkline {
 impl Sparkline {
     /// `'表名'!$A$1:$E$1` 形式的数据引用（写文件用）
     pub fn data_ref(&self, own_sheet: &str) -> String {
+        if self.source_sheet.as_deref() == Some("") { return "#REF!".into(); }
         let name = self.source_sheet.as_deref().unwrap_or(own_sheet);
         format!(
             "'{}'!${}${}:${}${}",
@@ -248,7 +249,11 @@ pub fn parse_sheet(xml: &str) -> Vec<Sparkline> {
             let Some(sq) = tag_text(one, "xm:sqref") else {
                 continue;
             };
-            let Some((sheet, rect)) = parse_ref(&f) else {
+            let (sheet, rect) = if f == "#REF!" {
+                (Some(String::new()), (0, 0, 0, 0))
+            } else if let Some(reference) = parse_ref(&f) {
+                reference
+            } else {
                 continue;
             };
             let Some((r, c)) = crate::arr::parse_a1_range(&sq).map(|x| (x.0, x.1)) else {

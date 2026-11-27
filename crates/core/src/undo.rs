@@ -2329,7 +2329,7 @@ pub fn snapshot_cell_shift(wb: &Workbook, sheet: usize, op: &crate::structural::
 pub fn snapshot_cell_shift_if_metadata(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> Option<StructureSnapshot> {
     let target = &wb.sheets[sheet];
     let has_metadata = !target.notes.is_empty() || !target.threads.is_empty() || !target.merges.is_empty()
-        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !wb.sources.is_empty()
+        || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !wb.sources.is_empty() || !wb.names.is_empty()
         || wb.sheets.iter().any(|sh| !sh.cf.blocks.is_empty() || !sh.dv.is_empty());
     has_metadata.then(|| snapshot_cell_shift(wb, sheet, op))
 }
@@ -2395,7 +2395,7 @@ impl StructureSnapshot {
     pub fn cell_shift_changed_metadata(&self, wb: &Workbook) -> bool {
         let old = &self.target;
         let new = &wb.sheets[self.sheet];
-        self.sources != wb.sources || old.merges != new.merges || old.notes != new.notes
+        self.names != wb.names || self.sources != wb.sources || old.merges != new.merges || old.notes != new.notes
             || old.threads != new.threads || old.rich != new.rich || old.hyperlinks != new.hyperlinks
             || old.cf != new.cf || old.dv != new.dv
             || self.foreign.iter().any(|scope| {

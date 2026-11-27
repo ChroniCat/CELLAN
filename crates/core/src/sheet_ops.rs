@@ -247,7 +247,9 @@ pub(crate) fn restore_deleted_sheet(
             ReferenceField::Validation(si, vi, fi) => ReferenceField::Validation(if si >= idx { si + 1 } else { si }, vi, fi),
             ReferenceField::Chart(si, ci, s, fi) => ReferenceField::Chart(if si >= idx { si + 1 } else { si }, ci, s, fi),
             ReferenceField::Name(i) => ReferenceField::Name(i),
-            ReferenceField::Source(i) => ReferenceField::Source(i),
+            ReferenceField::SourceInput(i) => ReferenceField::SourceInput(i),
+            ReferenceField::SourceTarget(i) => ReferenceField::SourceTarget(i),
+            ReferenceField::SparkSource(si, i) => ReferenceField::SparkSource(if si >= idx { si + 1 } else { si }, i),
             ReferenceField::Pivot(i) => ReferenceField::Pivot(i),
         }
     };
@@ -340,7 +342,9 @@ enum ReferenceField {
     Validation(usize, usize, usize),
     Chart(usize, usize, usize, usize),
     Name(usize),
-    Source(usize),
+    SourceInput(usize),
+    SourceTarget(usize),
+    SparkSource(usize, usize),
     Pivot(usize),
 }
 
@@ -385,9 +389,10 @@ fn rewrite_qualifiers(
     visit_references(wb, |field, text| {
         let rewritten = match field {
             ReferenceField::Pivot(_) if new.is_none() => return None, // delete_sheet removes these
-            ReferenceField::Source(_) | ReferenceField::Pivot(_) if text.eq_ignore_ascii_case(old) =>
+            ReferenceField::SparkSource(..) if text.eq_ignore_ascii_case(old) => new.unwrap_or_default().to_owned(),
+            ReferenceField::SourceInput(_) | ReferenceField::SourceTarget(_) | ReferenceField::Pivot(_) if text.eq_ignore_ascii_case(old) =>
                 new.unwrap_or("#REF!").to_owned(),
-            ReferenceField::Source(_) | ReferenceField::Pivot(_) => return None,
+            ReferenceField::SourceInput(_) | ReferenceField::SourceTarget(_) | ReferenceField::SparkSource(..) | ReferenceField::Pivot(_) => return None,
             _ => match three_d_order {
                 Some(order) => rewrite_sheet(&crate::refs::retarget_3d_endpoint(text, old, order), old, new),
                 None => rewrite_sheet(text, old, new),
@@ -435,6 +440,14 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
                 }
             }
         }
+        for (i, spark) in sheet.sparklines.iter_mut().enumerate() {
+            if let Some(source) = spark.source_sheet.as_mut()
+                && let Some(new) = update(ReferenceField::SparkSource(si, i), source)
+            {
+                *source = new;
+                sheet.sparklines_dirty = true;
+            }
+        }
         for (ci, chart) in sheet.charts.iter_mut().enumerate() {
             for (series_idx, series) in chart.series.iter_mut().enumerate() {
                 for (fi, text) in [&mut series.name_ref, &mut series.cat_ref, &mut series.val_ref].into_iter().enumerate() {
@@ -454,10 +467,10 @@ fn visit_references(wb: &mut Workbook, mut update: impl FnMut(ReferenceField, &s
     }
     for (i, source) in wb.sources.iter_mut().enumerate() {
         if let crate::external::Kind::Internal { sheet, .. } = &mut source.kind {
-            if let Some(new) = update(ReferenceField::Source(i), sheet) { *sheet = new; }
+            if let Some(new) = update(ReferenceField::SourceInput(i), sheet) { *sheet = new; }
         }
         if let Some(target) = source.target_sheet.as_mut() {
-            if let Some(new) = update(ReferenceField::Source(i), target) { *target = new; }
+            if let Some(new) = update(ReferenceField::SourceTarget(i), target) { *target = new; }
         }
     }
     for (i, (sheet, ..)) in wb.pivot_shifts.iter_mut().enumerate() {

@@ -1990,6 +1990,21 @@ impl CellShift {
             shift.own_sheet.clone_from(&sheet.name);
             sheet.rewrite_references(&shift);
         }
+        rewrite_defined_names(wb, &mut shift, &[]);
+    }
+}
+
+fn rewrite_defined_names(wb: &mut crate::Workbook, shift: &mut crate::refs::Shift, insertions: &[u32]) {
+    for (_, scope, text) in &mut wb.names {
+        shift.own_sheet.clear();
+        if let Some(sheet) = scope.and_then(|i| wb.sheets.get(i)) {
+            shift.own_sheet.push_str(&sheet.name);
+        }
+        let rewritten = crate::refs::rewrite_mapped(text, &MappedShift { shift, insertions });
+        if rewritten != *text {
+            *text = rewritten;
+            wb.names_dirty = true;
+        }
     }
 }
 
@@ -2143,19 +2158,7 @@ fn update_workbook_references(
         wb.pivot_shifts.extend(insertions.iter().rev().map(|&r| (name.clone(), 0, r, 1, false)));
     }
 
-    // 自定义名称
-    for (_, local, text) in wb.names.iter_mut() {
-        let own = match local {
-            Some(i) => wb.sheets.get(*i).map(|s| s.name.clone()).unwrap_or_default(),
-            None => String::new(),
-        };
-        shift.own_sheet = own;
-        let nt = crate::refs::rewrite_mapped(text, &MappedShift { shift: &shift, insertions });
-        if nt != *text {
-            *text = nt;
-            wb.names_dirty = true;
-        }
-    }
+    rewrite_defined_names(wb, &mut shift, insertions);
 
     // Session-created pivots keep absolute source-field and output coordinates.
     // If an essential field or either complete region disappears, keep any

@@ -402,22 +402,13 @@ impl CellShiftHost {
                 if !capable {
                     return Ok((order, ShiftIntro::default()));
                 }
-                let seed = lock_unpoison(&self.seed).clone();
-                match seed {
-                    Some((wm, overlay)) if wm == lock_unpoison(&self.wm).seq => {
-                        return Ok((
-                            order,
-                            ShiftIntro {
-                                overlay: Some(overlay),
-                                ..Default::default()
-                            },
-                        ));
-                    }
-                    Some(_) if !self.has_app.load(Ordering::Acquire) => {
-                        return Ok((order, ShiftIntro::default()));
-                    }
-                    None => return Ok((order, ShiftIntro::default())),
-                    _ => {}
+                // Name-manager edits are local workbook changes and need not advance the room clock.
+                // A live host must snapshot its current metadata even before the first shift.
+                if !self.has_app.load(Ordering::Acquire) {
+                    let overlay = lock_unpoison(&self.seed).as_ref()
+                        .filter(|(wm, _)| *wm == lock_unpoison(&self.wm).seq)
+                        .map(|(_, overlay)| overlay.clone());
+                    return Ok((order, ShiftIntro { overlay, ..Default::default() }));
                 }
             }
             if !capable {

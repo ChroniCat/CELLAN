@@ -16,6 +16,19 @@ fn late_join(
     app
 }
 
+#[test]
+fn partial_cell_shift_room_new_join_sees_names_edited_after_room_creation() {
+    let env = crate::test_env::TestEnv::new("shift-recent-names");
+    let (mut host, guest) = sort_apps(&env);
+    host.wb.names.push(("Amount".into(), None, "Sheet1!$B$4".into()));
+    let mut late = late_join(&env, &guest, |_| {});
+    until(&mut host, &mut late, |_, app| {
+        app.joined_doc && !app.in_snapshot && app.wb.names.iter().any(|(name, _, formula)| {
+            name == "Amount" && formula == "Sheet1!$B$4"
+        })
+    });
+}
+
 fn start_shift_paste(
     app: &mut SheetApp,
 ) -> mpsc::Sender<Result<sheetcore::clipboard_xmlss::SparseBlock, String>> {
