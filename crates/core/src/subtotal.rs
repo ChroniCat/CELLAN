@@ -122,83 +122,92 @@ pub fn try_subtotal_workbook(
 pub fn try_subtotal_workbook_opts(
     wb: &mut Workbook,
     sheet_idx: usize,
-    mut region: (u32, u32, u32, u32),
+    region: (u32, u32, u32, u32),
     key_col: u32,
     value_cols: &[u32],
     f: SubFn,
     opts: SubtotalOpts,
 ) -> Result<SubtotalReport, &'static str> {
-    let Some(sheet) = wb.sheets.get(sheet_idx) else { return Ok(SubtotalReport::default()) };
+    if sheet_idx >= wb.sheets.len() {
+        return Ok(SubtotalReport::default());
+    }
     let (r1, c1, mut r2, c2) = region;
     if r2 <= r1 || key_col < c1 || key_col > c2 {
         return Ok(SubtotalReport::default());
     }
     const LAST_ROW: u32 = 1_048_575;
     const OVERFLOW: &str = "分类汇总会将数据或格式移出工作表的最后一行";
-    if r2 >= LAST_ROW { return Err(OVERFLOW); }
+    if r2 > LAST_ROW || (!opts.replace_existing && r2 >= LAST_ROW) {
+        return Err(OVERFLOW);
+    }
+
+    // 在 CoW 副本上暂存整套操作（移除旧汇总行 -> 重新分组 -> MultiInsert 越界预检 -> 写入公式），
+    // 任一路径返回 Err 时 `wb` 保持 100% 未修改。
+    let mut staged = wb.clone();
 
     // 替换当前分类汇总：先移除区域内已有的 SUBTOTAL 汇总行并重置行分级
     if opts.replace_existing {
         let mut old_rows: Vec<u32> = ((r1 + 1)..=r2)
-            .filter(|&r| is_subtotal_summary_row(sheet, r, c1, c2))
+            .filter(|&r| is_subtotal_summary_row(&staged.sheets[sheet_idx], r, c1, c2))
             .collect();
         if !old_rows.is_empty() {
             old_rows.sort_unstable();
             for &rr in old_rows.iter().rev() {
                 crate::structural::apply_structural_wb(
-                    wb,
+                    &mut staged,
                     sheet_idx,
                     &crate::structural::Structural::DeleteRows { at: rr, n: 1 },
                 );
                 r2 = r2.saturating_sub(1);
             }
-            if let Some(sh) = wb.sheets.get_mut(sheet_idx) {
+            if let Some(sh) = staged.sheets.get_mut(sheet_idx) {
                 for r in (r1 + 1)..=r2 {
                     sh.row_levels.remove(&r);
                 }
             }
-            region.2 = r2;
             if r2 <= r1 {
                 return Ok(SubtotalReport::default());
             }
         }
     }
 
-    let sheet = &wb.sheets[sheet_idx];
     let has_existing_levels = !opts.replace_existing
-        && ((r1 + 1)..=r2).any(|r| sheet.row_levels.contains_key(&r));
+        && ((r1 + 1)..=r2).any(|r| staged.sheets[sheet_idx].row_levels.contains_key(&r));
 
     // 扫描分组（原始坐标）；嵌套模式下跳过已有 SUBTOTAL 汇总行
     let mut groups: Vec<(u32, u32)> = Vec::new();
-    let mut cur_start: Option<u32> = None;
-    let mut cur_val = String::new();
-    let mut last_detail = r1;
-    for r in (r1 + 1)..=r2 {
-        if has_existing_levels && is_subtotal_summary_row(sheet, r, c1, c2) {
-            if let Some(st) = cur_start.take() {
-                groups.push((st, last_detail));
-            }
-            continue;
-        }
-        let v = sheet.value(r, key_col).display();
-        match cur_start {
-            None => {
-                cur_start = Some(r);
-                cur_val = v;
-                last_detail = r;
-            }
-            Some(st) => {
-                if v != cur_val {
+    {
+        let sheet = &staged.sheets[sheet_idx];
+        let mut cur_start: Option<u32> = None;
+        let mut cur_val = String::new();
+        let mut last_detail = r1;
+        for r in (r1 + 1)..=r2 {
+            if has_existing_levels && is_subtotal_summary_row(sheet, r, c1, c2) {
+                if let Some(st) = cur_start.take() {
                     groups.push((st, last_detail));
+                }
+                continue;
+            }
+            let v = sheet.value(r, key_col).display();
+            match cur_start {
+                None => {
                     cur_start = Some(r);
                     cur_val = v;
+                    last_detail = r;
                 }
-                last_detail = r;
+                Some(st) => {
+                    if v != cur_val {
+                        groups.push((st, last_detail));
+                        cur_start = Some(r);
+                        cur_val = v;
+                    }
+                    last_detail = r;
+                }
             }
         }
-    }
-    if let Some(st) = cur_start {
-        groups.push((st, last_detail));
+        if let Some(st) = cur_start {
+            groups.push((st, last_detail));
+        }
     }
     if groups.is_empty() {
         return Ok(SubtotalReport::default());
@@ -208,20 +217,24 @@ pub fn try_subtotal_workbook_opts(
     if !has_existing_levels {
         insertions.push(r2 + 1);
     }
-    let total_at = r2 + insertions.len() as u32;
-    if total_at > LAST_ROW { return Err(OVERFLOW); }
+    let Some(total_at) = r2.checked_add(insertions.len() as u32) else {
+        return Err(OVERFLOW);
+    };
+    if total_at > LAST_ROW {
+        return Err(OVERFLOW);
+    }
     if crate::transform::CoordTransform::from_multi_insert(
         sheet_idx,
         crate::refs::Axis::Row,
         insertions.clone(),
     )
-    .preflight(wb)
+    .preflight(&staged)
     .is_err()
     {
         return Err(OVERFLOW);
     }
-    crate::structural::insert_subtotal_rows(wb, sheet_idx, &insertions);
-    let sheet = &mut wb.sheets[sheet_idx];
+    crate::structural::insert_subtotal_rows(&mut staged, sheet_idx, &insertions);
+    let sheet = &mut staged.sheets[sheet_idx];
     let mut added_breaks: Vec<u32> = Vec::new();
     for (i, (gs, ge)) in groups.iter().enumerate() {
         let shift = i as u32;
@@ -314,6 +327,7 @@ pub fn try_subtotal_workbook_opts(
     }
     sheet.edited = true;
     sheet.layout_dirty = true;
+    *wb = staged;
     Ok(SubtotalReport {
         groups: n,
         rows: insertions.len(),
@@ -481,5 +495,217 @@ mod tests {
         assert_eq!(rep.groups, 0, "只有表头不分组");
         let rep2 = subtotal(&mut sh, (0, 0, 1, 1), 9, &[1], SubFn::Sum);
         assert_eq!(rep2.groups, 0, "key_col 不在区域内要拒绝");
+    }
+
+    #[test]
+    fn replace_subtotals_overflow_must_leave_workbook_unchanged() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S".into();
+        for (row, label) in [(0, "类型"), (1, "甲"), (2, "乙"), (3, "甲 汇总"), (4, "总计")] {
+            wb.sheets[0].set(row, 0, Cell { value: Value::Text(label.into()), formula: None });
+        }
+        wb.sheets[0].set(0, 1, Cell { value: Value::Text("金额".into()), formula: None });
+        for (row, value) in [(1, 10.0), (2, 20.0)] {
+            wb.sheets[0].set(row, 1, Cell { value: Value::Number(value), formula: None });
+        }
+        for (row, formula) in [(3, "=SUBTOTAL(9,B2:B3)"), (4, "=SUBTOTAL(9,B2:B4)")] {
+            wb.sheets[0].set(row, 1, Cell { value: Value::Empty, formula: Some(formula.into()) });
+        }
+        wb.sheets[0].row_levels.insert(1, 1);
+        wb.sheets[0].row_levels.insert(2, 1);
+        wb.sheets[0].rows.set(3, 36.0);
+        let last = crate::sync::MAX_ROWS - 1;
+        wb.sheets[0].set(last, 0, Cell { value: Value::Number(7.0), formula: None });
+        let mut watcher = Sheet::new("Watcher");
+        watcher.set(0, 0, Cell { value: Value::Empty, formula: Some("=S!A1048576".into()) });
+        wb.sheets.push(watcher);
+        wb.dirty = false;
+        let epoch_before = wb.coord_epoch();
+        let rev_before = wb.sheets[0].cell_revision();
+
+        let result = try_subtotal_workbook_opts(
+            &mut wb,
+            0,
+            (0, 0, 4, 1),
+            0,
+            &[1],
+            SubFn::Sum,
+            SubtotalOpts {
+                replace_existing: true,
+                page_break_between_groups: false,
+                summary_below: true,
+            },
+        );
+        assert!(result.is_err(), "Tail overflow must reject the replacement");
+        assert_eq!(wb.coord_epoch(), epoch_before, "A rejected replacement must not delete old summary rows");
+        assert_eq!(wb.sheets[0].cell_revision(), rev_before);
+        assert_eq!(wb.sheets[0].formula_of(3, 1), Some("=SUBTOTAL(9,B2:B3)"));
+        assert_eq!(wb.sheets[0].formula_of(4, 1), Some("=SUBTOTAL(9,B2:B4)"));
+        assert_eq!(wb.sheets[0].value(last, 0), Value::Number(7.0));
+        assert_eq!(wb.sheets[0].row_levels.get(&1), Some(&1));
+        assert_eq!(wb.sheets[0].row_levels.get(&2), Some(&1));
+        assert!((wb.sheets[0].rows.size(3) - 36.0).abs() < 1e-3);
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A1048576"));
+        assert!(!wb.dirty);
+    }
+
+    #[test]
+    fn replace_existing_false_overflow_leaves_workbook_unchanged() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0] = sheet_with(&[("甲", 10.0), ("乙", 20.0)]);
+        wb.sheets[0].rows.set(1, 44.0);
+        let last = crate::sync::MAX_ROWS - 1;
+        wb.sheets[0].set(last, 0, Cell { value: Value::Number(9.0), formula: None });
+        let mut watcher = Sheet::new("Watcher");
+        watcher.set(0, 0, Cell { value: Value::Empty, formula: Some("=S!A1048576".into()) });
+        wb.sheets.push(watcher);
+        wb.dirty = false;
+        let epoch_before = wb.coord_epoch();
+        let rev_before = wb.sheets[0].cell_revision();
+
+        let result = try_subtotal_workbook_opts(
+            &mut wb,
+            0,
+            (0, 0, 2, 1),
+            0,
+            &[1],
+            SubFn::Sum,
+            SubtotalOpts {
+                replace_existing: false,
+                page_break_between_groups: true,
+                summary_below: true,
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(wb.coord_epoch(), epoch_before);
+        assert_eq!(wb.sheets[0].cell_revision(), rev_before);
+        assert_eq!(wb.sheets[0].value(1, 1), Value::Number(10.0));
+        assert_eq!(wb.sheets[0].value(2, 1), Value::Number(20.0));
+        assert!(wb.sheets[0].get(3, 0).is_none());
+        assert_eq!(wb.sheets[0].value(last, 0), Value::Number(9.0));
+        assert!((wb.sheets[0].rows.size(1) - 44.0).abs() < 1e-3);
+        assert!(wb.sheets[0].page.row_breaks.is_empty());
+        assert!(wb.sheets[0].row_levels.is_empty());
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A1048576"));
+        assert!(!wb.dirty);
+    }
+
+    #[test]
+    fn replace_existing_true_succeeds_and_roundtrips_undo_redo() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S".into();
+        for (row, label) in [(0, "类型"), (1, "甲"), (2, "乙"), (3, "甲 汇总"), (4, "总计")] {
+            wb.sheets[0].set(row, 0, Cell { value: Value::Text(label.into()), formula: None });
+        }
+        wb.sheets[0].set(0, 1, Cell { value: Value::Text("金额".into()), formula: None });
+        wb.sheets[0].set(1, 1, Cell { value: Value::Number(10.0), formula: None });
+        wb.sheets[0].set(2, 1, Cell { value: Value::Number(20.0), formula: None });
+        wb.sheets[0].set(3, 1, Cell { value: Value::Empty, formula: Some("=SUBTOTAL(9,B2:B3)".into()) });
+        wb.sheets[0].set(4, 1, Cell { value: Value::Empty, formula: Some("=SUBTOTAL(9,B2:B4)".into()) });
+        wb.sheets[0].set(10, 0, Cell { value: Value::Number(77.0), formula: None });
+        let mut watcher = Sheet::new("Watcher");
+        watcher.set(0, 0, Cell { value: Value::Empty, formula: Some("=S!A11".into()) });
+        wb.sheets.push(watcher);
+        crate::formula::recalc_all(&mut wb);
+
+        let before = crate::undo::snapshot_structure(&wb, 0, &Structural::InsertRows { at: 1, n: 1 });
+        let report = try_subtotal_workbook_opts(
+            &mut wb,
+            0,
+            (0, 0, 4, 1),
+            0,
+            &[1],
+            SubFn::Sum,
+            SubtotalOpts {
+                replace_existing: true,
+                page_break_between_groups: false,
+                summary_below: true,
+            },
+        )
+        .expect("replacement with room below should succeed");
+        assert_eq!((report.groups, report.rows), (2, 3));
+        let after = before.capture_after(&wb);
+        let mut undo = crate::undo::UndoStack::default();
+        undo.push_structure("分类汇总", before, after, (0, 0, 0));
+
+        // After replace: row 0 header, row 1 甲(10), row 2 甲 汇总, row 3 乙(20), row 4 乙 汇总, row 5 总计.
+        // Net +1 row shifted row 10 -> row 11 (A12).
+        crate::formula::recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].value(2, 0).display(), "甲 汇总");
+        assert_eq!(wb.sheets[0].formula_of(2, 1), Some("=SUBTOTAL(9,B2:B2)"));
+        assert_eq!(wb.sheets[0].value(2, 1), Value::Number(10.0));
+        assert_eq!(wb.sheets[0].value(4, 0).display(), "乙 汇总");
+        assert_eq!(wb.sheets[0].formula_of(4, 1), Some("=SUBTOTAL(9,B4:B4)"));
+        assert_eq!(wb.sheets[0].value(4, 1), Value::Number(20.0));
+        assert_eq!(wb.sheets[0].value(5, 0).display(), "总计");
+        assert_eq!(wb.sheets[0].formula_of(5, 1), Some("=SUBTOTAL(9,B2:B5)"));
+        assert_eq!(wb.sheets[0].value(5, 1), Value::Number(30.0));
+        assert_eq!(wb.sheets[0].value(11, 0), Value::Number(77.0));
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A12"));
+        assert_eq!(wb.sheets[1].value(0, 0), Value::Number(77.0));
+
+        // Undo restores original 2-summary-row layout and Watcher ref `=S!A11`.
+        undo.undo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+        crate::formula::recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].formula_of(3, 1), Some("=SUBTOTAL(9,B2:B3)"));
+        assert_eq!(wb.sheets[0].formula_of(4, 1), Some("=SUBTOTAL(9,B2:B4)"));
+        assert_eq!(wb.sheets[0].value(10, 0), Value::Number(77.0));
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A11"));
+        assert_eq!(wb.sheets[1].value(0, 0), Value::Number(77.0));
+
+        // Redo re-applies the replaced 2-group layout and `=S!A12`.
+        undo.redo_workbook(&mut wb, |_, _, _, _| true).unwrap();
+        crate::formula::recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].formula_of(2, 1), Some("=SUBTOTAL(9,B2:B2)"));
+        assert_eq!(wb.sheets[0].formula_of(4, 1), Some("=SUBTOTAL(9,B4:B4)"));
+        assert_eq!(wb.sheets[0].formula_of(5, 1), Some("=SUBTOTAL(9,B2:B5)"));
+        assert_eq!(wb.sheets[0].value(5, 1), Value::Number(30.0));
+        assert_eq!(wb.sheets[0].value(11, 0), Value::Number(77.0));
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A12"));
+        assert_eq!(wb.sheets[1].value(0, 0), Value::Number(77.0));
+    }
+
+    #[test]
+    fn replace_existing_true_only_subtotal_rows_leaves_workbook_unchanged() {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "S".into();
+        wb.sheets[0].set(0, 0, Cell { value: Value::Text("类型".into()), formula: None });
+        wb.sheets[0].set(0, 1, Cell { value: Value::Text("金额".into()), formula: None });
+        wb.sheets[0].set(1, 0, Cell { value: Value::Text("甲 汇总".into()), formula: None });
+        wb.sheets[0].set(1, 1, Cell { value: Value::Empty, formula: Some("=SUBTOTAL(9,B2:B2)".into()) });
+        wb.sheets[0].set(2, 0, Cell { value: Value::Text("总计".into()), formula: None });
+        wb.sheets[0].set(2, 1, Cell { value: Value::Empty, formula: Some("=SUBTOTAL(9,B2:B3)".into()) });
+        wb.sheets[0].set(5, 0, Cell { value: Value::Number(77.0), formula: None });
+        wb.sheets[0].rows.set(1, 42.0);
+        let mut watcher = Sheet::new("Watcher");
+        watcher.set(0, 0, Cell { value: Value::Empty, formula: Some("=S!A6".into()) });
+        wb.sheets.push(watcher);
+        wb.dirty = false;
+        let epoch_before = wb.coord_epoch();
+        let rev_before = wb.sheets[0].cell_revision();
+
+        let rep = try_subtotal_workbook_opts(
+            &mut wb,
+            0,
+            (0, 0, 2, 1),
+            0,
+            &[1],
+            SubFn::Sum,
+            SubtotalOpts {
+                replace_existing: true,
+                page_break_between_groups: false,
+                summary_below: true,
+            },
+        )
+        .expect("no-detail region returns empty SubtotalReport");
+        assert_eq!((rep.groups, rep.rows), (0, 0));
+        assert_eq!(wb.coord_epoch(), epoch_before);
+        assert_eq!(wb.sheets[0].cell_revision(), rev_before);
+        assert!(!wb.dirty);
+        assert_eq!(wb.sheets[0].formula_of(1, 1), Some("=SUBTOTAL(9,B2:B2)"));
+        assert_eq!(wb.sheets[0].formula_of(2, 1), Some("=SUBTOTAL(9,B2:B3)"));
+        assert_eq!(wb.sheets[0].value(5, 0), Value::Number(77.0));
+        assert!((wb.sheets[0].rows.size(1) - 42.0).abs() < 1e-3);
+        assert_eq!(wb.sheets[1].formula_of(0, 0), Some("=S!A6"));
     }
 }

@@ -85,6 +85,7 @@ pub(super) struct ShiftJournal {
     seq: u64,
     coord_ack_seq: u64,
     used_room_tx: bool,
+    used_full_overlay_tx: bool,
     latest: HashMap<u32, CommittedShift>,
     acks: HashMap<u32, (u64, u64)>,
 }
@@ -173,7 +174,13 @@ impl CellShiftHost {
         journal.coord_ack_seq != 0 && journal.acks.get(&site) != Some(&(conn, journal.coord_ack_seq))
     }
 
-    fn check_room_tx(&self, site: u32, conn: Option<u64>, revision: usize) -> Result<(), String> {
+    fn check_room_tx(
+        &self,
+        site: u32,
+        conn: Option<u64>,
+        revision: usize,
+        requires_full_overlay: bool,
+    ) -> Result<(), String> {
         let roster = lock_unpoison(&self.roster);
         if conn.is_some_and(|id| roster.peers.get(&site).is_none_or(|peer| peer.0 != id)) {
             return Err("协作连接已更换，请重试".into());
@@ -184,6 +191,16 @@ impl CellShiftHost {
             .any(|(site, (id, _, _))| roster.room_tx_members.get(site) != Some(id))
         {
             return Err("房间中有旧版本客户端，请所有成员升级后再执行该协作操作".into());
+        }
+        if requires_full_overlay
+            && roster
+                .peers
+                .iter()
+                .any(|(site, (id, _, _))| roster.full_overlay_members.get(site) != Some(id))
+        {
+            return Err(
+                "房间中有旧版本客户端不支持完整元数据快照，请所有成员升级后再移动行或列".into(),
+            );
         }
         if self.needs_ack(site, conn.unwrap_or(0)) {
             return Err("正在同步新的工作表位置，请稍后重试".into());
@@ -514,6 +531,7 @@ impl CellShiftHost {
         if matches!(*patch, RoomTxPatch::CellShift(_)) {
             return Err("局部单元格插删请使用标准位移通道".into());
         }
+        let requires_full_overlay = matches!(*patch, RoomTxPatch::AxisPermute(_));
         let digest = fingerprint_room_tx(&patch)?;
         let (tx, rx) = channel();
         let observed = {
@@ -530,7 +548,7 @@ impl CellShiftHost {
             {
                 return Ok(());
             }
-            self.check_room_tx(site, conn, revision)?;
+            self.check_room_tx(site, conn, revision, requires_full_overlay)?;
             self.check_room_tx_locks(site, phase, &patch)?;
             let journal = lock_unpoison(&self.transactions);
             match (phase, journal.entries.get(&(site, id))) {
@@ -561,8 +579,9 @@ impl CellShiftHost {
         {
             return Err("宿主历史与操作不匹配".into());
         }
+        let canonical_requires_full_overlay = matches!(*canonical, RoomTxPatch::AxisPermute(_));
         let _order = lock_unpoison(&self.order);
-        self.check_room_tx(site, conn, revision)?;
+        self.check_room_tx(site, conn, revision, canonical_requires_full_overlay)?;
         self.check_room_tx_locks(site, phase, &canonical)?;
         let mut wm = lock_unpoison(&self.wm);
         if wm.seq != observed {
@@ -607,6 +626,9 @@ impl CellShiftHost {
             .insert((site, id), (canonical_digest, (phase, first_ts, seq)));
         journal.seq = seq;
         journal.used_room_tx = true;
+        if canonical_requires_full_overlay {
+            journal.used_full_overlay_tx = true;
+        }
         if advances_coord_ack {
             journal.coord_ack_seq = seq;
         }
@@ -648,9 +670,10 @@ impl CellShiftHost {
         site: u32,
         capable: bool,
         room_tx_capable: bool,
+        full_tx_overlay_capable: bool,
     ) -> Result<(MutexGuard<'a, ()>, ShiftIntro), String> {
         for _ in 0..4 {
-            let (seq, coord_ack_seq, used_room_tx, receipt) = {
+            let (seq, coord_ack_seq, used_room_tx, used_full_overlay_tx, receipt) = {
                 let j = lock_unpoison(&self.transactions);
                 let rec = j.latest.get(&site).map(|receipt| {
                     let (phase, first_ts, rseq) = receipt.stamp;
@@ -673,8 +696,17 @@ impl CellShiftHost {
                         },
                     }
                 });
-                (j.seq, j.coord_ack_seq, j.used_room_tx, rec)
+                (
+                    j.seq,
+                    j.coord_ack_seq,
+                    j.used_room_tx,
+                    j.used_full_overlay_tx,
+                    rec,
+                )
             };
+            if used_full_overlay_tx && !full_tx_overlay_capable {
+                return Err("该房间已执行行列移动并依赖完整元数据快照，请升级客户端后加入".into());
+            }
             if used_room_tx && !room_tx_capable {
                 return Err("该房间已使用新版协作事务，请升级客户端后加入".into());
             }
@@ -871,6 +903,11 @@ impl Net {
     ) -> Result<(), String> {
         if !self.is_live() || !self.room_tx_cap.load(Ordering::Acquire) {
             return Err("协作连接不可用或宿主版本不支持此协作事务".into());
+        }
+        if matches!(*patch, RoomTxPatch::AxisPermute(_))
+            && !self.full_tx_overlay_cap.load(Ordering::Acquire)
+        {
+            return Err("协作宿主版本较旧，不支持完整元数据快照，请升级宿主后再移动行或列".into());
         }
         if id == 0 || !patch.wire_valid() {
             return Err("无效的协作事务操作".into());

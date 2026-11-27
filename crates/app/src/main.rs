@@ -1681,6 +1681,10 @@ struct SheetApp {
     rejoin_merge_outbox: Vec<cell_shift::RejoinMergeEntry>,
     /// 重连坐标冲突/切换房间时被取消的未确认离线编辑本地恢复草稿（有界去重，切文档/关闭时清理）
     pub(crate) cancelled_offline_drafts: Vec<cell_shift::CancelledOfflineDraft>,
+    /// O(1) 去重索引：`(room_id, coord_epoch, sheet, row, col) -> index in cancelled_offline_drafts`
+    cancelled_offline_draft_index: std::collections::HashMap<cell_shift::CancelledDraftKey, usize>,
+    /// 超出 `MAX_CANCELLED_OFFLINE_DRAFTS` 容量上限而被截断丢弃的冲突草稿条数
+    pub(crate) cancelled_offline_drafts_dropped: usize,
     /// 页面设置对话框（UI-26）
     page_setup_open: bool,
     page_setup_draft: sheetcore::page::PageSetup,
@@ -1966,6 +1970,9 @@ struct ParkedDoc {
     in_snapshot: bool,
     shift_intro: cell_shift::ShiftIntro,
     snapshot_is_delta: bool,
+    struct_history: Vec<(usize, sheetcore::structural::Structural)>,
+    history_planted: usize,
+    history_last_epoch: u64,
 }
 
 /// 最近文件列表的内存缓存项：避免主页与后台页每帧重复读盘和 stat 网络盘路径。
@@ -2846,6 +2853,8 @@ impl SheetApp {
             rejoin_style_outbox: Vec::new(),
             rejoin_merge_outbox: Vec::new(),
             cancelled_offline_drafts: Vec::new(),
+            cancelled_offline_draft_index: std::collections::HashMap::new(),
+            cancelled_offline_drafts_dropped: 0,
             page_setup_open: false,
             page_setup_draft: sheetcore::page::PageSetup::default(),
             page_setup_sheet: 0,
@@ -4918,6 +4927,7 @@ impl SheetApp {
                         }
                         self.manual_calc = self.wb.calc_manual;
                         self.wb_epoch += 1;
+                        self.history_last_epoch = self.wb_epoch;
                         self.deps = deps.into();
                         self.deps_built = true;
                         self.cf_stats_gen = u64::MAX;
@@ -4956,6 +4966,9 @@ impl SheetApp {
                     // 整份替换后条件格式统计必须重算，否则色阶/图标/数据条全空
                     self.cf_stats_gen = u64::MAX;
                     if self.in_snapshot || self.joined_doc {
+                        // 实时协作快照已接管值模型，self.wb 未被未偏移的磁盘基线替换，
+                        // 必须保持 history_last_epoch 对齐，防止 sync_history 对已覆盖历史再次重放。
+                        self.history_last_epoch = self.wb_epoch;
                         // 实时协作快照已接管值模型；若本地依赖图尚未就绪，顺手复用后台已建好的依赖图并补上增量格
                         if !self.deps_built {
                             let mut d = *deps;
@@ -7264,11 +7277,23 @@ impl SheetApp {
         );
     }
 
+    fn retire_struct_history(&mut self) {
+        self.history_planted = self.struct_history.len();
+        self.history_last_epoch = self.wb_epoch;
+    }
+
+    fn reset_struct_history(&mut self) {
+        self.struct_history.clear();
+        self.history_planted = 0;
+        self.history_last_epoch = self.wb_epoch;
+    }
+
     /// 把远端做过的结构改动套到当前工作簿上。
     /// 文件每次重新读入（Loaded/Recalced）都会得到「未改结构」的版本，
     /// 所以换过一次就要从头再套一遍。
+    /// 快照接收期间（`self.in_snapshot`）暂不执行，交由 `SnapshotDone` 统一按权威边界结算。
     fn sync_history(&mut self) {
-        if self.struct_history.is_empty() {
+        if self.in_snapshot || self.struct_history.is_empty() {
             return;
         }
         if self.wb_epoch != self.history_last_epoch {
@@ -24759,7 +24784,11 @@ fn clear_selection(&mut self) {
             &cols,
             f,
             opts,
-        )?;
+        )
+        .map_err(|e| {
+            self.status = e.into();
+            e.to_string()
+        })?;
         if rep.groups == 0 {
             return Err("选区内没有可分组的行".into());
         }
@@ -43490,6 +43519,10 @@ impl SheetApp {
             } else {
                 coord.room_id.clone()
             };
+            let stale_epoch = net::CoordEpoch {
+                struct_rev: coord.epoch.struct_rev,
+                shift_seq: self.shift_intro.pre_shift_seq,
+            };
             self.shift_intro.pending_cancelled_edits = self
                 .shift_intro
                 .pending_cancelled_edits
@@ -43498,6 +43531,7 @@ impl SheetApp {
             for op in &stale_pre_shift_ops {
                 self.archive_cancelled_offline_op(
                     stale_room.clone(),
+                    stale_epoch,
                     op,
                     "工作表坐标已改变".into(),
                 );
@@ -43517,6 +43551,11 @@ impl SheetApp {
                 .map(|m| m.coord.room_id.clone())
                 .filter(|r| !r.is_empty())
                 .unwrap_or_else(|| cur_net_room.clone());
+            let old_epoch = self
+                .rejoin_outbox_meta
+                .as_ref()
+                .map(|m| m.coord.epoch)
+                .unwrap_or_default();
             let old_reason = if !old_room.is_empty()
                 && !coord.room_id.is_empty()
                 && old_room != coord.room_id
@@ -43535,6 +43574,7 @@ impl SheetApp {
                     for op in &old_ops {
                         self.archive_cancelled_offline_op(
                             old_room.clone(),
+                            old_epoch,
                             op,
                             old_reason.clone(),
                         );
@@ -44124,6 +44164,7 @@ impl SheetApp {
         // 主动离开就不会再重连补发；本地表格里的修改仍在，按普通未保存修改处理
         self.clear_doc_rejoin_outboxes();
         self.shift_intro = Default::default();
+        self.reset_struct_history();
         self.release_lock();
         let host_session = self
             .net
@@ -44181,6 +44222,7 @@ impl SheetApp {
             .map(|info| info.session);
         self.clear_doc_rejoin_outboxes();
         self.shift_intro = Default::default();
+        self.reset_struct_history();
         if let Some(n) = self.net.take() {
             n.shutdown();
         }
@@ -47103,6 +47145,9 @@ fn elide(s: &str, max_chars: usize) -> String {
             in_snapshot: std::mem::replace(&mut self.in_snapshot, false),
             shift_intro: std::mem::take(&mut self.shift_intro),
             snapshot_is_delta: std::mem::replace(&mut self.snapshot_is_delta, false),
+            struct_history: std::mem::take(&mut self.struct_history),
+            history_planted: std::mem::replace(&mut self.history_planted, 0),
+            history_last_epoch: std::mem::replace(&mut self.history_last_epoch, u64::MAX),
         })
     }
 
@@ -47156,6 +47201,9 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.in_snapshot = doc.in_snapshot;
         self.shift_intro = doc.shift_intro;
         self.snapshot_is_delta = doc.snapshot_is_delta;
+        self.struct_history = doc.struct_history;
+        self.history_planted = doc.history_planted;
+        self.history_last_epoch = doc.history_last_epoch;
         self.last_cursor = None;
         self.my_lock = None;
         self.requested_lock = None;
@@ -47173,6 +47221,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         self.auto_join_tried = None;
         self.cf_stats_gen = doc.cf_stats_gen;
         self.wb_epoch = self.wb_epoch.wrapping_add(1);
+        self.history_last_epoch = self.wb_epoch;
         self.last_seen_coord_epoch = self.wb.coord_epoch();
         self.cancel_edit();
         self.cf_stats_gen = u64::MAX;
@@ -47450,6 +47499,7 @@ fn elide(s: &str, max_chars: usize) -> String {
     /// 打开一个新文档时把编辑态清干净
     fn reset_editor_state(&mut self) {
         self.clear_cancelled_offline_drafts();
+        self.reset_struct_history();
         self.auto_probe = None;
         self.drop_merge_confirmation();
         self.selected_sheets.clear();
@@ -47787,7 +47837,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                         if !net.hosting && net.site == site {
                             net.finish_structure();
                             if sheet < self.wb.sheets.len() {
-                                self.apply_local_structural(sheet, op);
+                                self.apply_local_structural(sheet, op.clone());
+                                self.struct_history.push((sheet, op));
+                                self.retire_struct_history();
                             }
                             continue;
                         }
@@ -47797,6 +47849,8 @@ fn elide(s: &str, max_chars: usize) -> String {
                         let label = op.label();
                         sheetcore::structural::apply_structural_wb(&mut self.wb, sheet, &op);
                         self.shift_collab_coordinates(sheet, &op);
+                        self.struct_history.push((sheet, op.clone()));
+                        self.retire_struct_history();
                         // 远端插删行/列已改变全表坐标基准，清空本地撤销栈避免旧坐标回放写错行/列
                         self.undo.clear();
                         self.tasks.last_edit = Some(std::time::Instant::now());
@@ -48061,9 +48115,19 @@ fn elide(s: &str, max_chars: usize) -> String {
                     // 重连：必须在重置 shift_intro.applied_seq 和 structure_seen 之前按旧坐标纪元暂存未确认编辑，
                     // 快照落定后再按统一坐标纪元校验并决定补发或取消。
                     if !was_in_snapshot {
-                        self.stash_own_ops_for_rejoin_at(prev_coord);
+                        self.stash_own_ops_for_rejoin_at(prev_coord.clone());
                     }
+                    let same_room = !new_room.is_empty() && prev_coord.room_id == new_room;
+                    let wb_matched_epoch = self.wb_epoch == self.history_last_epoch;
                     self.shift_intro.begin_welcome(new_room);
+                    if !delta_sync {
+                        self.struct_history.clear();
+                        self.history_planted = 0;
+                        self.history_last_epoch = self.wb_epoch;
+                        if !was_in_snapshot && same_room && wb_matched_epoch {
+                            self.shift_intro.baseline_struct_rev = prev_coord.epoch.struct_rev;
+                        }
+                    }
                     if let Some(net) = &self.net {
                         net.finish_unconfirmed_axis_structure();
                         net.reset_coord_epoch();
@@ -48101,6 +48165,38 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.in_snapshot = false;
                     self.joined_doc = true;
                     self.deps_pending = false;
+                    let pending_overlay = self.shift_intro.overlay.take();
+                    let has_full_overlay = pending_overlay
+                        .as_ref()
+                        .is_some_and(|(_, ov)| ov.is_full_state());
+                    // 权威快照落定单一边界：
+                    // 1) 若收到旧版 host 的空 overlay 或 format_version==0 部分 overlay，先在旧基线上
+                    //    以 structure-only 重放未套用的 StructuralHistory，再装入当前单元格和部分 overlay，
+                    //    避免 clear_orphan_spill_tails 伤及新单元格，并保留旧版 overlay 未覆盖的表格/布局偏移。
+                    // 2) 若收到新版 format_version>=1 权威 TxOverlay（已完整覆盖全部 16 类 CoordParticipant），
+                    //    直接装入当前单元格与完整 overlay，并将 StructuralHistory 整体退休，避免 sync_history 二次偏移。
+                    if !self.snapshot_is_delta && !has_full_overlay && !self.struct_history.is_empty() {
+                        if self.wb_epoch != self.history_last_epoch {
+                            self.history_planted = 0;
+                            self.history_last_epoch = self.wb_epoch;
+                        }
+                        let baseline_skip = self
+                            .shift_intro
+                            .baseline_struct_rev
+                            .min(self.struct_history.len());
+                        let start = self.history_planted.max(baseline_skip);
+                        if start < self.struct_history.len() {
+                            let items: Vec<(usize, sheetcore::structural::Structural)> =
+                                self.struct_history[start..].to_vec();
+                            for (sheet, op) in items.iter() {
+                                if *sheet < self.wb.sheets.len() {
+                                    self.wb
+                                        .sheet_mut(*sheet)
+                                        .apply_structural_structure_only(op);
+                                }
+                            }
+                        }
+                    }
                     if !self.snapshot_is_delta {
                         if let Some(snap) = self.net.as_ref().and_then(|n| n.take_prepared_snapshot()) {
                             snap.install(&mut self.wb, self.peer.as_mut());
@@ -48110,7 +48206,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     }
                     let mut overlay_needs_full_recalc = false;
                     let mut overlay_applied = false;
-                    if let Some((seq, overlay)) = self.shift_intro.overlay.take() {
+                    if let Some((seq, overlay)) = pending_overlay {
                         let names_before = self.wb.names.clone();
                         let tables_before: Vec<_> = self
                             .wb
@@ -48134,10 +48230,14 @@ fn elide(s: &str, max_chars: usize) -> String {
                                 net.ack_cell_shift(seq);
                             }
                         } else {
+                            self.retire_struct_history();
+                            self.shift_intro.baseline_struct_rev = 0;
                             self.resync_room_cell_shift();
                             continue;
                         }
                     }
+                    self.retire_struct_history();
+                    self.shift_intro.baseline_struct_rev = 0;
                     if !self.sync_coord_epoch_side_effects() && overlay_applied {
                         self.invalidate_render_and_layout_caches();
                         self.clear_transient_pivot_popups();
@@ -48226,9 +48326,22 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.replay_rejoin_outbox();
                     let cancelled = std::mem::take(&mut self.shift_intro.pending_cancelled_edits);
                     if cancelled > 0 {
-                        self.status = format!(
-                            "工作表坐标已改变，已取消断线前未确认的 {cancelled} 处修改（已暂存至本地冲突草稿）"
-                        );
+                        self.status = self.format_cancelled_edits_status(cancelled);
+                        if self.cancelled_offline_drafts_dropped > 0 {
+                            let retained = self.cancelled_offline_drafts.len();
+                            let dropped = self.cancelled_offline_drafts_dropped;
+                            self.set_notice(NoticeBanner {
+                                level: NoticeLevel::Warn,
+                                title: "本地冲突草稿已达容量上限".into(),
+                                detail: format!(
+                                    "断线取消的编辑超出容量上限（{} 条），已保留 {retained} 条、已丢弃 {dropped} 条；请及时复制导出冲突草稿。",
+                                    cell_shift::MAX_CANCELLED_OFFLINE_DRAFTS,
+                                ),
+                                actions: Vec::new(),
+                                tag: Some("conflict_drafts_truncated"),
+                                target_doc_uid: Some(self.doc_uid),
+                            });
+                        }
                     }
                     if shared_cells_only {
                         self.shared_cell_generation = Some((self.doc_uid, self.doc_gen));
@@ -48425,6 +48538,9 @@ fn elide(s: &str, max_chars: usize) -> String {
                         self.in_snapshot = false;
                         self.snapshot_is_delta = false;
                         self.room_lost = false;
+                        self.reset_struct_history();
+                        self.shift_intro.baseline_struct_rev = 0;
+                        self.shift_intro.overlay = None;
                         self.status = format!(
                             "{msg}（对端防火墙可能拦截了连接；已通知对方一键放行，后台将自动重连）"
                         );
@@ -48462,6 +48578,10 @@ fn elide(s: &str, max_chars: usize) -> String {
                     self.peers_list.clear();
                     self.joined_doc = false;
                     self.in_snapshot = false;
+                    self.snapshot_is_delta = false;
+                    self.reset_struct_history();
+                    self.shift_intro.baseline_struct_rev = 0;
+                    self.shift_intro.overlay = None;
                 }
                 net::NetEvent::SaveRequested { .. } => {
                     if self.net.as_ref().is_some_and(|n| n.hosting) && self.wb.path.is_some() {
@@ -51238,21 +51358,32 @@ impl eframe::App for SheetApp {
                             },
                         );
                     }
-                    if !self.cancelled_offline_drafts.is_empty() {
+                    if !self.cancelled_offline_drafts.is_empty()
+                        || self.cancelled_offline_drafts_dropped > 0
+                    {
                         ui.add_space(8.0);
-                        let n = self.cancelled_offline_drafts.len();
+                        let label = self.conflict_drafts_button_label();
+                        let hover = if self.cancelled_offline_drafts_dropped > 0 {
+                            format!(
+                                "本地冲突草稿已达上限：已保留 {} 条，超出上限已丢弃 {} 条；点击导出为 TSV 并复制到剪贴板，右键可清空",
+                                self.cancelled_offline_drafts.len(),
+                                self.cancelled_offline_drafts_dropped,
+                            )
+                        } else {
+                            "将断线取消的未确认编辑导出为 TSV 并复制到剪贴板；右键可清空".into()
+                        };
                         let mut copy_drafts = false;
                         let mut clear_drafts = false;
                         let btn = ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(format!("复制冲突草稿({n})"))
+                                    egui::RichText::new(label)
                                         .size(11.0)
                                         .color(status_pal.warn_fg),
                                 )
                                 .frame(false),
                             )
-                            .on_hover_text("将断线取消的未确认编辑导出为 TSV 并复制到剪贴板；右键可清空");
+                            .on_hover_text(hover);
                         if btn.clicked() {
                             copy_drafts = true;
                         }

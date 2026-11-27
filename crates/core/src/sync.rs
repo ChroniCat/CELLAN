@@ -838,6 +838,8 @@ pub enum Msg {
         compact_v3: bool,
         #[serde(default)]
         room_tx: bool,
+        #[serde(default)]
+        full_tx_overlay: bool,
     },
     /// 本机显示名变更（不改变 site；宿主转发给其他参与者）
     Rename { site: u32, name: String },
@@ -877,6 +879,8 @@ pub enum Msg {
         acked_op_ts: u64,
         #[serde(default)]
         room_tx: bool,
+        #[serde(default)]
+        full_tx_overlay: bool,
     },
     Snapshot { ops: Vec<Op> },
     /// 大文件分片下发（last=1 表示这是最后一片）
@@ -2667,9 +2671,9 @@ fn sort_permutation_validates_bounds_and_defaults_old_hello_to_legacy() {
     sort.horizontal = false;
     assert!(!sort.valid());
     let hello: Msg = serde_json::from_str(r#"{"t":"Hello","site":1,"name":"a","doc":"d","proof":"p"}"#).unwrap();
-    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, binary_v3: false, room_tx: false, .. }));
+    assert!(matches!(hello,Msg::Hello { sort_permutation: false, palette_styles: false, resume_watermark: 0, binary_v3: false, room_tx: false, full_tx_overlay: false, .. }));
     let welcome: Msg = serde_json::from_str(r#"{"t":"Welcome","site":2,"doc":"d","peers":[]}"#).unwrap();
-    assert!(matches!(welcome, Msg::Welcome { binary_v3: false, room_tx: false, .. }));
+    assert!(matches!(welcome, Msg::Welcome { binary_v3: false, room_tx: false, full_tx_overlay: false, .. }));
 }
 
 #[test]

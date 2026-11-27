@@ -615,6 +615,7 @@ struct RoomRoster {
     auth_hashes: HashMap<u32, [u8; 32]>,
     shift_members: HashMap<u32, u64>,
     room_tx_members: HashMap<u32, u64>,
+    full_overlay_members: HashMap<u32, u64>,
 }
 
 fn sha256_bytes(input: &[u8]) -> [u8; 32] {
@@ -656,6 +657,7 @@ impl RoomRoster {
             auth_hashes: HashMap::new(),
             shift_members: HashMap::new(),
             room_tx_members: HashMap::new(),
+            full_overlay_members: HashMap::new(),
         }
     }
 
@@ -780,6 +782,7 @@ impl RoomRoster {
                 self.peers.remove(&site);
                 self.shift_members.remove(&site);
                 self.room_tx_members.remove(&site);
+                self.full_overlay_members.remove(&site);
             }
             self.names.remove(&site);
         }
@@ -2118,7 +2121,7 @@ fn permute_host_threads(
 
 /// Unified collaboration coordinate epoch across whole-row/col `Structural`
 /// operations (`struct_rev`) and partial `CellShift` / `AxisPermute` operations (`shift_seq`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct CoordEpoch {
     pub struct_rev: usize,
     pub shift_seq: u64,
@@ -2134,6 +2137,7 @@ pub struct Net {
     thread_changes_cap: Arc<AtomicBool>,
     cell_shift_cap: Arc<AtomicBool>,
     room_tx_cap: Arc<AtomicBool>,
+    full_tx_overlay_cap: Arc<AtomicBool>,
     shift_host: Option<Arc<CellShiftHost>>,
     shift_pending: ShiftPending,
     room_tx_pending: RoomTxPending,
@@ -4308,6 +4312,9 @@ impl Net {
 
     pub fn supports_thread_changes(&self) -> bool { self.thread_changes_cap.load(Ordering::Acquire) }
     pub(crate) fn supports_room_tx(&self) -> bool { self.room_tx_cap.load(Ordering::Acquire) }
+    pub(crate) fn supports_full_tx_overlay(&self) -> bool {
+        self.full_tx_overlay_cap.load(Ordering::Acquire)
+    }
 
     pub fn pending_structure(&self) -> bool { self.pending_structure.load(Ordering::Acquire) }
     pub fn finish_structure(&self) {
@@ -6299,6 +6306,7 @@ fn host_initialized(
                                 base_hash: client_hash,
                                 cell_shifts,
                                 room_tx,
+                                full_tx_overlay,
                                 sort_permutation,
                                 palette_styles,
                                 resume_room,
@@ -6322,7 +6330,13 @@ fn host_initialized(
                                     break;
                                 }
                                 let order = lock_unpoison(&room_order);
-                                let (order, shift_intro) = match shift_host.capture_intro(order, site, cell_shifts, room_tx) {
+                                let (order, shift_intro) = match shift_host.capture_intro(
+                                    order,
+                                    site,
+                                    cell_shifts,
+                                    room_tx,
+                                    full_tx_overlay,
+                                ) {
                                     Ok(pair) => pair,
                                     Err(reason) => {
                                         let _ = tx.send(IntroFrame::Line(serde_json::to_string(&Msg::Denied { reason }).unwrap()));
@@ -6351,8 +6365,21 @@ fn host_initialized(
                                 hello_conn_id = conn_id;
                                 {
                                     let mut r = lock_unpoison(&roster);
-                                    if cell_shifts { r.shift_members.insert(site, conn_id); }
-                                    if room_tx { r.room_tx_members.insert(site, conn_id); }
+                                    if cell_shifts {
+                                        r.shift_members.insert(site, conn_id);
+                                    } else {
+                                        r.shift_members.remove(&site);
+                                    }
+                                    if room_tx {
+                                        r.room_tx_members.insert(site, conn_id);
+                                    } else {
+                                        r.room_tx_members.remove(&site);
+                                    }
+                                    if full_tx_overlay {
+                                        r.full_overlay_members.insert(site, conn_id);
+                                    } else {
+                                        r.full_overlay_members.remove(&site);
+                                    }
                                 }
                                 // 已认证成员可以长时间不说话（只看不改），取消认证前的读超时
                                 let _ = stream.set_read_timeout(None);
@@ -6477,6 +6504,7 @@ fn host_initialized(
                                         batch_ops: true,
                                         cell_shifts: true,
                                         room_tx: true,
+                                        full_tx_overlay: true,
                                         sort_permutation: true,
                                         structural_ack: true,
                                         thread_changes: true,
@@ -6870,6 +6898,7 @@ fn host_initialized(
                                     base_hash: String::new(),
                                     cell_shifts: true,
                                     room_tx: true,
+                                    full_tx_overlay,
                                     sort_permutation: false,
                                     palette_styles: false,
                                     resume_room: String::new(),
@@ -8067,6 +8096,7 @@ fn host_initialized(
         thread_changes_cap: Arc::new(AtomicBool::new(true)),
         cell_shift_cap: Arc::new(AtomicBool::new(true)),
         room_tx_cap: Arc::new(AtomicBool::new(true)),
+        full_tx_overlay_cap: Arc::new(AtomicBool::new(true)),
         shift_host: Some(shift_host_for_self), shift_pending: Default::default(), room_tx_pending: Default::default(), force_full: Default::default(),
         connection_generation: Default::default(),
         sheet_names,
@@ -8457,6 +8487,8 @@ fn join_session(
     let shift_cap_reader = cell_shift_cap.clone();
     let room_tx_cap = Arc::new(AtomicBool::new(false));
     let room_tx_cap_reader = room_tx_cap.clone();
+    let full_tx_overlay_cap = Arc::new(AtomicBool::new(false));
+    let full_tx_overlay_cap_reader = full_tx_overlay_cap.clone();
     let shift_pending: ShiftPending = Default::default();
     let shift_pending_reader = shift_pending.clone();
     let room_tx_pending: RoomTxPending = Default::default();
@@ -8873,6 +8905,7 @@ fn join_session(
                                 auth: client_auth.clone(),
                                 cell_shifts: true,
                                 room_tx: true,
+                                full_tx_overlay: true,
                                 sort_permutation: true,
                                 palette_styles: true,
                                 resume_room,
@@ -8905,6 +8938,7 @@ fn join_session(
                             batch_ops,
                             cell_shifts,
                             room_tx,
+                            full_tx_overlay,
                             sort_permutation,
                             structural_ack,
                             thread_changes,
@@ -8941,6 +8975,7 @@ fn join_session(
                             ack_for_reader.store(structural_ack,Ordering::Release);
                             shift_cap_reader.store(cell_shifts, Ordering::Release);
                             room_tx_cap_reader.store(room_tx, Ordering::Release);
+                            full_tx_overlay_cap_reader.store(full_tx_overlay, Ordering::Release);
                             thread_changes_for_reader.store(thread_changes, Ordering::Release);
                             palette_for_reader.store(palette_styles, Ordering::Release);
                             got_welcome = true;
@@ -9165,6 +9200,26 @@ fn join_session(
                             shift_seq = seq;
                             if last {
                                 let Ok(overlay)=serde_json::from_slice::<CellShiftOverlay>(&shift_overlay) else {break};
+                                if overlay.format_version() > sheetcore::cell_shift_patch::CURRENT_OVERLAY_FORMAT_VERSION {
+                                    let _ = evt_tx.send(NetEvent::Denied(format!(
+                                        "宿主快照元数据版本（v{}）高于当前客户端支持版本（v{}），请升级客户端后加入",
+                                        overlay.format_version(),
+                                        sheetcore::cell_shift_patch::CURRENT_OVERLAY_FORMAT_VERSION,
+                                    )));
+                                    denied = true;
+                                    break;
+                                }
+                                if seq > 0
+                                    && !overlay.is_full_state()
+                                    && room_tx_cap_reader.load(Ordering::Acquire)
+                                    && !full_tx_overlay_cap_reader.load(Ordering::Acquire)
+                                {
+                                    let _ = evt_tx.send(NetEvent::Denied(
+                                        "协作宿主版本较旧，已执行坐标变换且缺少完整元数据快照，请宿主升级后再加入".into(),
+                                    ));
+                                    denied = true;
+                                    break;
+                                }
                                 if !overlay.wire_valid() {break;}
                                 shift_overlay=Vec::new();
                                 overlay_complete = true;
@@ -9599,7 +9654,7 @@ fn join_session(
         structural_ack,
         palette_styles_cap,
         thread_changes_cap,
-        cell_shift_cap, room_tx_cap, shift_host: None, shift_pending, room_tx_pending, force_full,
+        cell_shift_cap, room_tx_cap, full_tx_overlay_cap, shift_host: None, shift_pending, room_tx_pending, force_full,
         connection_generation,
         pending_sorts: pending_for_net,
         local_sort_ranges: Default::default(),
@@ -10089,6 +10144,7 @@ mod integrity_tests {
             base_hash: String::new(),
             cell_shifts: true,
             room_tx: false,
+            full_tx_overlay: false,
             sort_permutation: false,
             palette_styles: false,
             resume_room: String::new(),
@@ -11230,6 +11286,7 @@ mod integrity_tests {
             base_hash: String::new(),
             cell_shifts: true,
             room_tx: false,
+            full_tx_overlay: false,
             sort_permutation: false,
             palette_styles: true,
             resume_room: String::new(),

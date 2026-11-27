@@ -80,10 +80,15 @@ function Invoke-TestSuite {
         }
     }
 
-    $status = if ($exitCode -eq 0 -and $failed -eq 0) {
-        if ($passed -eq 0) { "WARN(0)" } else { "PASS" }
-    } else {
+    $totalMatched = $passed + $failed + $ignored
+    $status = if ($exitCode -ne 0 -or $failed -gt 0) {
         "FAIL"
+    } elseif ($summaryHits -eq 0) {
+        "FAIL(NO_SUMMARY)"
+    } elseif ($totalMatched -eq 0) {
+        "FAIL(0_MATCH)"
+    } else {
+        "PASS"
     }
 
     $results.Add([PSCustomObject]@{
@@ -95,20 +100,20 @@ function Invoke-TestSuite {
         Status   = $status
     })
 
-    if ($status -eq "FAIL") {
-        Write-Host ("FAILED [{0}] (exit={1}, passed={2}, failed={3})" -f $Name, $exitCode, $passed, $failed) -ForegroundColor Red
+    if ($status -ne "PASS") {
+        if ($status -eq "FAIL(NO_SUMMARY)") {
+            Write-Host ("FAILED [{0}]: no test result summary lines parsed (exit={1})" -f $Name, $exitCode) -ForegroundColor Red
+        } elseif ($status -eq "FAIL(0_MATCH)") {
+            Write-Host ("FAILED [{0}]: 0 tests matched filter (passed+failed+ignored=0, {1:F2}s)" -f $Name, $sw.Elapsed.TotalSeconds) -ForegroundColor Red
+        } else {
+            Write-Host ("FAILED [{0}] (exit={1}, passed={2}, failed={3})" -f $Name, $exitCode, $passed, $failed) -ForegroundColor Red
+        }
         $lines | ForEach-Object { Write-Host $_ }
         Print-SummaryTable
         exit $(if ($exitCode -ne 0) { $exitCode } else { 1 })
     }
 
-    if ($summaryHits -eq 0) {
-        Write-Host ("    WARN: no test summary lines parsed for [{0}]" -f $Name) -ForegroundColor Yellow
-    } elseif ($passed -eq 0) {
-        Write-Host ("    WARN: 0 tests matched filter [{0}] ({1:F2}s)" -f $Name, $sw.Elapsed.TotalSeconds) -ForegroundColor Yellow
-    } else {
-        Write-Host ("    ok: {0} passed, {1} ignored ({2:F2}s)" -f $passed, $ignored, $sw.Elapsed.TotalSeconds) -ForegroundColor Green
-    }
+    Write-Host ("    ok: {0} passed, {1} ignored ({2:F2}s)" -f $passed, $ignored, $sw.Elapsed.TotalSeconds) -ForegroundColor Green
 }
 
 function Print-SummaryTable {
@@ -123,20 +128,20 @@ function Print-SummaryTable {
     $sumPassed = 0
     $sumFailed = 0
     $sumIgnored = 0
+    $allPassed = $true
     foreach ($r in $results) {
         $sumPassed += $r.Passed
         $sumFailed += $r.Failed
         $sumIgnored += $r.Ignored
-        $color = switch ($r.Status) {
-            "PASS"    { "Green" }
-            "FAIL"    { "Red" }
-            default   { "Yellow" }
+        if ($r.Status -ne "PASS") {
+            $allPassed = $false
         }
+        $color = if ($r.Status -eq "PASS") { "Green" } else { "Red" }
         Write-Host ("{0,-42} {1,8} {2,8} {3,8} {4,9:F2}  {5}" -f $r.Suite, $r.Passed, $r.Failed, $r.Ignored, $r.Seconds, $r.Status) -ForegroundColor $color
     }
 
     Write-Host ("{0,-42} {1,8} {2,8} {3,8} {4,9}  {5}" -f ("-" * 42), ("-" * 8), ("-" * 8), ("-" * 8), ("-" * 9), ("-" * 8))
-    Write-Host ("{0,-42} {1,8} {2,8} {3,8} {4,9:F2}  {5}" -f "TOTAL", $sumPassed, $sumFailed, $sumIgnored, $totalStopwatch.Elapsed.TotalSeconds, $(if ($sumFailed -eq 0) { "PASS" } else { "FAIL" })) -ForegroundColor White
+    Write-Host ("{0,-42} {1,8} {2,8} {3,8} {4,9:F2}  {5}" -f "TOTAL", $sumPassed, $sumFailed, $sumIgnored, $totalStopwatch.Elapsed.TotalSeconds, $(if ($allPassed) { "PASS" } else { "FAIL" })) -ForegroundColor White
     Write-Host "================================================================================" -ForegroundColor White
 }
 
@@ -150,6 +155,7 @@ try {
     Invoke-TestSuite -Name "app (compile)" -CargoArgs @("test", "--offline", "-p", "app", "--no-default-features", "--features", "glow", "--bin", "app", "--no-run") -BuildOnly
 
     $appSuites = @(
+        "phase7_",
         "phase6_",
         "phase5_",
         "phase4_tx_",

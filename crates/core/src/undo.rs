@@ -1266,7 +1266,7 @@ impl Entry {
                         .map(|d| (d.sheet, d.row, d.col))
                         .chain(
                             rich.iter()
-                                .filter_map(move |&((r, c), ..)| fallback_sheet.map(|s| (s, r, c))),
+                                .filter_map(move |rd| fallback_sheet.map(|s| (s, rd.row, rd.col))),
                         ),
                 ))
             }
@@ -1410,14 +1410,14 @@ impl TxAction {
         let rich_by_coord: std::collections::HashMap<(u32, u32), usize> = rich
             .iter()
             .enumerate()
-            .map(|(idx, &(pos, ..))| (pos, idx))
+            .map(|(idx, rd)| ((rd.row, rd.col), idx))
             .collect();
         let rich_matches_expected = |sheet: &Sheet, r: u32, c: u32| -> bool {
             let Some(&ri) = rich_by_coord.get(&(r, c)) else {
                 return true;
             };
-            let (_, ref before_runs, ref after_runs) = rich[ri];
-            let expected_runs = if redo { before_runs } else { after_runs };
+            let rd = &rich[ri];
+            let expected_runs = if redo { &rd.before_runs } else { &rd.after_runs };
             sheet.rich.get(&(r, c)) == expected_runs.as_ref()
         };
 
@@ -1469,7 +1469,8 @@ impl TxAction {
                 && let Some(sheet) = sheets.get_mut(sheet_idx)
             {
                 let mut any_rich_changed = false;
-                for (ri, &((r, c), ref before_runs, ref after_runs)) in rich.iter().enumerate() {
+                for (ri, rd) in rich.iter().enumerate() {
+                    let (r, c) = (rd.row, rd.col);
                     if skipped_coords.contains(&(sheet_idx, r, c)) {
                         excluded_rich.insert(ri);
                         continue;
@@ -1478,8 +1479,10 @@ impl TxAction {
                         let blank = Cell::default();
                         let cur_cell = sheet.get(r, c);
                         let cur_cell = cur_cell.as_deref().unwrap_or(&blank);
-                        let expected_runs = if redo { before_runs } else { after_runs };
+                        let expected_cell = if redo { &rd.before_cell } else { &rd.after_cell };
+                        let expected_runs = if redo { &rd.before_runs } else { &rd.after_runs };
                         if !id_matches(sheet_idx, sheet)
+                            || !cur_cell.same_input(expected_cell)
                             || sheet.rich.get(&(r, c)) != expected_runs.as_ref()
                             || !guard(sheet_idx, r, c, cur_cell)
                         {
@@ -1489,8 +1492,8 @@ impl TxAction {
                         }
                         touched.push((sheet_idx, r, c));
                     }
-                    let target_runs = if redo { after_runs } else { before_runs };
-                    let expected_runs = if redo { before_runs } else { after_runs };
+                    let target_runs = if redo { &rd.after_runs } else { &rd.before_runs };
+                    let expected_runs = if redo { &rd.before_runs } else { &rd.after_runs };
                     match target_runs {
                         Some(runs) if !runs.is_empty() => {
                             if sheet.rich.get(&(r, c)) != Some(runs) {
@@ -1510,9 +1513,9 @@ impl TxAction {
                     sheet.bump_display_style_revision();
                 }
             } else {
-                for (ri, &((r, c), ..)) in rich.iter().enumerate() {
+                for (ri, rd) in rich.iter().enumerate() {
                     excluded_rich.insert(ri);
-                    if batch_sheet.is_none_or(|s| !skipped_coords.contains(&(s, r, c))) {
+                    if batch_sheet.is_none_or(|s| !skipped_coords.contains(&(s, rd.row, rd.col))) {
                         standalone_rich_skipped += 1;
                     }
                 }
@@ -3306,19 +3309,18 @@ impl UndoStack {
             TxDelta::CellBatch { deltas, rich, .. } => {
                 let rich_bytes: usize = rich
                     .iter()
-                    .map(|(_, b, a)| {
+                    .map(|rd| {
                         let runs_bytes = |opt: &Option<Vec<crate::richtext::RichRun>>| -> usize {
                             opt.as_ref().map_or(0, |runs| {
                                 runs.capacity() * std::mem::size_of::<crate::richtext::RichRun>()
                                     + runs.iter().map(|r| r.text.len()).sum::<usize>()
                             })
                         };
-                        std::mem::size_of::<(
-                            (u32, u32),
-                            Option<Vec<crate::richtext::RichRun>>,
-                            Option<Vec<crate::richtext::RichRun>>,
-                        )>() + runs_bytes(b)
-                            + runs_bytes(a)
+                        std::mem::size_of::<crate::tx::CellRichDelta>()
+                            + cell_heap_bytes(&rd.before_cell)
+                            + cell_heap_bytes(&rd.after_cell)
+                            + runs_bytes(&rd.before_runs)
+                            + runs_bytes(&rd.after_runs)
                     })
                     .sum();
                 deltas.capacity() * std::mem::size_of::<CellDelta>()

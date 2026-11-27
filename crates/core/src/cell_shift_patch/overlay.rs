@@ -6,7 +6,7 @@ use crate::protection::ProtectedRange;
 use crate::sort_filter::{ColorFilter, Criterion, DateGroupItem, DynamicFilter, Filter, TopFilter};
 use crate::table::Table;
 
-const OVERLAY_FORMAT_VERSION: u8 = 1;
+pub const CURRENT_OVERLAY_FORMAT_VERSION: u8 = 1;
 const MAX_AXIS_SIZE: f32 = 100_000.0;
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -1022,11 +1022,19 @@ fn replace_entries<K: Point, V: PartialEq + Clone>(
 
 impl CellShiftOverlay {
     #[inline]
-    fn is_full_state(&self) -> bool {
-        self.format_version >= OVERLAY_FORMAT_VERSION
+    pub fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
+    #[inline]
+    pub fn is_full_state(&self) -> bool {
+        self.format_version >= 1 && self.format_version <= CURRENT_OVERLAY_FORMAT_VERSION
     }
 
     pub fn wire_valid(&self) -> bool {
+        if self.format_version > CURRENT_OVERLAY_FORMAT_VERSION {
+            return false;
+        }
         let mut count: usize = 0;
         for s in &self.sheets {
             count = count
@@ -1176,7 +1184,7 @@ impl CellShiftOverlay {
         use crate::participant::CoordParticipant;
 
         let mut overlay = Self {
-            format_version: OVERLAY_FORMAT_VERSION,
+            format_version: CURRENT_OVERLAY_FORMAT_VERSION,
             sheets: wb
                 .sheets
                 .iter()

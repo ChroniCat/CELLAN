@@ -1919,10 +1919,9 @@ fn cell_batch_rich_text_undo_redo_all_transitions_and_conflict_guards() {
             assert_eq!(rich.len(), 4, "only cleared rich cells should be recorded");
             for r in 0..4u32 {
                 assert!(
-                    rich.iter()
-                        .any(|&(pos, ref before, ref after)| pos == (r, 0)
-                            && before.as_ref() == Some(&runs)
-                            && after.is_none()),
+                    rich.iter().any(|rd| (rd.row, rd.col) == (r, 0)
+                        && rd.before_runs.as_ref() == Some(&runs)
+                        && rd.after_runs.is_none()),
                     "missing rich capture for row {r}"
                 );
             }
@@ -2050,4 +2049,251 @@ fn structural_undo_succeeds_after_cell_batch_style_undo_on_row_styled_cell() {
     assert!(undone_struct.structural);
     assert_eq!(wb.sheets[0].value(10, 0), Value::Number(42.0));
     assert_eq!(wb.sheets[0].style_of(5, 0), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 R3: Rich-Only CellBatch Input CAS (Undo & Redo Directions)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cell_batch_rich_only_normal_undo_redo_roundtrip() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Finance".into();
+    let runs = sample_rich_runs();
+    wb.sheets[0].set(0, 0, txt("Revenue total"));
+    wb.sheets[0].rich.insert((0, 0), runs.clone());
+
+    // Duplicate-coordinate CellBatch (A1=99 then A1="Revenue total") strips RichRuns with
+    // zero net Cell/style diff -> produces `deltas.len() == 0, rich.len() == 1`.
+    let commit = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::CellBatch(CellBatchIntent {
+            sheet: 0,
+            writes: vec![
+                CellWrite::cell(0, 0, num(99.0)),
+                CellWrite::cell(0, 0, txt("Revenue total")),
+            ],
+        }),
+        (0, 0, 0),
+    )
+    .expect("duplicate-coord rich-only CellBatch must succeed");
+
+    match &commit.delta {
+        TxDelta::CellBatch { deltas, rich, .. } => {
+            assert!(deltas.is_empty(), "zero net cell/style diff produces rich-only delta");
+            assert_eq!(rich.len(), 1);
+            assert_eq!((rich[0].row, rich[0].col), (0, 0));
+            assert!(rich[0].before_cell.same_input(&txt("Revenue total")));
+            assert!(rich[0].after_cell.same_input(&txt("Revenue total")));
+            assert_eq!(rich[0].before_runs.as_ref(), Some(&runs));
+            assert_eq!(rich[0].after_runs, None);
+        }
+        other => panic!("expected TxDelta::CellBatch, got {other:?}"),
+    }
+    assert!(!wb.sheets[0].rich.contains_key(&(0, 0)));
+
+    let mut undo = UndoStack::new();
+    assert!(undo.push_tx(commit) > 0);
+    assert_eq!(undo.depth(), (1, 0));
+
+    // Unconflicted Undo restores exact RichRuns.
+    wb.sheets[0].rich_dirty = false;
+    let undone = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(undone.skipped, 0);
+    assert_eq!(undone.touched, vec![(0, 0, 0)]);
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("Revenue total".into()));
+    assert_eq!(wb.sheets[0].rich.get(&(0, 0)), Some(&runs));
+    assert!(wb.sheets[0].rich_dirty);
+    assert_eq!(undo.depth(), (0, 1));
+
+    // Unconflicted Redo strips RichRuns cleanly.
+    wb.sheets[0].rich_dirty = false;
+    let redone = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(redone.skipped, 0);
+    assert_eq!(redone.touched, vec![(0, 0, 0)]);
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("Revenue total".into()));
+    assert!(!wb.sheets[0].rich.contains_key(&(0, 0)));
+    assert!(wb.sheets[0].rich_dirty);
+    assert_eq!(undo.depth(), (1, 0));
+
+    // Second Undo restores again.
+    let undone2 = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(undone2.skipped, 0);
+    assert_eq!(wb.sheets[0].rich.get(&(0, 0)), Some(&runs));
+}
+
+#[test]
+fn cell_batch_rich_only_enforces_input_cas_on_undo_for_all_replacement_types() {
+    let runs = sample_rich_runs();
+    let replacements: [(&str, Option<Cell>); 4] = [
+        ("different text", Some(txt("Peer replacement"))),
+        ("number", Some(num(123.0))),
+        ("formula", Some(fml("=2+2"))),
+        ("blank", None),
+    ];
+
+    for (kind, replacement) in replacements {
+        // 1. Standalone rich-only batch: conflict skips rich restoration AND drops empty redo entry.
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "Finance".into();
+        wb.sheets[0].set(0, 0, txt("Revenue total"));
+        wb.sheets[0].rich.insert((0, 0), runs.clone());
+
+        let commit = WorkbookTx::execute(
+            &mut wb,
+            TxIntent::CellBatch(CellBatchIntent {
+                sheet: 0,
+                writes: vec![
+                    CellWrite::cell(0, 0, num(99.0)),
+                    CellWrite::cell(0, 0, txt("Revenue total")),
+                ],
+            }),
+            (0, 0, 0),
+        )
+        .unwrap();
+        let mut undo = UndoStack::new();
+        assert!(undo.push_tx(commit) > 0);
+
+        // Simulate peer edit (not recorded in local UndoStack), followed by offline undo.
+        match &replacement {
+            Some(c) => wb.sheets[0].set(0, 0, c.clone()),
+            None => {
+                wb.sheets[0].remove(0, 0);
+            }
+        }
+        wb.sheets[0].rich_dirty = false;
+
+        let undone = undo.undo_workbook(&mut wb, allow_all).unwrap();
+        assert_eq!(undone.skipped, 1, "undo must skip conflicted rich-only cell ({kind})");
+        assert!(undone.touched.is_empty(), "conflicted rich-only cell must not be touched ({kind})");
+        assert!(
+            !wb.sheets[0].rich.contains_key(&(0, 0)),
+            "stale rich runs must NOT attach onto peer {kind} replacement"
+        );
+        assert!(!wb.sheets[0].rich_dirty);
+        assert_eq!(
+            undo.depth(),
+            (0, 0),
+            "conflicted rich-only item must be excluded from inverse redo stack ({kind})"
+        );
+        let expected_cell = replacement.clone().unwrap_or_default();
+        let actual_cell = wb.sheets[0].get(0, 0).map(|c| c.into_owned()).unwrap_or_default();
+        assert!(actual_cell.same_input(&expected_cell), "peer cell must stay intact ({kind})");
+
+        // 2. Mixed batch (A1 rich-only + B1 normal cell edit): conflicted A1 is skipped AND
+        //    excluded from Redo while unconflicted B1 still undoes & redoes cleanly.
+        let mut wb2 = Workbook::new_blank();
+        wb2.sheets[0].name = "Finance".into();
+        wb2.sheets[0].set(0, 0, txt("Revenue total"));
+        wb2.sheets[0].rich.insert((0, 0), runs.clone());
+        wb2.sheets[0].set(0, 1, num(10.0));
+
+        let mixed = WorkbookTx::execute(
+            &mut wb2,
+            TxIntent::CellBatch(CellBatchIntent {
+                sheet: 0,
+                writes: vec![
+                    CellWrite::cell(0, 0, num(99.0)),
+                    CellWrite::cell(0, 0, txt("Revenue total")),
+                    CellWrite::cell(0, 1, num(20.0)),
+                ],
+            }),
+            (0, 0, 0),
+        )
+        .unwrap();
+        let mut undo2 = UndoStack::new();
+        assert!(undo2.push_tx(mixed) > 0);
+
+        match &replacement {
+            Some(c) => wb2.sheets[0].set(0, 0, c.clone()),
+            None => {
+                wb2.sheets[0].remove(0, 0);
+            }
+        }
+        let u2 = undo2.undo_workbook(&mut wb2, allow_all).unwrap();
+        assert_eq!(u2.skipped, 1, "mixed batch must skip A1 ({kind})");
+        assert_eq!(u2.touched, vec![(0, 0, 1)], "mixed batch must still undo B1 ({kind})");
+        assert_eq!(wb2.sheets[0].value(0, 1), Value::Number(10.0));
+        assert!(!wb2.sheets[0].rich.contains_key(&(0, 0)));
+        assert_eq!(undo2.depth(), (0, 1));
+
+        // Even if A1 is restored back to "Revenue total" + runs before Redo, the excluded A1
+        // rich entry MUST NOT be replayed on Redo!
+        wb2.sheets[0].set(0, 0, txt("Revenue total"));
+        wb2.sheets[0].rich.insert((0, 0), runs.clone());
+        let r2 = undo2.redo_workbook(&mut wb2, allow_all).unwrap();
+        assert_eq!(r2.skipped, 0);
+        assert_eq!(r2.touched, vec![(0, 0, 1)]);
+        assert_eq!(wb2.sheets[0].value(0, 1), Value::Number(20.0));
+        assert_eq!(
+            wb2.sheets[0].rich.get(&(0, 0)),
+            Some(&runs),
+            "excluded rich-only entry must never replay on Redo ({kind})"
+        );
+    }
+}
+
+#[test]
+fn cell_batch_rich_only_enforces_input_cas_on_redo_for_all_replacement_types() {
+    let runs = sample_rich_runs();
+    let replacements: [(&str, Option<Cell>); 4] = [
+        ("different text", Some(txt("Peer redo replacement"))),
+        ("number", Some(num(456.0))),
+        ("formula", Some(fml("=3+3"))),
+        ("blank", None),
+    ];
+
+    for (kind, replacement) in replacements {
+        let mut wb = Workbook::new_blank();
+        wb.sheets[0].name = "Finance".into();
+        wb.sheets[0].set(0, 0, txt("Revenue total"));
+        wb.sheets[0].rich.insert((0, 0), runs.clone());
+
+        let commit = WorkbookTx::execute(
+            &mut wb,
+            TxIntent::CellBatch(CellBatchIntent {
+                sheet: 0,
+                writes: vec![
+                    CellWrite::cell(0, 0, num(99.0)),
+                    CellWrite::cell(0, 0, txt("Revenue total")),
+                ],
+            }),
+            (0, 0, 0),
+        )
+        .unwrap();
+        let mut undo = UndoStack::new();
+        assert!(undo.push_tx(commit) > 0);
+
+        // Undo succeeds cleanly so entry moves onto the redo stack with runs restored on A1.
+        let undone = undo.undo_workbook(&mut wb, allow_all).unwrap();
+        assert_eq!(undone.skipped, 0);
+        assert_eq!(wb.sheets[0].rich.get(&(0, 0)), Some(&runs));
+        assert_eq!(undo.depth(), (0, 1));
+
+        // Replace A1 input AND explicitly keep matching runs in `sheet.rich` so ONLY input CAS
+        // (`same_input`) can detect the conflict during Redo!
+        match &replacement {
+            Some(c) => wb.sheets[0].set(0, 0, c.clone()),
+            None => {
+                wb.sheets[0].remove(0, 0);
+            }
+        }
+        wb.sheets[0].rich.insert((0, 0), runs.clone());
+        wb.sheets[0].rich_dirty = false;
+
+        let redone = undo.redo_workbook(&mut wb, allow_all).unwrap();
+        assert_eq!(redone.skipped, 1, "redo must skip conflicted rich-only cell ({kind})");
+        assert!(redone.touched.is_empty());
+        assert_eq!(
+            wb.sheets[0].rich.get(&(0, 0)),
+            Some(&runs),
+            "conflicted redo must leave existing rich state untouched ({kind})"
+        );
+        assert!(!wb.sheets[0].rich_dirty);
+        assert_eq!(
+            undo.depth(),
+            (0, 0),
+            "conflicted rich-only redo must be excluded from inverse undo stack ({kind})"
+        );
+    }
 }
