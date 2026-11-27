@@ -210,12 +210,13 @@ pub fn try_subtotal_workbook_opts(
     }
     let total_at = r2 + insertions.len() as u32;
     if total_at > LAST_ROW { return Err(OVERFLOW); }
-    let last_safe = LAST_ROW - insertions.len() as u32;
-    if tail_occupied(sheet, last_safe)
-        || wb.sheets.iter().flat_map(|s| &s.sparklines)
-            .any(|sp| sp.source_sheet.as_deref() == Some(&sheet.name) && sp.rect.2 > last_safe)
-        || wb.pivots_pending.iter().any(|(index, spec, _, output, _)|
-            *index == sheet_idx && (spec.source.2 > last_safe || output.2 > last_safe))
+    if crate::transform::CoordTransform::from_multi_insert(
+        sheet_idx,
+        crate::refs::Axis::Row,
+        insertions.clone(),
+    )
+    .preflight(wb)
+    .is_err()
     {
         return Err(OVERFLOW);
     }
@@ -317,36 +318,6 @@ pub fn try_subtotal_workbook_opts(
         groups: n,
         rows: insertions.len(),
     })
-}
-
-// An empty-looking tail may still contain formatting, a drawing anchor or a
-// validation range. Check it before the first mutation, including style-only cells.
-fn tail_occupied(s: &Sheet, last: u32) -> bool {
-    let past = |r: u32| r > last;
-    s.used_bounds().is_some_and(|b| past(b.2))
-        || s.styles.iter_from(true, last + 1).next().is_some()
-        || s.rows.entries().any(|(&r, _)| past(r))
-        || s.row_styles.keys().chain(s.row_levels.keys()).copied().any(past)
-        || s.hidden_rows.iter().chain(s.hidden_rows_user.iter()).copied().any(past)
-        || s.notes.keys().chain(s.spilled.iter()).any(|k| past(k.row))
-        || s.spill_shapes.iter().any(|(k, shape)| past(k.row.saturating_add(shape.0.saturating_sub(1))))
-        || s.arrays.iter().any(|(k, r)| past(k.row) || past(r.2))
-        || s.rich.keys().chain(s.ignored_errors.iter()).any(|&(r, _)| past(r))
-        || s.hyperlinks.iter().any(|(&(r, _), h)| past(r.saturating_add(h.span.0)))
-        || s.merges.iter().any(|r| past(r.2))
-        || s.cf.blocks.iter().flat_map(|b| &b.ranges).chain(s.dv.iter().flat_map(|d| &d.ranges))
-            .any(|r| past(r.2) && (r.0, r.2) != (0, 1_048_575))
-        || s.tables.iter().any(|t| past(t.range.2))
-        || s.filter.as_ref().is_some_and(|f| past(f.range.2))
-        || s.freeze.is_some_and(|(r, _)| past(r))
-        || s.pictures.iter().any(|p| past(p.rect.2))
-        || s.charts.iter().any(|c| past(c.anchor.2))
-        || s.textboxes.iter().any(|t| past(t.from.2) || past(t.to.2))
-        || s.sparklines.iter().any(|sp| past(sp.r) || (sp.source_sheet.is_none() && past(sp.rect.2)))
-        || s.page.print_area.is_some_and(|r| past(r.2))
-        || s.page.title_rows.is_some_and(|r| past(r.1))
-        || s.page.row_breaks.iter().copied().any(past)
-        || s.scenarios.iter().flat_map(|s| &s.cells).any(|((r, _), _)| past(*r))
 }
 
 #[cfg(test)]

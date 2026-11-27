@@ -178,9 +178,63 @@ impl CoordParticipant {
             && !matches!(self, Self::CellsAndStyles)
     }
 
-    /// Whether this subsystem participates in `CellShiftPatch` / `CellShiftOverlay`.
+    /// Whether this subsystem participates in partial-band `CellShiftPatch`.
     pub const fn participates_in_cell_shift_patch(self) -> bool {
         matches!(self.cell_shift_mode(), CellShiftMode::Transform)
+    }
+
+    /// Whether this subsystem can be mutated by a partial-band `CellShift`.
+    pub const fn mutated_by_cell_shift(self) -> bool {
+        matches!(self.cell_shift_mode(), CellShiftMode::Transform)
+    }
+
+    /// Whether this subsystem can be mutated by a whole-axis `AxisPermute`.
+    pub const fn mutated_by_axis_permute(self) -> bool {
+        match self {
+            Self::CellsAndStyles
+            | Self::CellNotesAndThreads
+            | Self::RichAndHyperlinks
+            | Self::Merges
+            | Self::ConditionalAndValidation
+            | Self::Charts
+            | Self::Sparklines
+            | Self::DefinedNames
+            | Self::ExternalSources
+            | Self::IgnoredErrors
+            | Self::Tables
+            | Self::Pivots
+            | Self::ArraysAndSpills
+            | Self::AutoFilter
+            | Self::ScenariosAndProtectedRanges
+            | Self::LayoutAndPage => true,
+        }
+    }
+
+    /// Whether this subsystem is captured & restored by `TxOverlay` (`CellShiftOverlay`).
+    ///
+    /// Contract invariant: every participant with
+    /// `mutated_by_axis_permute() || mutated_by_cell_shift()` MUST return `true`
+    /// and have non-empty `capture_participant` / `apply_participant` arms in
+    /// `cell_shift_patch/overlay.rs`.
+    pub const fn captured_in_tx_overlay(self) -> bool {
+        match self {
+            Self::CellsAndStyles
+            | Self::CellNotesAndThreads
+            | Self::RichAndHyperlinks
+            | Self::Merges
+            | Self::ConditionalAndValidation
+            | Self::Charts
+            | Self::Sparklines
+            | Self::DefinedNames
+            | Self::ExternalSources
+            | Self::IgnoredErrors
+            | Self::Tables
+            | Self::Pivots
+            | Self::ArraysAndSpills
+            | Self::AutoFilter
+            | Self::ScenariosAndProtectedRanges
+            | Self::LayoutAndPage => true,
+        }
     }
 
     /// Whether this subsystem runs a workbook-wide reference pass in
@@ -205,9 +259,20 @@ impl CoordParticipant {
         let Some(sheet) = wb.sheets.get(sheet_idx) else {
             return Err(CellShiftConflict::InvalidTarget);
         };
-        let Some(op) = tx.as_cell_shift() else {
-            return Ok(());
-        };
+        if let Some(op) = tx.as_cell_shift() {
+            return self.preflight_cell_shift(wb, sheet_idx, sheet, &op, tx);
+        }
+        self.preflight_whole_axis_insert(wb, sheet_idx, sheet, tx)
+    }
+
+    fn preflight_cell_shift(
+        self,
+        wb: &Workbook,
+        sheet_idx: usize,
+        sheet: &Sheet,
+        op: &CellShift,
+        tx: &CoordTransform,
+    ) -> Result<(), CellShiftConflict> {
         let Some(ray) = op.moving_ray() else {
             return Err(CellShiftConflict::InvalidTarget);
         };
@@ -223,7 +288,7 @@ impl CoordParticipant {
                 }
                 Ok(())
             }
-            Self::Merges => preflight_merges_for_shift(sheet, &op),
+            Self::Merges => preflight_merges_for_shift(sheet, op),
             Self::Tables => {
                 if sheet
                     .tables
@@ -304,7 +369,7 @@ impl CoordParticipant {
             // `source_range` across all sheets via `Chart::rewrite_with_transform`
             // without moving floating anchors.
             Self::Charts => Ok(()),
-            Self::Sparklines => preflight_sparklines_for_shift(wb, sheet_idx, &op, tx, ray),
+            Self::Sparklines => preflight_sparklines_for_shift(wb, sheet_idx, op, tx, ray),
             Self::ScenariosAndProtectedRanges => {
                 if sheet
                     .protected_ranges
@@ -327,13 +392,335 @@ impl CoordParticipant {
                 }
                 Ok(())
             }
-            Self::RichAndHyperlinks => preflight_hyperlinks_for_shift(sheet, &op, ray),
+            Self::RichAndHyperlinks => preflight_hyperlinks_for_shift(sheet, op, ray),
             Self::CellNotesAndThreads
             | Self::ConditionalAndValidation
             | Self::DefinedNames
             | Self::ExternalSources
             | Self::IgnoredErrors
             | Self::LayoutAndPage => Ok(()),
+        }
+    }
+
+    /// Tail-occupancy overflow validation for whole-axis `AxisShift { band: None, delete: false }`
+    /// and `MultiInsert` across all 16 `CoordParticipant` groups.
+    fn preflight_whole_axis_insert(
+        self,
+        wb: &Workbook,
+        sheet_idx: usize,
+        sheet: &Sheet,
+        tx: &CoordTransform,
+    ) -> Result<(), CellShiftConflict> {
+        let Some(tail_start) = insert_tail_start(tx) else {
+            return Ok(());
+        };
+        if self.sheet_insert_overflows(sheet, tx, tail_start) {
+            return Err(CellShiftConflict::Overflow);
+        }
+        let rows = tx.axis() == crate::refs::Axis::Row;
+        let overflows = |pos: u32| pos >= tail_start;
+        let rect_overflows = |rect: (u32, u32, u32, u32)| {
+            let norm = norm_rect(rect);
+            overflows(if rows { norm.2 } else { norm.3 })
+        };
+        let target_name = sheet.name.as_str();
+        let target_sid = sheet.identity;
+
+        let wb_overflow = match self {
+            Self::Sparklines => wb.sheets.iter().any(|sh| {
+                sh.sparklines.iter().any(|sp| {
+                    sp.source_sheet
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(target_name))
+                        && rect_overflows(sp.rect)
+                })
+            }),
+            Self::ExternalSources => wb.sources.iter().any(|src| {
+                if matches!(src.kind, crate::external::Kind::Unbound(_)) {
+                    return false;
+                }
+                let target_hit = src
+                    .target_sheet
+                    .as_deref()
+                    .is_none_or(|n| n.eq_ignore_ascii_case(target_name))
+                    && rect_overflows(src.destination_rect());
+                let internal_hit = matches!(
+                    &src.kind,
+                    crate::external::Kind::Internal { sheet: s, rect }
+                        if s.eq_ignore_ascii_case(target_name) && rect_overflows(*rect)
+                );
+                target_hit || internal_hit
+            }),
+            Self::Pivots => {
+                wb.pivots.iter().any(|p| {
+                    let is_src = p.source_sheet_id == Some(target_sid)
+                        || p.source_sheet.eq_ignore_ascii_case(target_name);
+                    let src_hit = is_src
+                        && (rect_overflows(p.spec.source)
+                            || (!rows
+                                && (p.spec.rows.iter().any(|f| overflows(f.col))
+                                    || p.spec.cols.iter().any(|f| overflows(f.col))
+                                    || p.spec.values.iter().any(|f| {
+                                        overflows(f.col)
+                                            || f.base.as_ref().is_some_and(|(bc, _)| overflows(*bc))
+                                    })
+                                    || p.spec.filters.iter().any(|f| overflows(f.col))
+                                    || p.options.slicers.iter().any(|s| overflows(s.col)))));
+                    let dst_hit = p.target_sheet == sheet_idx
+                        && (rect_overflows(p.rect)
+                            || overflows(if rows { p.anchor.0 } else { p.anchor.1 }));
+                    src_hit || dst_hit
+                }) || wb.pivots_pending.iter().any(|(idx, spec, _, out, _)| {
+                    *idx == sheet_idx
+                        && (rect_overflows(spec.source)
+                            || rect_overflows(*out)
+                            || (!rows
+                                && (overflows(spec.row_field)
+                                    || spec.col_field.is_some_and(overflows)
+                                    || overflows(spec.value_field))))
+                }) || wb.pivots_pending2.iter().any(|(idx, spec, _, out)| {
+                    *idx == sheet_idx
+                        && (rect_overflows(spec.source)
+                            || rect_overflows(*out)
+                            || (!rows
+                                && (spec.rows.iter().any(|f| overflows(f.col))
+                                    || spec.cols.iter().any(|f| overflows(f.col))
+                                    || spec.values.iter().any(|f| {
+                                        overflows(f.col)
+                                            || f.base.as_ref().is_some_and(|(bc, _)| overflows(*bc))
+                                    })
+                                    || spec.filters.iter().any(|f| overflows(f.col)))))
+                })
+            }
+            Self::CellsAndStyles
+            | Self::CellNotesAndThreads
+            | Self::RichAndHyperlinks
+            | Self::Merges
+            | Self::ConditionalAndValidation
+            | Self::Charts
+            | Self::DefinedNames
+            | Self::IgnoredErrors
+            | Self::Tables
+            | Self::ArraysAndSpills
+            | Self::AutoFilter
+            | Self::ScenariosAndProtectedRanges
+            | Self::LayoutAndPage => false,
+        };
+        if wb_overflow {
+            Err(CellShiftConflict::Overflow)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn sheet_insert_overflows(self, sheet: &Sheet, tx: &CoordTransform, tail_start: u32) -> bool {
+        let rows = tx.axis() == crate::refs::Axis::Row;
+        let limit = tx.axis_limit();
+        let last_valid = limit - 1;
+        let overflows = |pos: u32| pos >= tail_start;
+        let rect_overflows = |rect: (u32, u32, u32, u32)| {
+            let norm = norm_rect(rect);
+            overflows(if rows { norm.2 } else { norm.3 })
+        };
+
+        match self {
+            Self::CellsAndStyles => {
+                let cells_hit = sheet
+                    .used_bounds()
+                    .is_some_and(|b| overflows(if rows { b.2 } else { b.3 }));
+                let styles_hit = sheet.styles.iter_from(rows, tail_start).next().is_some();
+                let axis_styles_hit = if rows {
+                    sheet.row_styles.keys().any(|&r| overflows(r))
+                } else {
+                    sheet.col_styles.keys().any(|&c| overflows(c))
+                };
+                cells_hit || styles_hit || axis_styles_hit
+            }
+            Self::CellNotesAndThreads => sheet
+                .notes
+                .keys()
+                .chain(sheet.threads.keys())
+                .any(|k| overflows(if rows { k.row } else { k.col })),
+            Self::RichAndHyperlinks => {
+                sheet
+                    .rich
+                    .keys()
+                    .any(|&(r, c)| overflows(if rows { r } else { c }))
+                    || sheet.hyperlinks.iter().any(|(&(r, c), link)| {
+                        let end = if rows {
+                            r.saturating_add(link.span.0)
+                        } else {
+                            c.saturating_add(link.span.1)
+                        };
+                        overflows(end)
+                    })
+            }
+            Self::Merges => sheet.merges.iter().any(|&m| rect_overflows(m)),
+            Self::ConditionalAndValidation => {
+                let rule_overflows = |&(r1, c1, r2, c2): &(u32, u32, u32, u32)| {
+                    let (lo, hi) = if rows {
+                        (r1.min(r2), r1.max(r2))
+                    } else {
+                        (c1.min(c2), c1.max(c2))
+                    };
+                    // Full-axis CF/DV rules stay full-axis and never overflow.
+                    !(lo == 0 && hi == last_valid) && overflows(hi)
+                };
+                sheet
+                    .cf
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.ranges)
+                    .any(rule_overflows)
+                    || sheet.dv.iter().flat_map(|d| &d.ranges).any(rule_overflows)
+            }
+            Self::Charts => sheet.charts.iter().any(|ch| rect_overflows(ch.anchor)),
+            Self::Sparklines => sheet.sparklines.iter().any(|sp| {
+                overflows(if rows { sp.r } else { sp.c })
+                    || (sp.source_sheet.is_none() && rect_overflows(sp.rect))
+            }),
+            Self::IgnoredErrors => sheet
+                .ignored_errors
+                .iter()
+                .any(|&(r, c)| overflows(if rows { r } else { c })),
+            Self::Tables => sheet.tables.iter().any(|t| {
+                let (r1, c1, r2, c2) = norm_rect(t.range);
+                if rows {
+                    // Row insertion immediately after a totals-less table expands its end row too.
+                    match tx {
+                        CoordTransform::AxisShift {
+                            at,
+                            n,
+                            delete: false,
+                            band: None,
+                            ..
+                        } => {
+                            if *at <= r1 || *at <= r2.saturating_add(u32::from(!t.totals_row)) {
+                                r2.checked_add(*n).is_none_or(|e| e >= limit)
+                            } else {
+                                false
+                            }
+                        }
+                        CoordTransform::MultiInsert { positions, .. } => {
+                            let cutoff = r2.saturating_add(u32::from(!t.totals_row));
+                            let added = positions.partition_point(|&r| r <= cutoff) as u32;
+                            r2.checked_add(added).is_none_or(|e| e >= limit)
+                        }
+                        _ => overflows(r2),
+                    }
+                } else {
+                    let _ = c1;
+                    overflows(c2)
+                }
+            }),
+            Self::ArraysAndSpills => {
+                sheet.arrays.iter().any(|&(anchor, rect)| {
+                    overflows(if rows { anchor.row } else { anchor.col }) || rect_overflows(rect)
+                }) || sheet
+                    .spilled
+                    .iter()
+                    .any(|k| overflows(if rows { k.row } else { k.col }))
+                    || sheet.spill_shapes.iter().any(|(&anchor, &(h, w))| {
+                        let end = if rows {
+                            anchor.row.saturating_add(h.saturating_sub(1))
+                        } else {
+                            anchor.col.saturating_add(w.saturating_sub(1))
+                        };
+                        overflows(end)
+                    })
+            }
+            Self::AutoFilter => sheet.filter.as_ref().is_some_and(|f| {
+                rect_overflows(f.range)
+                    || (!rows
+                        && (f.allows.keys().any(|&c| overflows(c))
+                            || f.criteria.keys().any(|&c| overflows(c))
+                            || f.date_groups.keys().any(|&c| overflows(c))
+                            || f.color_filters.keys().any(|&c| overflows(c))
+                            || f.top_filters.keys().any(|&c| overflows(c))
+                            || f.dynamic_filters.keys().any(|&c| overflows(c))))
+            }),
+            Self::ScenariosAndProtectedRanges => {
+                sheet
+                    .protected_ranges
+                    .iter()
+                    .any(|pr| pr.sqref.iter().any(|&sq| rect_overflows(sq)))
+                    || sheet.scenarios.iter().any(|sc| {
+                        sc.cells
+                            .iter()
+                            .any(|&((r, c), _)| overflows(if rows { r } else { c }))
+                    })
+                    || sheet.scenario_settings.sqref.as_deref().is_some_and(|sq| {
+                        crate::scenarios::sqref_rects(sq)
+                            .into_iter()
+                            .any(rect_overflows)
+                    })
+            }
+            Self::LayoutAndPage => {
+                let axis_hit = if rows {
+                    sheet.rows.spans().last().is_some_and(|sp| overflows(sp.end))
+                        || sheet
+                            .hidden_rows
+                            .intervals()
+                            .last()
+                            .is_some_and(|&(_, hi)| overflows(hi))
+                        || sheet
+                            .hidden_rows_user
+                            .intervals()
+                            .last()
+                            .is_some_and(|&(_, hi)| overflows(hi))
+                        || sheet.row_levels.keys().any(|&r| overflows(r))
+                } else {
+                    sheet.cols.spans().last().is_some_and(|sp| overflows(sp.end))
+                        || sheet
+                            .hidden_cols
+                            .intervals()
+                            .last()
+                            .is_some_and(|&(_, hi)| overflows(hi))
+                        || sheet.col_levels.keys().any(|&c| overflows(c))
+                };
+                let freeze_hit = sheet.freeze.is_some_and(|(fr, fc)| {
+                    let v = if rows { fr } else { fc };
+                    match tx {
+                        CoordTransform::AxisShift {
+                            at,
+                            n,
+                            delete: false,
+                            band: None,
+                            ..
+                        } => v > *at && v.checked_add(*n).is_none_or(|nv| nv >= limit),
+                        CoordTransform::MultiInsert { positions, .. } => {
+                            let added = positions.partition_point(|&at| at < v) as u32;
+                            v.checked_add(added).is_none_or(|nv| nv >= limit)
+                        }
+                        _ => false,
+                    }
+                });
+                let drawings_hit = sheet.pictures.iter().any(|p| rect_overflows(p.rect))
+                    || sheet.textboxes.iter().any(|tb| {
+                        let (a, b) = if rows {
+                            (tb.from.2, tb.to.2)
+                        } else {
+                            (tb.from.0, tb.to.0)
+                        };
+                        overflows(a) || overflows(b)
+                    });
+                let page_hit = sheet.page.print_area.is_some_and(rect_overflows)
+                    || if rows {
+                        sheet
+                            .page
+                            .title_rows
+                            .is_some_and(|(a, b)| overflows(a.max(b)))
+                            || sheet.page.row_breaks.iter().any(|&b| overflows(b))
+                    } else {
+                        sheet
+                            .page
+                            .title_cols
+                            .is_some_and(|(a, b)| overflows(a.max(b)))
+                            || sheet.page.col_breaks.iter().any(|&b| overflows(b))
+                    };
+                axis_hit || freeze_hit || drawings_hit || page_hit
+            }
+            Self::DefinedNames | Self::ExternalSources | Self::Pivots => false,
         }
     }
 
@@ -369,8 +756,15 @@ impl CoordParticipant {
                 if *at >= limit {
                     return Err(CellShiftConflict::InvalidTarget);
                 }
-                if !*delete && *n > limit - *at {
-                    return Err(CellShiftConflict::Overflow);
+                if !*delete {
+                    if *n > limit - *at {
+                        return Err(CellShiftConflict::Overflow);
+                    }
+                    if *n > 0 {
+                        for participant in Self::ALL {
+                            participant.preflight(wb, tx)?;
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -389,12 +783,37 @@ impl CoordParticipant {
                 }
                 Ok(())
             }
-            CoordTransform::MultiInsert { positions, .. } => {
+            CoordTransform::MultiInsert {
+                sheet_idx,
+                axis,
+                positions,
+            } => {
                 if positions.len() >= limit as usize {
                     return Err(CellShiftConflict::Overflow);
                 }
                 if positions.iter().any(|&p| p >= limit) {
                     return Err(CellShiftConflict::InvalidTarget);
+                }
+                if positions.is_empty() {
+                    return Ok(());
+                }
+                let sorted_tx;
+                let effective = if positions.windows(2).all(|w| w[0] <= w[1]) {
+                    tx
+                } else {
+                    sorted_tx = CoordTransform::from_multi_insert(*sheet_idx, *axis, positions.clone());
+                    &sorted_tx
+                };
+                if let CoordTransform::MultiInsert { positions: sorted, .. } = effective
+                    && sorted
+                        .iter()
+                        .enumerate()
+                        .any(|(i, &p)| u64::from(p) + i as u64 >= u64::from(limit))
+                {
+                    return Err(CellShiftConflict::Overflow);
+                }
+                for participant in Self::ALL {
+                    participant.preflight(wb, effective)?;
                 }
                 Ok(())
             }
@@ -702,6 +1121,47 @@ impl CoordParticipant {
                 .collect(),
             ..Default::default()
         }
+    }
+}
+
+/// Return the smallest 0-based coordinate along `tx.axis()` whose mapped
+/// destination would leave the grid (`>= MAX_ROWS` / `>= MAX_COLS`) under a
+/// whole-axis non-deleting insert (`AxisShift { band: None, delete: false }`
+/// or `MultiInsert`).
+fn insert_tail_start(tx: &CoordTransform) -> Option<u32> {
+    let limit = tx.axis_limit();
+    match tx {
+        CoordTransform::AxisShift {
+            at,
+            n,
+            delete: false,
+            band: None,
+            ..
+        } => {
+            if *n == 0 || *at >= limit {
+                return None;
+            }
+            if *n >= limit - *at {
+                return Some(*at);
+            }
+            Some((limit - *n).max(*at))
+        }
+        CoordTransform::MultiInsert { positions, .. } => {
+            if positions.is_empty() {
+                return None;
+            }
+            let (mut lo, mut hi) = (0u32, limit);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if tx.map_index(mid).is_none() {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            (lo < limit).then_some(lo)
+        }
+        _ => None,
     }
 }
 

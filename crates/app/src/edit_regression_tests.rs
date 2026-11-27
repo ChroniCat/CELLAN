@@ -14603,6 +14603,271 @@ fn phase5_tx_meta_and_cow_funnel_undo_redo() {
     assert!(app.wb.styles.get(app.wb.sheet(0).style_of(10, 10)).bold);
 }
 
+#[test]
+fn phase6_a2_ai_cell_batch_preserves_and_restores_rich_runs_on_undo_redo() {
+    use sheetcore::richtext::RichRun;
+    let env = crate::test_env::TestEnv::new("p6-a2-ai-rich-undo");
+    let ctx = egui::Context::default();
+    let mut app = app();
+    app.wb.path = Some(env.path("p6_a2_ai_rich.xlsx"));
+    app.ai.bound_doc_uid = Some(app.doc_uid);
+    app.ai.messages.push(crate::ai_agent::AiMessage {
+        role: crate::ai_agent::AiRole::Assistant,
+        content: String::new(),
+        reasoning: String::new(),
+        reasoning_open: false,
+        tool_logs: Vec::new(),
+        error: None,
+        undo_ids: Vec::new(),
+    });
+
+    // Exact peer-review setup: A1 = "Revenue total" with 2 RichRuns ("total" bold),
+    // plus B1 = "Margin pct" with 2 RichRuns (italic + color) overwritten by fill_formula_range.
+    let mut run_bold = RichRun::plain("total");
+    run_bold.bold = true;
+    let a1_runs = vec![RichRun::plain("Revenue "), run_bold];
+
+    let mut run_pct = RichRun::plain("pct");
+    run_pct.italic = true;
+    run_pct.color = Some([200, 30, 30]);
+    let b1_runs = vec![RichRun::plain("Margin "), run_pct];
+
+    {
+        let sh = app.wb.sheet_mut(0);
+        sh.set(
+            0,
+            0,
+            Cell {
+                value: Value::Text("Revenue total".into()),
+                formula: None,
+            },
+        );
+        sh.rich.insert((0, 0), a1_runs.clone());
+        sh.set(
+            0,
+            1,
+            Cell {
+                value: Value::Text("Margin pct".into()),
+                formula: None,
+            },
+        );
+        sh.rich.insert((0, 1), b1_runs.clone());
+        sh.set(0, 2, number(10.0));
+    }
+
+    // 1) AI set_cells writes 99 into A1.
+    let tc_set = crate::ai_agent::ToolCallSpec {
+        name: "set_cells".into(),
+        arguments: serde_json::json!({
+            "edits": [{"cell": "A1", "value": 99}]
+        }),
+    };
+    let _ = app.execute_ai_tool(&tc_set, &ctx);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(99.0));
+    assert!(
+        !app.wb.sheet(0).rich.contains_key(&(0, 0)),
+        "numeric overwrite must clear rich runs"
+    );
+
+    // 2) AI fill_formula_range overwrites B1 with =C1*2.
+    let tc_fill = crate::ai_agent::ToolCallSpec {
+        name: "fill_formula_range".into(),
+        arguments: serde_json::json!({
+            "range": "B1:B1",
+            "top_left_formula": "=C1*2"
+        }),
+    };
+    let _ = app.execute_ai_tool(&tc_fill, &ctx);
+    assert_eq!(app.wb.sheet(0).formula_of(0, 1), Some("C1*2"));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(20.0));
+    assert!(
+        !app.wb.sheet(0).rich.contains_key(&(0, 1)),
+        "formula overwrite must clear rich runs"
+    );
+
+    // 3) undo_last_ai_change restores exact text AND exact 2 RichRuns on both A1 and B1,
+    //    invalidating render caches cleanly.
+    app.cf_stats_gen = 55;
+    app.invalid_gen = 55;
+    app.undo_last_ai_change();
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("Revenue total".into()));
+    assert_eq!(app.wb.sheet(0).rich.get(&(0, 0)), Some(&a1_runs));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("Margin pct".into()));
+    assert_eq!(app.wb.sheet(0).formula_of(0, 1), None);
+    assert_eq!(app.wb.sheet(0).rich.get(&(0, 1)), Some(&b1_runs));
+    assert_eq!(app.cf_stats_gen, u64::MAX);
+    assert_eq!(app.invalid_gen, u64::MAX);
+
+    // 4) Redo clears rich runs and reapplies both AI writes.
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(99.0));
+    assert!(!app.wb.sheet(0).rich.contains_key(&(0, 0)));
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).formula_of(0, 1), Some("C1*2"));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(20.0));
+    assert!(!app.wb.sheet(0).rich.contains_key(&(0, 1)));
+
+    // 5) Undo again restores exact text AND exact RichRuns on both cells.
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Text("Margin pct".into()));
+    assert_eq!(app.wb.sheet(0).rich.get(&(0, 1)), Some(&b1_runs));
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_eq!(app.wb.sheet(0).value(0, 0), Value::Text("Revenue total".into()));
+    assert_eq!(app.wb.sheet(0).rich.get(&(0, 0)), Some(&a1_runs));
+}
+
+#[test]
+fn phase6_p2b_apply_undo_shares_post_mutation_cache_and_epoch_effects() {
+    let _env = crate::test_env::TestEnv::new("p6-p2b-apply-undo-effects");
+    let mut app = app();
+    app.wb.sheet_mut(0).set(0, 0, number(10.0));
+    app.wb.sheet_mut(0).rows.set(0, 52.0);
+    app.wb.sheet_mut(0).set(
+        0,
+        1,
+        Cell {
+            value: Value::Empty,
+            formula: Some("=A1*3".into()),
+        },
+    );
+    sheetcore::formula::recalc_all(&mut app.wb);
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(30.0));
+
+    let prime_caches_and_popups = |app: &mut SheetApp| {
+        app.wb.dirty = false;
+        app.tasks.last_edit = None;
+        app.cf_stats_gen = 77;
+        app.invalid_gen = 77;
+        let _ = app.view_axes();
+        assert!(app.view_axes_cache.borrow().is_some());
+        assert!(app.normal_page_breaks.base_axes.borrow().is_some());
+        app.normal_page_breaks.formula_bar = Some((
+            crate::grid_render_cache::FormulaBarKey {
+                sheet_id: app.wb.sheet(0).identity,
+                row: 0,
+                col: 0,
+                doc_gen: app.doc_gen,
+                wb_epoch: app.wb_epoch,
+                cells: app.wb.sheet(0).cell_version().clone(),
+                style_rev: app.wb.sheet(0).display_style_revision(),
+                protected: false,
+            },
+            std::sync::Arc::from("10"),
+        ));
+        app.pivot_ui.field_settings = Some(crate::pivot_ui::FieldSettingsPopup::Value {
+            pivot_id: 1,
+            val_idx: 0,
+            name_draft: "Sum".into(),
+            fmt_draft: String::new(),
+        });
+        app.pivot_ui.grid_filter = Some(crate::pivot_ui::PivotFilterPopupState {
+            pivot_id: 1,
+            target: sheetcore::pivot_engine::PivotFilterTarget::RowField(0),
+            anchor_pos: egui::pos2(0.0, 0.0),
+            search: String::new(),
+            items: Vec::new(),
+            top_n_input: String::new(),
+        });
+        app.pivot_ui.options_pivot_id = Some(1);
+    };
+
+    let assert_post_effects = |app: &SheetApp, prev_gen: u64, prev_epoch: u64, expect_epoch_bump: bool, expected_tall_row: u32, step: &str| {
+        assert!(app.wb.dirty, "{step}: wb.dirty must be true");
+        assert!(app.doc_gen > prev_gen, "{step}: doc_gen must increment");
+        assert!(app.tasks.last_edit.is_some(), "{step}: last_edit must be set");
+        let cur_epoch = app.wb.coord_epoch();
+        if expect_epoch_bump {
+            assert!(cur_epoch > prev_epoch, "{step}: coord_epoch must advance");
+        }
+        assert_eq!(
+            app.last_seen_coord_epoch, cur_epoch,
+            "{step}: last_seen_coord_epoch must match wb.coord_epoch()"
+        );
+        assert_eq!(app.cf_stats_gen, u64::MAX, "{step}: cf_stats_gen must invalidate");
+        assert_eq!(app.invalid_gen, u64::MAX, "{step}: invalid_gen must invalidate");
+        assert!(app.cf_cache.is_none(), "{step}: cf_cache must clear");
+        assert!(
+            app.normal_page_breaks.formula_bar.is_none(),
+            "{step}: formula_bar cache must clear"
+        );
+        assert!(
+            app.pivot_ui.field_settings.is_none(),
+            "{step}: pivot field_settings popup must clear"
+        );
+        assert!(
+            app.pivot_ui.grid_filter.is_none(),
+            "{step}: pivot grid_filter popup must clear"
+        );
+        assert!(
+            app.pivot_ui.options_pivot_id.is_none(),
+            "{step}: pivot options_pivot_id must clear"
+        );
+        // Layout cache must serve fresh post-mutation row heights (never stale pre-undo cache).
+        assert!(
+            (app.view_axes().1.size(expected_tall_row) - 52.0).abs() < 1e-4,
+            "{step}: view_axes must reflect live tall row at {expected_tall_row}"
+        );
+    };
+
+    // 1) Forward structural tx -> Undo -> Redo
+    prime_caches_and_popups(&mut app);
+    let g0 = app.doc_gen;
+    let e0 = app.wb.coord_epoch();
+    app.structural(sheetcore::structural::Structural::InsertRows { at: 0, n: 1 });
+    assert_post_effects(&app, g0, e0, true, 1, "forward structural");
+    assert_eq!(app.wb.sheet(0).formula_of(1, 1), Some("=A2*3"));
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(30.0));
+
+    prime_caches_and_popups(&mut app);
+    let g1 = app.doc_gen;
+    let e1 = app.wb.coord_epoch();
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_post_effects(&app, g1, e1, true, 0, "undo structural");
+    assert_eq!(app.wb.sheet(0).formula_of(0, 1), Some("=A1*3"));
+    assert_eq!(app.wb.sheet(0).value(0, 1), Value::Number(30.0));
+
+    prime_caches_and_popups(&mut app);
+    let g2 = app.doc_gen;
+    let e2 = app.wb.coord_epoch();
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_post_effects(&app, g2, e2, true, 1, "redo structural");
+    assert_eq!(app.wb.sheet(0).formula_of(1, 1), Some("=A2*3"));
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(30.0));
+
+    // 2) Non-structural CellBatch forward -> Undo -> Redo (recalc + cache + pivot popup cleanup)
+    prime_caches_and_popups(&mut app);
+    let g3 = app.doc_gen;
+    let e3 = app.wb.coord_epoch();
+    app.execute_cell_batch_tx(
+        sheetcore::tx::CellBatchIntent {
+            sheet: 0,
+            writes: vec![sheetcore::tx::CellWrite {
+                row: 1,
+                col: 0,
+                cell: Some(number(25.0)),
+                style: None,
+            }],
+        },
+        Some("更新 A2".into()),
+        (0, 1, 0),
+    )
+    .unwrap();
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(75.0));
+    assert!(app.doc_gen > g3 && app.wb.dirty && app.last_seen_coord_epoch == e3);
+
+    prime_caches_and_popups(&mut app);
+    let g4 = app.doc_gen;
+    assert!(app.apply_undo(false), "{}", app.status);
+    assert_post_effects(&app, g4, e3, false, 1, "undo cell batch");
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(30.0));
+
+    prime_caches_and_popups(&mut app);
+    let g5 = app.doc_gen;
+    assert!(app.apply_undo(true), "{}", app.status);
+    assert_post_effects(&app, g5, e3, false, 1, "redo cell batch");
+    assert_eq!(app.wb.sheet(0).value(1, 1), Value::Number(75.0));
+}
+
 
 
 

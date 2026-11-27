@@ -95,6 +95,7 @@ pub enum NetEvent {
     /// 结构改动历史（加入时补）
     StructuralHistory(Vec<(usize, sheetcore::structural::Structural)>),
     StructuralRejected(String),
+    CheckStructural { sheet: usize, op: sheetcore::structural::Structural, reply: Sender<Result<(), String>> },
     CheckCellShift { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, reply: Sender<Result<Arc<CellShiftPatch>, String>> },
     CellShiftCommitted { site: u32, id: u64, phase: CellShiftPhase, patch: Arc<CellShiftPatch>, first_ts: u64, seq: u64, snapshot: bool },
     CheckRoomTx { site: u32, phase: CellShiftPhase, patch: Arc<RoomTxPatch>, reply: Sender<Result<Arc<RoomTxPatch>, String>> },
@@ -2997,6 +2998,145 @@ fn permute_grid<T: Clone>(
     }
 }
 
+fn host_structural_tail_overflow(
+    baseline: &SharedBaseline,
+    state: &SharedGrid<Op>,
+    styles: &SharedStyles,
+    merges: &Mutex<Vec<(usize, u32, u32, u32, u32, bool)>>,
+    threads: &HostThreads,
+    wm: &Mutex<HostWatermark>,
+    sheet: usize,
+    op: &sheetcore::structural::Structural,
+) -> Option<String> {
+    use sheetcore::structural::{CellShiftConflict, Structural as S};
+    use sheetcore::sync::{MAX_COLS, MAX_ROWS, ValueWire};
+
+    let overflow = || Some(CellShiftConflict::Overflow.message().to_string());
+    let (is_row, at, n, limit) = match *op {
+        S::InsertRows { at, n } => (true, at, n, MAX_ROWS),
+        S::InsertCols { at, n } => (false, at, n, MAX_COLS),
+        S::DeleteRows { .. } | S::DeleteCols { .. } => return None,
+    };
+    if n == 0 {
+        return None;
+    }
+    if at >= limit || n > limit || at.saturating_add(n) > limit {
+        return overflow();
+    }
+    let first = at.max(limit - n);
+    let last_row = MAX_ROWS - 1;
+    let last_col = MAX_COLS - 1;
+
+    // 1. Live ops grid
+    let state_guard = lock_unpoison(state);
+    if is_row {
+        if state_guard
+            .range((sheet, first, 0)..=(sheet, last_row, last_col))
+            .any(|(_, op)| !matches!(op.value, ValueWire::Empty) || op.formula.is_some())
+        {
+            return overflow();
+        }
+    } else if state_guard
+        .range((sheet, 0, 0)..=(sheet, last_row, last_col))
+        .any(|(&(_, _, c), op)| {
+            c >= first && (!matches!(op.value, ValueWire::Empty) || op.formula.is_some())
+        })
+    {
+        return overflow();
+    }
+
+    // 2. Baseline workbook cells & explicit styles (respecting live blank overwrites)
+    if let Some(base) = lock_unpoison(baseline).as_ref()
+        && let Some(sh) = base.sheets.get(sheet)
+    {
+        let rect = if is_row {
+            (first, 0, last_row, last_col)
+        } else {
+            (0, first, last_row, last_col)
+        };
+        for (k, cell) in sh.iter_rect(rect) {
+            if cell.is_blank() {
+                continue;
+            }
+            let cleared = state_guard
+                .get(&(sheet, k.row, k.col))
+                .is_some_and(|op| matches!(op.value, ValueWire::Empty) && op.formula.is_none());
+            if !cleared {
+                return overflow();
+            }
+        }
+        if sh.styles.iter_rect(rect).next().is_some() {
+            return overflow();
+        }
+    }
+    drop(state_guard);
+
+    // 3. Live explicit cell styles
+    {
+        let styles_guard = lock_unpoison(styles);
+        let style_hit = if is_row {
+            styles_guard
+                .range((sheet, first, 0)..=(sheet, last_row, last_col))
+                .next()
+                .is_some()
+        } else {
+            styles_guard
+                .range((sheet, 0, 0)..=(sheet, last_row, last_col))
+                .any(|(&(_, _, c), _)| c >= first)
+        };
+        if style_hit {
+            return overflow();
+        }
+    }
+
+    // 4. Active merges
+    {
+        let mut active: BTreeSet<(u32, u32, u32, u32)> = BTreeSet::new();
+        for &(msh, r1, c1, r2, c2, on) in lock_unpoison(merges).iter() {
+            if msh == sheet {
+                if on {
+                    active.insert((r1, c1, r2, c2));
+                } else {
+                    active.remove(&(r1, c1, r2, c2));
+                }
+            }
+        }
+        if active
+            .iter()
+            .any(|&(_, _, r2, c2)| if is_row { r2 >= first } else { c2 >= first })
+        {
+            return overflow();
+        }
+    }
+
+    // 5. Comments / threads
+    if lock_unpoison(threads)
+        .keys()
+        .any(|&(s, r, c)| s == sheet && if is_row { r >= first } else { c >= first })
+    {
+        return overflow();
+    }
+
+    // 6. Axis default styles tracked in HostWatermark
+    {
+        let wm_guard = lock_unpoison(wm);
+        let axis_hit = if is_row {
+            wm_guard.axis_rows.get(&sheet).is_some_and(|m| {
+                m.range(first..).any(|(_, (st, _))| st.is_some())
+            })
+        } else {
+            wm_guard.axis_cols.get(&sheet).is_some_and(|m| {
+                m.range(first..).any(|(_, (st, _))| st.is_some())
+            })
+        };
+        if axis_hit {
+            return overflow();
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn permute_state(
     baseline: &SharedBaseline,
@@ -5084,6 +5224,25 @@ impl Net {
             self.finish_structure();
             return Err("协作连接已断开，结构修改尚未执行".into());
         }
+        if let (
+            Some(baseline),
+            Some(state),
+            Some(styles),
+            Some(merges),
+            Some(threads),
+            Some(wm),
+        ) = (
+            &self.host_baseline,
+            &self.state,
+            &self.host_styles,
+            &self.delta_merges,
+            &self.host_threads,
+            &self.host_watermark,
+        ) && let Some(reason) =
+            host_structural_tail_overflow(baseline, state, styles, merges, threads, wm, sheet, op)
+        {
+            return Err(reason);
+        }
         let queued = queue_room_change(&self.cmd,self.host_roster.as_ref().unwrap(),None,RoomChange::Message(message));
         if !queued { return Err("协作发送队列已关闭，结构修改尚未执行".into()); }
         if let (
@@ -6966,66 +7125,153 @@ fn host_initialized(
                                 if site != conn_site {
                                     continue;
                                 }
-                                let _order = room_order.lock().unwrap_or_else(|e| e.into_inner());
-                                if revision.is_some_and(|rev| {
-                                    structs.lock().unwrap_or_else(|e| e.into_inner()).get(rev..)
-                                        .is_none_or(|later| later.iter().any(|(s,_)| *s==sheet))
-                                }) {
-                                    let revision = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
-                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructureRevision { revision })));
-                                    let msg = Msg::StructuralRejected { reason: "工作表结构已变更，请重新执行插删操作".into() };
-                                    let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
-                                    continue;
-                                }
-                                expire_and_broadcast();
-                                let conflict = locks
-                                    .lock()
-                                    .unwrap()
-                                    .conflicts_structural(sheet, &op, conn_site, now_ms())
-                                    .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
-                                let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
-                                    let (row, col) = structural_anchor(&op);
-                                    (0, "工作表位置已变更".into(), row, col)
-                                }));
-                                if let Some((holder, holder_name, row, col)) = conflict {
-                                    if revision.is_some() {
-                                        let reason = if holder == 0 { format!("{holder_name}，请重新执行{}", op.label()) }
-                                            else { format!("{holder_name} 正在编辑 {}，宿主未执行{}",sheetcore::model::cell_name(row,col),op.label()) };
-                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructuralRejected { reason })));
-                                        continue;
+                                let mut attempts = 0usize;
+                                loop {
+                                    attempts += 1;
+                                    let mut order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                    if revision.is_some_and(|rev| {
+                                        structs.lock().unwrap_or_else(|e| e.into_inner()).get(rev..)
+                                            .is_none_or(|later| later.iter().any(|(s,_)| *s==sheet))
+                                    }) {
+                                        let revision = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructureRevision { revision })));
+                                        let msg = Msg::StructuralRejected { reason: "工作表结构已变更，请重新执行插删操作".into() };
+                                        let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(msg)));
+                                        break;
                                     }
-                                    let _ = cmd.send(Cmd::Deliver(
-                                        vec![tx.clone()],
-                                        RoomChange::Message(Msg::LockDeny {
-                                            site: conn_site,
-                                            sheet,
-                                            row,
-                                            col,
-                                            holder,
-                                            holder_name,
-                                        }),
-                                    ));
-                                    continue;
+                                    expire_and_broadcast();
+                                    let conflict = locks
+                                        .lock()
+                                        .unwrap()
+                                        .conflicts_structural(sheet, &op, conn_site, now_ms())
+                                        .map(|((r, c), h)| (h.site, h.name.clone(), r, c));
+                                    let conflict = conflict.or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                        let (row, col) = structural_anchor(&op);
+                                        (0, "工作表位置已变更".into(), row, col)
+                                    }));
+                                    if let Some((holder, holder_name, row, col)) = conflict {
+                                        if revision.is_some() {
+                                            let reason = if holder == 0 { format!("{holder_name}，请重新执行{}", op.label()) }
+                                                else { format!("{holder_name} 正在编辑 {}，宿主未执行{}",sheetcore::model::cell_name(row,col),op.label()) };
+                                            let _ = cmd.send(Cmd::Deliver(vec![tx.clone()],RoomChange::Message(Msg::StructuralRejected { reason })));
+                                            break;
+                                        }
+                                        let _ = cmd.send(Cmd::Deliver(
+                                            vec![tx.clone()],
+                                            RoomChange::Message(Msg::LockDeny {
+                                                site: conn_site,
+                                                sheet,
+                                                row,
+                                                col,
+                                                holder,
+                                                holder_name,
+                                            }),
+                                        ));
+                                        break;
+                                    }
+                                    if shift_host.has_app.load(Ordering::Acquire) {
+                                        let observed_wm = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).seq;
+                                        let observed_rev = structs.lock().unwrap_or_else(|e| e.into_inner()).len();
+                                        let (reply_tx, reply_rx) = channel();
+                                        if evt_tx
+                                            .send(NetEvent::CheckStructural {
+                                                sheet,
+                                                op: op.clone(),
+                                                reply: reply_tx,
+                                            })
+                                            .is_err()
+                                        {
+                                            let _ = cmd.send(Cmd::Deliver(
+                                                vec![tx.clone()],
+                                                RoomChange::Message(Msg::StructuralRejected { reason: "宿主已关闭".into() }),
+                                            ));
+                                            break;
+                                        }
+                                        drop(order);
+                                        let check_res = match reply_rx.recv_timeout(Duration::from_secs(12)) {
+                                            Ok(res) => res,
+                                            Err(_) => Err("宿主未能及时核对工作簿，请重试".into()),
+                                        };
+                                        if let Err(reason) = check_res {
+                                            let _ = cmd.send(Cmd::Deliver(
+                                                vec![tx.clone()],
+                                                RoomChange::Message(Msg::StructuralRejected { reason }),
+                                            ));
+                                            break;
+                                        }
+                                        order = room_order.lock().unwrap_or_else(|e| e.into_inner());
+                                        let rev_changed = structs.lock().unwrap_or_else(|e| e.into_inner()).len() != observed_rev;
+                                        let wm_changed = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).seq != observed_wm;
+                                        if rev_changed || wm_changed {
+                                            drop(order);
+                                            if attempts < 2 {
+                                                continue;
+                                            }
+                                            let _ = cmd.send(Cmd::Deliver(
+                                                vec![tx.clone()],
+                                                RoomChange::Message(Msg::StructuralRejected {
+                                                    reason: "核对期间工作簿已有新编辑，请重新执行插删操作".into(),
+                                                }),
+                                            ));
+                                            break;
+                                        }
+                                        expire_and_broadcast();
+                                        let post_conflict = locks
+                                            .lock()
+                                            .unwrap()
+                                            .conflicts_structural(sheet, &op, conn_site, now_ms())
+                                            .map(|((r, c), h)| (h.site, h.name.clone(), r, c))
+                                            .or_else(|| shift_host.needs_ack(conn_site, hello_conn_id).then(|| {
+                                                let (row, col) = structural_anchor(&op);
+                                                (0, "工作表位置已变更".into(), row, col)
+                                            }));
+                                        if let Some((holder, holder_name, row, col)) = post_conflict {
+                                            let reason = if holder == 0 {
+                                                format!("{holder_name}，请重新执行{}", op.label())
+                                            } else {
+                                                format!("{holder_name} 正在编辑 {}，宿主未执行{}", sheetcore::model::cell_name(row, col), op.label())
+                                            };
+                                            let _ = cmd.send(Cmd::Deliver(vec![tx.clone()], RoomChange::Message(Msg::StructuralRejected { reason })));
+                                            break;
+                                        }
+                                    } else if let Some(reason) = host_structural_tail_overflow(
+                                        &host_baseline,
+                                        &state,
+                                        &styles,
+                                        &delta_merges,
+                                        &host_threads,
+                                        &host_watermark,
+                                        sheet,
+                                        &op,
+                                    ) {
+                                        let _ = cmd.send(Cmd::Deliver(
+                                            vec![tx.clone()],
+                                            RoomChange::Message(Msg::StructuralRejected { reason }),
+                                        ));
+                                        break;
+                                    }
+                                    shift_state(&host_baseline, &formula_keys, &state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap_or_else(|e| e.into_inner()), sheet, &op);
+                                    shift_host_threads(&host_threads, sheet, &op);
+                                    let struct_rev = {
+                                        let mut h = structs.lock().unwrap_or_else(|e| e.into_inner());
+                                        h.push((sheet, op.clone()));
+                                        h.len()
+                                    };
+                                    let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).shift_structural(sheet, &op);
+                                    queue_room_change(&cmd, &roster, revision.is_none().then_some(conn_site), RoomChange::Message(Msg::Structural {
+                                        site: conn_site,
+                                        sheet,
+                                        op: op.clone(),
+                                    }));
+                                    emit_room_watermark(&cmd, &roster, seq, struct_rev);
+                                    let _ = evt_tx.send(NetEvent::Structural {
+                                        site: conn_site,
+                                        sheet,
+                                        op,
+                                    });
+                                    drop(order);
+                                    break;
                                 }
-                                shift_state(&host_baseline, &formula_keys, &state, &delta_ops, &host_base_hash, &styles, &delta_styles, &locks, &cursors, &sheet_names.lock().unwrap_or_else(|e| e.into_inner()), sheet, &op);
-                                shift_host_threads(&host_threads, sheet, &op);
-                                let struct_rev = {
-                                    let mut h = structs.lock().unwrap_or_else(|e| e.into_inner());
-                                    h.push((sheet, op.clone()));
-                                    h.len()
-                                };
-                                let seq = host_watermark.lock().unwrap_or_else(|e| e.into_inner()).shift_structural(sheet, &op);
-                                queue_room_change(&cmd, &roster, revision.is_none().then_some(conn_site), RoomChange::Message(Msg::Structural {
-                                    site: conn_site,
-                                    sheet,
-                                    op: op.clone(),
-                                }));
-                                emit_room_watermark(&cmd, &roster, seq, struct_rev);
-                                let _ = evt_tx.send(NetEvent::Structural {
-                                    site: conn_site,
-                                    sheet,
-                                    op,
-                                });
                             }
                             Msg::StylePaletteOp { site, sheet, ts, palette, items } => {
                                 let Some(conn_site) = hello_site else { break };

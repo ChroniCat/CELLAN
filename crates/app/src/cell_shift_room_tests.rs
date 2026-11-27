@@ -1688,5 +1688,687 @@ fn phase5_tx_room_tx_reconnect_receipt_clears_pending_structure() {
     });
 }
 
+fn seed_phase6_a1_rich_metadata_baseline(wb: &mut sheetcore::Workbook) {
+    use sheetcore::{
+        charts::{Chart, ChartKind, Series},
+        pivot::{Agg, GroupBy, PivotResult, PivotSpec},
+        protection::ProtectedRange,
+        scenarios::Scenario,
+        sort_filter::Filter,
+        sparkline::Sparkline,
+        table::Table,
+    };
+    let sh = wb.sheet_mut(0);
+    // Keep A1=2, A2=1 seeded by `sort_apps_with_baseline`; attach rich metadata matching A1:B2.
+    sh.tables.push(Table {
+        name: "Table1".into(),
+        display: "Table1".into(),
+        range: (0, 0, 1, 1),
+        columns: vec!["Item".into(), "Val".into()],
+        column_ids: vec![1, 2],
+        header_row: true,
+        totals_row: false,
+        ..Default::default()
+    });
+    sh.rows.set(0, 60.0);
+    sh.cols.set(0, 140.0);
+    sh.hidden_rows_user.insert(1);
+    sh.hidden_cols.insert(1);
+    sh.freeze = Some((1, 1));
+    sh.filter = Some(Filter::new(0, 0, 1, 1));
+    sh.protected_ranges
+        .push(ProtectedRange::new("EditA1B2", vec![(0, 0, 1, 1)], ""));
+    let mut sc = Scenario::new("BaseCase");
+    sc.cells = vec![((0, 0), "2".into()), ((1, 1), "42".into())];
+    sh.scenarios.push(sc);
+    sh.charts.push(Chart {
+        kind: ChartKind::Column,
+        title: "A1Chart".into(),
+        anchor: (0, 5, 8, 10),
+        source_range: "Sheet1!$A$1:$B$2".into(),
+        series: vec![Series {
+            name: "Val".into(),
+            val_ref: "Sheet1!$B$1:$B$2".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    sh.sparklines.push(Sparkline {
+        r: 0,
+        c: 4,
+        rect: (0, 1, 1, 1),
+        ..Default::default()
+    });
+    wb.pivots_pending.push((
+        0,
+        PivotSpec {
+            source: (0, 0, 1, 1),
+            row_field: 0,
+            col_field: None,
+            value_field: 1,
+            agg: Agg::Sum,
+            group: GroupBy::None,
+            exclude: Vec::new(),
+        },
+        PivotResult::default(),
+        (6, 0, 8, 1),
+        "PivotA1".into(),
+    ));
+}
+
+fn seed_phase6_a1_live_cells(host: &mut SheetApp, guest: &mut SheetApp) {
+    use sheetcore::{Cell, Value};
+    host.wb.sheet_mut(0).set(0, 1, Cell { value: Value::Number(100.0), formula: None });
+    host.wb.sheet_mut(0).set(1, 1, Cell { value: Value::Number(42.0), formula: None });
+    host.wb.sheet_mut(0).set(2, 0, Cell { value: Value::Number(3.0), formula: None });
+    host.wb.sheet_mut(0).set(2, 1, Cell { value: Value::Number(10.0), formula: None });
+    host.wb.sheet_mut(0).set(3, 0, Cell { value: Value::Number(4.0), formula: None });
+    host.wb.sheet_mut(0).set(3, 1, Cell { value: Value::Number(20.0), formula: None });
+    host.wb.sheet_mut(0).set(4, 0, Cell { value: Value::Empty, formula: Some("=B2+B3".into()) });
+    host.recalc_and_broadcast(&[
+        (0, 0, 1),
+        (0, 1, 1),
+        (0, 2, 0),
+        (0, 2, 1),
+        (0, 3, 0),
+        (0, 3, 1),
+        (0, 4, 0),
+    ]);
+    until(host, guest, |h, g| {
+        h.wb.sheet(0).value(4, 0) == Value::Number(52.0)
+            && g.wb.sheet(0).value(4, 0) == Value::Number(52.0)
+            && g.wb.sheet(0).value(3, 1) == Value::Number(20.0)
+    });
+}
+
+fn assert_phase6_a1_metadata_matches_host(host: &SheetApp, peer: &SheetApp, label: &str) {
+    let h = host.wb.sheet(0);
+    let p = peer.wb.sheet(0);
+    assert_eq!(p.tables, h.tables, "{label}: tables mismatch");
+    for r in 0..8u32 {
+        assert!(
+            (p.rows.size(r) - h.rows.size(r)).abs() < 1e-4,
+            "{label}: row {r} height mismatch (peer={}, host={})",
+            p.rows.size(r),
+            h.rows.size(r)
+        );
+    }
+    for c in 0..8u32 {
+        assert!(
+            (p.cols.size(c) - h.cols.size(c)).abs() < 1e-4,
+            "{label}: col {c} width mismatch (peer={}, host={})",
+            p.cols.size(c),
+            h.cols.size(c)
+        );
+    }
+    assert_eq!(p.hidden_rows, h.hidden_rows, "{label}: hidden_rows mismatch");
+    assert_eq!(
+        p.hidden_rows_user, h.hidden_rows_user,
+        "{label}: hidden_rows_user mismatch"
+    );
+    assert_eq!(p.hidden_cols, h.hidden_cols, "{label}: hidden_cols mismatch");
+    assert_eq!(p.freeze, h.freeze, "{label}: freeze mismatch");
+    assert_eq!(p.filter, h.filter, "{label}: filter mismatch");
+    assert_eq!(
+        p.protected_ranges, h.protected_ranges,
+        "{label}: protected_ranges mismatch"
+    );
+    assert_eq!(p.scenarios, h.scenarios, "{label}: scenarios mismatch");
+    assert_eq!(p.charts.len(), h.charts.len(), "{label}: charts len mismatch");
+    for (pc, hc) in p.charts.iter().zip(h.charts.iter()) {
+        assert_eq!(pc.anchor, hc.anchor, "{label}: chart anchor mismatch");
+        assert_eq!(pc.source_range, hc.source_range, "{label}: chart source_range mismatch");
+        assert_eq!(pc.series.len(), hc.series.len(), "{label}: chart series len mismatch");
+        for (ps, hs) in pc.series.iter().zip(hc.series.iter()) {
+            assert_eq!(ps.val_ref, hs.val_ref, "{label}: chart series val_ref mismatch");
+        }
+    }
+    assert_eq!(p.sparklines, h.sparklines, "{label}: sparklines mismatch");
+    assert_eq!(
+        peer.wb.pivots_pending.len(),
+        host.wb.pivots_pending.len(),
+        "{label}: pivots_pending len mismatch"
+    );
+    for (pp, hp) in peer.wb.pivots_pending.iter().zip(host.wb.pivots_pending.iter()) {
+        assert_eq!(pp.0, hp.0, "{label}: pivot sheet mismatch");
+        assert_eq!(pp.1.source, hp.1.source, "{label}: pivot source mismatch");
+        assert_eq!(pp.3, hp.3, "{label}: pivot output mismatch");
+        assert_eq!(pp.4, hp.4, "{label}: pivot name mismatch");
+    }
+    // Verify live layout cache on peer reflects updated heights/widths & hidden axes.
+    let (p_cols, p_rows) = peer.view_axes();
+    let (h_cols, h_rows) = host.view_axes();
+    for r in 0..8u32 {
+        assert!(
+            (p_rows.size(r) - h_rows.size(r)).abs() < 1e-4,
+            "{label}: view_axes row {r} mismatch"
+        );
+    }
+    for c in 0..8u32 {
+        assert!(
+            (p_cols.size(c) - h_cols.size(c)).abs() < 1e-4,
+            "{label}: view_axes col {c} mismatch"
+        );
+    }
+    for r in 0..6u32 {
+        for c in 0..6u32 {
+            assert_eq!(
+                p.value(r, c),
+                h.value(r, c),
+                "{label}: cell ({r},{c}) value mismatch"
+            );
+            assert_eq!(
+                p.formula_of(r, c),
+                h.formula_of(r, c),
+                "{label}: cell ({r},{c}) formula mismatch"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase6_a1_axis_permute_late_join_restores_all_metadata_row_and_col_moves() {
+    let env = crate::test_env::TestEnv::new("p6-a1-late-join-meta");
+    let (mut host, mut guest) = sort_apps_with_baseline(&env, seed_phase6_a1_rich_metadata_baseline);
+    seed_phase6_a1_live_cells(&mut host, &mut guest);
+
+    // 1) Row move: move rows 0..=1 before drop=4 -> Table1 A1:B2 moves to A3:B4, row 0 height 60 -> row 2.
+    assert!(guest.move_axis_headers(true, 0, 2, 4), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).tables.first().is_some_and(|t| t.range == (2, 0, 3, 1))
+            && g.wb.sheet(0).tables.first().is_some_and(|t| t.range == (2, 0, 3, 1))
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+    assert!((host.wb.sheet(0).rows.size(2) - 60.0).abs() < 1e-4);
+    assert!(host.wb.sheet(0).hidden_rows_user.contains(&3));
+    assert!(!host.wb.sheet(0).hidden_rows_user.contains(&1));
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "online-after-row-move");
+
+    // Third client joins from unsaved original disk baseline (host has NOT saved).
+    let mut late_row = late_join(&env, &guest, seed_phase6_a1_rich_metadata_baseline);
+    // Prime late_row's view_axes cache before snapshot completes to verify cache invalidation.
+    let _ = late_row.view_axes();
+    until(&mut host, &mut late_row, |_, l| {
+        l.joined_doc && !l.in_snapshot && l.shift_intro.applied_seq > 0
+    });
+    assert!(!late_row.snapshot_is_delta);
+    assert_eq!(late_row.wb.sheet(0).tables[0].range, (2, 0, 3, 1));
+    assert!((late_row.wb.sheet(0).rows.size(2) - 60.0).abs() < 1e-4);
+    assert_phase6_a1_metadata_matches_host(&host, &late_row, "late-join-after-row-move");
+
+    // 2) Column move: move cols 0..=1 before drop=4 -> Table1 A3:B4 moves to C3:D4, col 0 width 140 -> col 2.
+    let prev_seq = host.shift_intro.applied_seq;
+    assert!(guest.move_axis_headers(false, 0, 2, 4), "{}", guest.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.shift_intro.applied_seq > prev_seq
+            && g.shift_intro.applied_seq > prev_seq
+            && h.wb.sheet(0).tables[0].range == (2, 2, 3, 3)
+            && g.wb.sheet(0).tables[0].range == (2, 2, 3, 3)
+            && !g.net.as_ref().unwrap().pending_structure()
+    });
+    assert!((host.wb.sheet(0).cols.size(2) - 140.0).abs() < 1e-4);
+    assert!(host.wb.sheet(0).hidden_cols.contains(&3));
+    assert!(!host.wb.sheet(0).hidden_cols.contains(&1));
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "online-after-col-move");
+
+    // Another late joiner from unsaved disk baseline sees BOTH row + col moves across all metadata.
+    let mut late_col = {
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        app.wb.path = Some(env.path("late_col.xlsx"));
+        seed_phase6_a1_rich_metadata_baseline(&mut app.wb);
+        let addr = &guest.net.as_ref().unwrap().addr;
+        app.net = Some(crate::net::join(4, "LateCol".into(), "doc".into(), addr, "sort".into()).unwrap());
+        app.peer = Some(sheetcore::sync::Peer::new(4));
+        app.undo.set_site(4);
+        app
+    };
+    let _ = late_col.view_axes();
+    until(&mut host, &mut late_col, |_, l| {
+        l.joined_doc && !l.in_snapshot && l.shift_intro.applied_seq > prev_seq
+    });
+    assert_eq!(late_col.wb.sheet(0).tables[0].range, (2, 2, 3, 3));
+    assert!((late_col.wb.sheet(0).rows.size(2) - 60.0).abs() < 1e-4);
+    assert!((late_col.wb.sheet(0).cols.size(2) - 140.0).abs() < 1e-4);
+    assert_phase6_a1_metadata_matches_host(&host, &late_col, "late-join-after-row-and-col-move");
+}
+
+#[test]
+fn phase6_a1_axis_permute_reconnect_full_and_delta_converges_all_metadata() {
+    use sheetcore::{Cell, Value};
+    let env = crate::test_env::TestEnv::new("p6-a1-reconnect-meta");
+
+    // 1) Disconnected guest missing AxisPermute reconnecting via explicit full resync AND
+    //    via socket drop (delta-attempt handshake that safely upgrades to authoritative snapshot + overlay).
+    for force_full in [true, false] {
+        let (mut host, mut guest) =
+            sort_apps_with_baseline(&env, seed_phase6_a1_rich_metadata_baseline);
+        seed_phase6_a1_live_cells(&mut host, &mut guest);
+        // Prime guest layout cache & transient pivot popup to verify SnapshotDone invalidates both.
+        let _ = guest.view_axes();
+        guest.pivot_ui.options_pivot_id = Some(99);
+
+        if force_full {
+            guest.net.as_ref().unwrap().request_snapshot_resync();
+        } else {
+            guest.net.as_ref().unwrap().disconnect_socket_for_test();
+        }
+        until(&mut host, &mut guest, |_, g| g.room_lost);
+
+        // Host commits AxisPermute (rows 0..=1 -> rows 2..=3) while guest is offline.
+        assert!(host.move_axis_headers(true, 0, 2, 4), "{}", host.status);
+        until(&mut host, &mut guest, |h, _| {
+            h.wb.sheet(0).tables[0].range == (2, 0, 3, 1)
+                && !h.net.as_ref().unwrap().pending_structure()
+        });
+        let permute_seq = host.shift_intro.applied_seq;
+        assert!(permute_seq > 0);
+
+        until(&mut host, &mut guest, |_, g| {
+            g.joined_doc
+                && !g.in_snapshot
+                && !g.room_lost
+                && g.shift_intro.applied_seq >= permute_seq
+        });
+        assert!(
+            guest.pivot_ui.options_pivot_id.is_none(),
+            "SnapshotDone overlay must clear transient pivot popup (force_full={force_full})"
+        );
+        assert_eq!(guest.wb.sheet(0).tables[0].range, (2, 0, 3, 1));
+        assert!((guest.wb.sheet(0).rows.size(2) - 60.0).abs() < 1e-4);
+        assert_phase6_a1_metadata_matches_host(
+            &host,
+            &guest,
+            if force_full {
+                "missed-permute-full-resync"
+            } else {
+                "missed-permute-socket-drop-reconnect"
+            },
+        );
+    }
+
+    // 2) True delta snapshot reconnect (`snapshot_is_delta == true`) AFTER AxisPermute:
+    //    host edits a cell and changes row height & Table1 while guest is briefly disconnected;
+    //    guest resumes via delta snapshot + TxOverlay and converges cleanly.
+    let (mut host, mut guest) =
+        sort_apps_with_baseline(&env, seed_phase6_a1_rich_metadata_baseline);
+    seed_phase6_a1_live_cells(&mut host, &mut guest);
+    assert!(host.move_axis_headers(true, 0, 2, 4), "{}", host.status);
+    until(&mut host, &mut guest, |h, g| {
+        h.wb.sheet(0).tables[0].range == (2, 0, 3, 1)
+            && g.wb.sheet(0).tables[0].range == (2, 0, 3, 1)
+            && g.shift_intro.applied_seq == h.shift_intro.applied_seq
+            && g.shift_intro.applied_seq > 0
+    });
+    // Prime guest's cached view_axes at height 60.0.
+    assert!((guest.view_axes().1.size(2) - 60.0).abs() < 1e-4);
+
+    guest.net.as_ref().unwrap().disconnect_socket_for_test();
+    until(&mut host, &mut guest, |_, g| g.room_lost);
+
+    // Host mutates a cell + row 2 height to 85.0 + freeze pane while guest is disconnected.
+    host.wb.sheet_mut(0).set(
+        5,
+        0,
+        Cell {
+            value: Value::Number(555.0),
+            formula: None,
+        },
+    );
+    host.wb.sheet_mut(0).rows.set(2, 85.0);
+    host.wb.sheet_mut(0).freeze = Some((2, 1));
+    host.broadcast_cells(&[(0, 5, 0)]);
+
+    until(&mut host, &mut guest, |_, g| {
+        g.joined_doc
+            && !g.in_snapshot
+            && !g.room_lost
+            && g.wb.sheet(0).value(5, 0) == Value::Number(555.0)
+    });
+    assert!(
+        guest.snapshot_is_delta,
+        "post-permute brief disconnect must exercise true delta snapshot path"
+    );
+    assert!((guest.wb.sheet(0).rows.size(2) - 85.0).abs() < 1e-4);
+    assert!((guest.view_axes().1.size(2) - 85.0).abs() < 1e-4);
+    assert_eq!(guest.wb.sheet(0).freeze, Some((2, 1)));
+    assert_phase6_a1_metadata_matches_host(&host, &guest, "post-permute-true-delta-reconnect");
+}
+
+#[test]
+fn phase6_a3_whole_axis_insert_rejects_tail_overflow_solo_and_room() {
+    use sheetcore::{
+        cf::{CfBlock, CfKind, CfOp, CfRule, Dxf},
+        structural::{CellShiftConflict, Structural},
+        table::Table,
+        Cell, Value,
+    };
+    let env = crate::test_env::TestEnv::new("p6-a3-axis-overflow");
+
+    // --- Part 1: Solo UI structural insert overflow + valid table/full-axis CF ---
+    {
+        let mut app = SheetApp::new_with_context(&eframe::egui::Context::default(), None);
+        app.wb.sheets.push(sheetcore::model::Sheet::new("Sheet2"));
+        app.wb.sheet_mut(0).set(
+            1_048_575,
+            0,
+            Cell {
+                value: Value::Number(7.0),
+                formula: None,
+            },
+        );
+        app.wb.sheet_mut(1).set(
+            0,
+            0,
+            Cell {
+                value: Value::Empty,
+                formula: Some("=Sheet1!A1048576".into()),
+            },
+        );
+        // Full-axis CF rule (0..=1_048_575) must NOT falsely trigger overflow once tail cell is cleared.
+        app.wb.sheet_mut(0).cf.dxfs.push(Dxf::default());
+        app.wb.sheet_mut(0).cf.blocks.push(CfBlock {
+            ranges: vec![(0, 2, 1_048_575, 2)],
+            rules: vec![CfRule {
+                kind: CfKind::CellIs {
+                    op: CfOp::Greater,
+                    a: "0".into(),
+                    b: String::new(),
+                    dxf: 0,
+                },
+                stop: false,
+                priority: 1,
+            }],
+        });
+        app.wb.sheet_mut(0).tables.push(Table {
+            name: "Table1".into(),
+            display: "Table1".into(),
+            range: (0, 0, 1, 1),
+            columns: vec!["K".into(), "V".into()],
+            column_ids: vec![1, 2],
+            ..Default::default()
+        });
+        sheetcore::formula::recalc_all(&mut app.wb);
+        assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(7.0));
+        app.wb.dirty = false;
+
+        // 1a) Tail row A1048576 occupied -> InsertRows rejects cleanly and mutates nothing.
+        let epoch0 = app.wb.coord_epoch();
+        app.sheet_idx = 0;
+        app.structural(Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(app.status, CellShiftConflict::Overflow.message());
+        assert_eq!(app.wb.coord_epoch(), epoch0);
+        assert_eq!(app.undo.depth(), (0, 0));
+        assert!(!app.wb.dirty);
+        assert_eq!(app.wb.sheet(0).value(1_048_575, 0), Value::Number(7.0));
+        assert_eq!(
+            app.wb.sheet(1).formula_of(0, 0),
+            Some("=Sheet1!A1048576")
+        );
+        assert_eq!(app.wb.sheet(1).value(0, 0), Value::Number(7.0));
+        assert_eq!(app.wb.sheet(0).tables[0].range, (0, 0, 1, 1));
+
+        // 1b) Tail col XFD1 occupied -> InsertCols rejects cleanly and mutates nothing.
+        app.wb.sheet_mut(0).set(
+            0,
+            16_383,
+            Cell {
+                value: Value::Number(9.0),
+                formula: None,
+            },
+        );
+        app.wb.dirty = false;
+        app.structural(Structural::InsertCols { at: 0, n: 1 });
+        assert_eq!(app.status, CellShiftConflict::Overflow.message());
+        assert_eq!(app.wb.coord_epoch(), epoch0);
+        assert_eq!(app.undo.depth(), (0, 0));
+        assert!(!app.wb.dirty);
+        assert_eq!(app.wb.sheet(0).value(0, 16_383), Value::Number(9.0));
+
+        // 1c) Once A1048576 & XFD1 are cleared, whole-row InsertRows STILL succeeds with
+        //     full-axis CF rule (0..=1_048_575) and moves Table1 cleanly to A2:B3!
+        app.wb.sheet_mut(0).remove(1_048_575, 0);
+        app.wb.sheet_mut(0).remove(0, 16_383);
+        app.structural(Structural::InsertRows { at: 0, n: 1 });
+        assert!(app.wb.coord_epoch() > epoch0);
+        assert_eq!(app.undo.depth(), (1, 0));
+        assert_eq!(app.wb.sheet(0).tables[0].range, (1, 0, 2, 1));
+        assert_eq!(app.wb.sheet(0).cf.blocks[0].ranges, vec![(0, 2, 1_048_575, 2)]);
+    }
+
+    // --- Part 2: Room mode (host preflight + guest local preflight + host authoritative CheckStructural) ---
+    {
+        let baseline = |wb: &mut sheetcore::Workbook| {
+            wb.sheets.push(sheetcore::model::Sheet::new("Sheet2"));
+            wb.sheet_mut(0).cf.dxfs.push(Dxf::default());
+            wb.sheet_mut(0).cf.blocks.push(CfBlock {
+                ranges: vec![(0, 2, 1_048_575, 2)],
+                rules: vec![CfRule {
+                    kind: CfKind::CellIs {
+                        op: CfOp::Greater,
+                        a: "0".into(),
+                        b: String::new(),
+                        dxf: 0,
+                    },
+                    stop: false,
+                    priority: 1,
+                }],
+            });
+            wb.sheet_mut(0).tables.push(Table {
+                name: "Table1".into(),
+                display: "Table1".into(),
+                range: (0, 0, 1, 1),
+                columns: vec!["K".into(), "V".into()],
+                column_ids: vec![1, 2],
+                ..Default::default()
+            });
+        };
+        let (mut host, mut guest) = sort_apps_with_baseline(&env, baseline);
+
+        // Place A1048576 ONLY on host (simulating stale guest view) + cross-sheet ref on host.
+        host.wb.sheet_mut(0).set(
+            1_048_575,
+            0,
+            Cell {
+                value: Value::Number(7.0),
+                formula: None,
+            },
+        );
+        host.wb.sheet_mut(1).set(
+            0,
+            0,
+            Cell {
+                value: Value::Empty,
+                formula: Some("=Sheet1!A1048576".into()),
+            },
+        );
+        sheetcore::formula::recalc_all(&mut host.wb);
+
+        let host_epoch = host.wb.coord_epoch();
+        let guest_epoch = guest.wb.coord_epoch();
+        let host_undo = host.undo.depth();
+        let guest_undo = guest.undo.depth();
+
+        // 2a) Host local structural rejects BEFORE broadcasting.
+        host.sheet_idx = 0;
+        host.structural(Structural::InsertRows { at: 0, n: 1 });
+        assert_eq!(host.status, CellShiftConflict::Overflow.message());
+        assert_eq!(host.wb.coord_epoch(), host_epoch);
+        assert_eq!(host.undo.depth(), host_undo);
+        assert_eq!(host.net.as_ref().unwrap().structure_seen(), 0);
+
+        // 2b) Stale guest sends InsertRows request -> Room Host rejects via CheckStructural + StructuralRejected!
+        guest.sheet_idx = 0;
+        guest.structural(Structural::InsertRows { at: 0, n: 1 });
+        assert!(guest.net.as_ref().unwrap().pending_structure());
+        until(&mut host, &mut guest, |_, g| {
+            !g.net.as_ref().unwrap().pending_structure()
+        });
+        assert_eq!(guest.status, CellShiftConflict::Overflow.message());
+        assert_eq!(host.wb.coord_epoch(), host_epoch);
+        assert_eq!(guest.wb.coord_epoch(), guest_epoch);
+        assert_eq!(host.undo.depth(), host_undo);
+        assert_eq!(guest.undo.depth(), guest_undo);
+        assert_eq!(host.net.as_ref().unwrap().structure_seen(), 0);
+        assert_eq!(guest.net.as_ref().unwrap().structure_seen(), 0);
+        assert_eq!(host.wb.sheet(0).value(1_048_575, 0), Value::Number(7.0));
+        assert_eq!(
+            host.wb.sheet(1).formula_of(0, 0),
+            Some("=Sheet1!A1048576")
+        );
+
+        // 2c) Same authoritative host rejection for XFD1 on InsertCols.
+        host.wb.sheet_mut(0).remove(1_048_575, 0);
+        host.wb.sheet_mut(0).set(
+            0,
+            16_383,
+            Cell {
+                value: Value::Number(9.0),
+                formula: None,
+            },
+        );
+        guest.structural(Structural::InsertCols { at: 0, n: 1 });
+        assert!(guest.net.as_ref().unwrap().pending_structure());
+        until(&mut host, &mut guest, |_, g| {
+            !g.net.as_ref().unwrap().pending_structure()
+        });
+        assert_eq!(guest.status, CellShiftConflict::Overflow.message());
+        assert_eq!(host.wb.coord_epoch(), host_epoch);
+        assert_eq!(guest.wb.coord_epoch(), guest_epoch);
+        assert_eq!(host.wb.sheet(0).value(0, 16_383), Value::Number(9.0));
+
+        // 2d) Once XFD1 is cleared, guest whole-row InsertRows succeeds across host & guest,
+        //     moving Table1 to A2:B3 even with full-axis CF rule present!
+        host.wb.sheet_mut(0).remove(0, 16_383);
+        guest.structural(Structural::InsertRows { at: 0, n: 1 });
+        until(&mut host, &mut guest, |h, g| {
+            h.wb.sheet(0).tables[0].range == (1, 0, 2, 1)
+                && g.wb.sheet(0).tables[0].range == (1, 0, 2, 1)
+                && !g.net.as_ref().unwrap().pending_structure()
+        });
+        assert_eq!(host.wb.sheet(0).value(1, 0), Value::Number(2.0));
+        assert_eq!(guest.wb.sheet(0).value(1, 0), Value::Number(2.0));
+    }
+}
+
+#[test]
+fn phase6_p2a_cancelled_offline_edits_preserved_in_local_conflict_draft() {
+    use sheetcore::{Cell, Value};
+    use std::time::Duration;
+
+    let env = crate::test_env::TestEnv::new("p6-p2a-conflict-draft");
+    let (mut host, mut guest) = sort_apps(&env);
+    let room_id = guest.net.as_ref().unwrap().connected_room_id();
+    let red = [235, 30, 30];
+
+    guest.net.as_ref().unwrap().disconnect_socket_for_test();
+    until(&mut host, &mut guest, |_, g| g.room_lost);
+
+    // Make offline unacknowledged edits: numeric cell + formula cell + style + merge.
+    let val_cell = Cell {
+        value: Value::Number(77.0),
+        formula: None,
+    };
+    let formula_cell = Cell {
+        value: Value::Number(4.0),
+        formula: Some("=A1*2".into()),
+    };
+    let _ = guest.peer.as_mut().unwrap().local_set(0, 6, 1, &val_cell);
+    guest.wb.sheet_mut(0).set(6, 1, val_cell);
+    let _ = guest.peer.as_mut().unwrap().local_set(0, 6, 2, &formula_cell);
+    guest.wb.sheet_mut(0).set(6, 2, formula_cell);
+    guest.sel = (6, 1);
+    guest.sel_end = (6, 1);
+    assert!(guest.apply_style_xy(move |st, _, _| st.fill = Some(red)));
+    guest.sel = (7, 1);
+    guest.sel_end = (7, 2);
+    guest.toggle_merge(true);
+
+    // Host commits partial CellShift advancing coordinate epoch while guest is offline.
+    host.sel = (1, 0);
+    host.sel_end = (1, 0);
+    host.shift_cells(true, false);
+    until(&mut host, &mut guest, |h, _| {
+        h.wb.sheet(0).value(2, 0) == Value::Number(1.0) && h.shift_intro.applied_seq > 0
+    });
+
+    until(&mut host, &mut guest, |_, g| {
+        g.joined_doc
+            && !g.in_snapshot
+            && !g.room_lost
+            && g.shift_intro.applied_seq > 0
+            && g.status.contains("已取消断线前未确认")
+    });
+    for _ in 0..10 {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 1) Offline edits were NOT replayed to old coordinates on host or guest.
+    for app in [&host, &guest] {
+        let sh = app.wb.sheet(0);
+        assert_eq!(sh.value(6, 1), Value::Empty);
+        assert_eq!(sh.value(6, 2), Value::Empty);
+        assert_eq!(sh.formula_of(6, 2), None);
+        assert_ne!(app.wb.styles.get(sh.style_of(6, 1)).fill, Some(red));
+        assert!(!sh.merges.contains(&(7, 1, 7, 2)));
+    }
+    assert!(
+        guest.status.contains("工作表坐标已改变")
+            && guest.status.contains("已取消")
+            && guest.status.contains("本地冲突草稿"),
+        "unexpected status: {}",
+        guest.status
+    );
+
+    // 2) Cancelled offline edits are preserved & deduplicated in `cancelled_offline_drafts`.
+    assert_eq!(guest.cancelled_offline_drafts.len(), 3);
+    let b7 = guest
+        .cancelled_offline_drafts
+        .iter()
+        .find(|d| (d.sheet, d.row, d.col, d.merge_rect) == (0, 6, 1, None))
+        .expect("missing B7 value+style draft");
+    assert_eq!(b7.room_id, room_id);
+    assert_eq!(b7.sheet_name, "Sheet1");
+    assert_eq!(b7.value_display, "77");
+    assert_eq!(b7.formula, None);
+    assert!(b7.style_changed);
+
+    let c7 = guest
+        .cancelled_offline_drafts
+        .iter()
+        .find(|d| (d.sheet, d.row, d.col, d.merge_rect) == (0, 6, 2, None))
+        .expect("missing C7 formula draft");
+    assert_eq!(c7.sheet_name, "Sheet1");
+    assert_eq!(c7.formula.as_deref(), Some("=A1*2"));
+    assert!(!c7.style_changed);
+
+    let m = guest
+        .cancelled_offline_drafts
+        .iter()
+        .find(|d| d.merge_rect == Some((7, 1, 7, 2)))
+        .expect("missing B8:C8 merge draft");
+    assert_eq!((m.sheet, m.row, m.col), (0, 7, 1));
+
+    // 3) TSV export & clipboard copy work cleanly.
+    let tsv = guest.export_cancelled_offline_drafts_tsv();
+    let lines: Vec<&str> = tsv.lines().collect();
+    assert_eq!(lines.len(), 4, "header + 3 drafts: {tsv}");
+    assert!(lines[0].contains("工作表\t单元格\t原值\t公式"));
+    assert!(tsv.contains("Sheet1\tB7\t77\t\t是\t\t工作表坐标已改变"), "{tsv}");
+    assert!(tsv.contains("Sheet1\tC7\t4\t=A1*2\t否\t\t工作表坐标已改变"), "{tsv}");
+    assert!(tsv.contains("B8:C8"), "{tsv}");
+
+    crate::clipboard::clear_test_clipboard();
+    assert!(guest.copy_cancelled_offline_drafts_to_clipboard());
+    assert_eq!(crate::clipboard::read_system_clip().text, tsv);
+
+    // 4) Switching / opening a new document tab clears cancelled_offline_drafts.
+    guest.open_in_new_tab(std::path::PathBuf::new());
+    assert!(guest.cancelled_offline_drafts.is_empty());
+    assert!(guest.export_cancelled_offline_drafts_tsv().is_empty());
+}
+
+
 
 

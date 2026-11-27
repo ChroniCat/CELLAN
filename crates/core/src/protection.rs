@@ -476,7 +476,7 @@ pub fn parse_workbook_tag(xml: &str) -> Option<WorkbookProtection> {
 }
 
 /// 工作表允许用户编辑的区域（OOXML `<protectedRanges><protectedRange .../></protectedRanges>`）
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProtectedRange {
     pub title: String,
     pub sqref: Vec<(u32, u32, u32, u32)>,

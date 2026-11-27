@@ -1865,3 +1865,189 @@ fn workbook_coord_epoch_advances_monotonically_across_all_coord_and_sheet_ops() 
     );
     assert_eq!(wb.coord_epoch(), last_epoch);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 A2: CellBatch Reversible Rich Text (`RichRun`) Capture & Guarded Replay
+// ---------------------------------------------------------------------------
+
+fn sample_rich_runs() -> Vec<RichRun> {
+    let mut bold = RichRun::plain("total");
+    bold.bold = true;
+    vec![RichRun::plain("Revenue "), bold]
+}
+
+#[test]
+fn cell_batch_rich_text_undo_redo_all_transitions_and_conflict_guards() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].name = "Finance".into();
+    let runs = sample_rich_runs();
+
+    // Seed 6 rich cells to test every transition in one deterministic workbook:
+    // (0,0): rich text -> number 99 (exact peer-review A2 repro)
+    // (1,0): rich text -> formula "=1+1"
+    // (2,0): rich text -> different text "Other label"
+    // (3,0): rich text -> cleared/blank
+    // (4,0): rich text -> same text "Revenue total" (runs MUST be preserved!)
+    // (5,0): rich text -> style-only edit (runs MUST be preserved!)
+    for r in 0..6u32 {
+        wb.sheets[0].set(r, 0, txt("Revenue total"));
+        wb.sheets[0].rich.insert((r, 0), runs.clone());
+    }
+    wb.sheets[0].rich_dirty = false;
+
+    let mut undo = UndoStack::new();
+    let commit = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::CellBatch(CellBatchIntent {
+            sheet: 0,
+            writes: vec![
+                CellWrite::cell(0, 0, num(99.0)),
+                CellWrite::cell(1, 0, fml("=1+1")),
+                CellWrite::cell(2, 0, txt("Other label")),
+                CellWrite::cell(3, 0, Cell::default()),
+                CellWrite::cell(4, 0, txt("Revenue total")),
+                CellWrite::style(5, 0, 4),
+            ],
+        }),
+        (0, 0, 0),
+    )
+    .expect("CellBatch over rich cells must succeed");
+
+    // Verify only the 4 cells whose rich runs actually changed were captured in `rich`.
+    match &commit.delta {
+        TxDelta::CellBatch { rich, .. } => {
+            assert_eq!(rich.len(), 4, "only cleared rich cells should be recorded");
+            for r in 0..4u32 {
+                assert!(
+                    rich.iter()
+                        .any(|&(pos, ref before, ref after)| pos == (r, 0)
+                            && before.as_ref() == Some(&runs)
+                            && after.is_none()),
+                    "missing rich capture for row {r}"
+                );
+            }
+        }
+        other => panic!("expected TxDelta::CellBatch, got {other:?}"),
+    }
+    assert!(!commit.delta.is_empty());
+
+    // Immediate post-execute state: rows 0..4 stripped, rows 4..6 preserved!
+    for r in 0..4u32 {
+        assert!(!wb.sheets[0].rich.contains_key(&(r, 0)), "row {r} rich should be stripped");
+    }
+    assert_eq!(wb.sheets[0].rich.get(&(4, 0)), Some(&runs));
+    assert_eq!(wb.sheets[0].rich.get(&(5, 0)), Some(&runs));
+    assert_eq!(wb.sheets[0].style_of(5, 0), 4);
+
+    assert!(undo.push_tx(commit) > 0);
+    assert_eq!(undo.depth(), (1, 0));
+
+    // 1. Full Undo restores ALL 4 rich texts + original text + style on row 5!
+    wb.sheets[0].rich_dirty = false;
+    let rev_before_undo = wb.sheets[0].display_style_revision();
+    let undone = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(undone.skipped, 0);
+    assert!(wb.sheets[0].rich_dirty);
+    assert!(wb.sheets[0].display_style_revision() > rev_before_undo);
+    for r in 0..6u32 {
+        assert_eq!(wb.sheets[0].value(r, 0), Value::Text("Revenue total".into()));
+        assert!(wb.sheets[0].formula_of(r, 0).is_none());
+        assert_eq!(
+            wb.sheets[0].rich.get(&(r, 0)),
+            Some(&runs),
+            "row {r} must restore exact 2 RichRuns on undo"
+        );
+    }
+    assert_eq!(wb.sheets[0].style_of(5, 0), 0);
+
+    // 2. Full Redo re-applies edits, strips rows 0..4 rich, keeps rows 4..6 rich, marks rich_dirty!
+    wb.sheets[0].rich_dirty = false;
+    let rev_before_redo = wb.sheets[0].display_style_revision();
+    let redone = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(redone.skipped, 0);
+    assert!(wb.sheets[0].rich_dirty);
+    assert!(wb.sheets[0].display_style_revision() > rev_before_redo);
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Number(99.0));
+    assert_eq!(wb.sheets[0].formula_of(1, 0), Some("=1+1"));
+    assert_eq!(wb.sheets[0].value(2, 0), Value::Text("Other label".into()));
+    assert!(wb.sheets[0].get(3, 0).is_none());
+    for r in 0..4u32 {
+        assert!(!wb.sheets[0].rich.contains_key(&(r, 0)));
+    }
+    assert_eq!(wb.sheets[0].rich.get(&(4, 0)), Some(&runs));
+    assert_eq!(wb.sheets[0].rich.get(&(5, 0)), Some(&runs));
+    assert_eq!(wb.sheets[0].style_of(5, 0), 4);
+
+    // 3. Conflict guards on Undo:
+    //    - Row 0: peer overwrote A1 with new rich text ("Peer edit" italic) -> CAS skips row 0, preserves peer's cell AND rich!
+    //    - Row 1: custom guard closure rejects (1, 0) -> skipped, preserves "=1+1" and no rich!
+    //    - Row 2: peer kept value "Other label" but attached new rich runs -> rich CAS detects conflict and preserves peer's rich!
+    //    - Row 3: untouched -> undone cleanly and restores original rich text!
+    let mut peer_run = RichRun::plain("Peer edit");
+    peer_run.italic = true;
+    wb.sheets[0].set(0, 0, txt("Peer edit"));
+    wb.sheets[0].rich.insert((0, 0), vec![peer_run.clone()]);
+    let mut peer_label_run = RichRun::plain("Other label");
+    peer_label_run.underline = true;
+    wb.sheets[0].rich.insert((2, 0), vec![peer_label_run.clone()]);
+
+    let guarded = undo
+        .undo_workbook(&mut wb, |_, r, c, _| !(r == 1 && c == 0))
+        .unwrap();
+    assert_eq!(guarded.skipped, 3);
+    // Peer edits on rows 0, 1, 2 preserved untouched!
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("Peer edit".into()));
+    assert_eq!(wb.sheets[0].rich.get(&(0, 0)), Some(&vec![peer_run]));
+    assert_eq!(wb.sheets[0].formula_of(1, 0), Some("=1+1"));
+    assert!(!wb.sheets[0].rich.contains_key(&(1, 0)));
+    assert_eq!(wb.sheets[0].value(2, 0), Value::Text("Other label".into()));
+    assert_eq!(wb.sheets[0].rich.get(&(2, 0)), Some(&vec![peer_label_run]));
+    // Non-conflicted row 3 restored completely!
+    assert_eq!(wb.sheets[0].value(3, 0), Value::Text("Revenue total".into()));
+    assert_eq!(wb.sheets[0].rich.get(&(3, 0)), Some(&runs));
+
+    // Redo replays only the non-excluded cells (row 3 cleared again, rows 0..3 untouched).
+    let redone2 = undo.redo_workbook(&mut wb, allow_all).unwrap();
+    assert_eq!(redone2.skipped, 0);
+    assert!(wb.sheets[0].get(3, 0).is_none());
+    assert!(!wb.sheets[0].rich.contains_key(&(3, 0)));
+    assert_eq!(wb.sheets[0].value(0, 0), Value::Text("Peer edit".into()));
+}
+
+#[test]
+fn structural_undo_succeeds_after_cell_batch_style_undo_on_row_styled_cell() {
+    let mut wb = Workbook::new_blank();
+    wb.sheets[0].set_row_style(5, 1);
+    wb.sheets[0].set(10, 0, num(42.0));
+    assert_eq!(wb.sheets[0].explicit_style_of(5, 0), None);
+    assert_eq!(wb.sheets[0].style_of(5, 0), 1);
+
+    let mut undo = UndoStack::new();
+    let c1 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_structural(0, &Structural::InsertRows { at: 9, n: 1 }),
+        (0, 9, 0),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c1) > 0);
+    assert_eq!(wb.sheets[0].value(11, 0), Value::Number(42.0));
+
+    let c2 = WorkbookTx::execute(
+        &mut wb,
+        TxIntent::from_cell_batch(0, vec![CellWrite::style(5, 0, 2)]),
+        (0, 5, 0),
+    )
+    .unwrap();
+    assert!(undo.push_tx(c2) > 0);
+    assert_eq!(wb.sheets[0].style_of(5, 0), 2);
+
+    // Undo CellBatch leaves an explicit `(5, 0) -> 1` matching inherited `row_styles[5] = 1`.
+    assert!(undo.undo_workbook(&mut wb, allow_all).is_some());
+    assert_eq!(wb.sheets[0].style_of(5, 0), 1);
+
+    // Undoing the earlier structural InsertRows MUST succeed cleanly instead of jamming!
+    let undone_struct = undo.undo_workbook(&mut wb, allow_all).unwrap();
+    assert!(undone_struct.structural);
+    assert_eq!(wb.sheets[0].value(10, 0), Value::Number(42.0));
+    assert_eq!(wb.sheets[0].style_of(5, 0), 1);
+}
