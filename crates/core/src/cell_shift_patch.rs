@@ -320,6 +320,10 @@ fn valid_defined_name(name: &str, scope: Option<usize>) -> bool {
         && scope.is_none_or(|index| index < crate::sync::MAX_SHEET_INDEX)
 }
 
+fn valid_name_formula(text: &str) -> bool {
+    text.len() <= crate::sync::MAX_THREAD_ENTRY_TEXT_BYTES
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SourceChange {
     name: String,
@@ -360,13 +364,23 @@ impl CellShiftPatch {
         self.sheet
     }
 
-    fn operation(&self) -> CellShift {
+    pub fn operation(&self) -> CellShift {
         let direction = if self.horizontal {
             crate::cells::Shift::Horizontal
         } else {
             crate::cells::Shift::Vertical
         };
         CellShift::new(self.rect, direction, self.insert)
+    }
+
+    pub fn referenced_sheets(&self) -> Vec<usize> {
+        let mut sheets = BTreeSet::new();
+        sheets.insert(self.sheet);
+        sheets.extend(self.cells.iter().map(|c| c.sheet));
+        sheets.extend(self.cf.iter().map(|c| c.sheet));
+        sheets.extend(self.dv.iter().map(|c| c.sheet));
+        sheets.extend(self.names.iter().filter_map(|n| n.scope));
+        sheets.into_iter().collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -426,7 +440,16 @@ impl CellShiftPatch {
                         .chain(&c.after.ranges)
                         .all(valid_rect)
             })
-            && self.names.iter().all(|n| valid_defined_name(&n.name, n.scope))
+            && {
+                let mut seen = std::collections::HashSet::with_capacity(self.names.len());
+                self.names.iter().all(|n| {
+                    valid_defined_name(&n.name, n.scope)
+                        && n.before != n.after
+                        && valid_name_formula(&n.before)
+                        && valid_name_formula(&n.after)
+                        && seen.insert((n.scope, n.name.as_str()))
+                })
+            }
             && self
                 .sources
                 .iter()
@@ -434,10 +457,8 @@ impl CellShiftPatch {
     }
 
     pub fn prepare(wb: &Workbook, sheet: usize, op: CellShift) -> Option<Self> {
-        let a = wb.sheets.get(sheet)?;
-        if op.would_overflow(a) {
-            return None;
-        }
+        op.preflight(wb, sheet).ok()?;
+        let a = &wb.sheets[sheet];
         // Only the target has moving cell metadata. Formula rewriting on other
         // sheets needs their shared cell storage and conditional/validation rules.
         let mut result = Workbook {
@@ -468,6 +489,25 @@ impl CellShiftPatch {
         if !op.apply(&mut result, sheet) {
             return None;
         }
+        let mut name_counts: HashMap<(Option<usize>, &str), usize> =
+            HashMap::with_capacity(wb.names.len());
+        for (name, scope, _) in &wb.names {
+            *name_counts.entry((*scope, name.as_str())).or_insert(0) += 1;
+        }
+        let mut names = Vec::new();
+        for ((name, scope, before), (_, _, after)) in wb.names.iter().zip(&result.names) {
+            if shared_name(name) && before != after {
+                if name_counts.get(&(*scope, name.as_str())).copied().unwrap_or(0) != 1 {
+                    return None;
+                }
+                names.push(NameChange {
+                    name: name.clone(),
+                    scope: *scope,
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+            }
+        }
         let b = &result.sheets[sheet];
         let mut patch = Self {
             sheet,
@@ -488,11 +528,7 @@ impl CellShiftPatch {
             cf: Vec::new(),
             dv: Vec::new(),
             sources: Vec::new(),
-            names: wb.names.iter().zip(&result.names)
-                .filter(|((name, _, before), (_, _, after))| shared_name(name) && before != after)
-                .map(|((name, scope, before), (_, _, after))| NameChange {
-                    name: name.clone(), scope: *scope, before: before.clone(), after: after.clone(),
-                }).collect(),
+            names,
             merge_history: MergeHistory::default(),
         };
         if a.merges != b.merges {
@@ -570,7 +606,10 @@ impl CellShiftPatch {
                     });
                 }
             }
-            if idx == sheet || patch.entries() != prior_entries {
+            if idx == sheet
+                || patch.entries() != prior_entries
+                || patch.names.iter().any(|n| n.scope == Some(idx))
+            {
                 patch.sheet_names.push((idx, a.name.clone()));
             }
         }
@@ -583,7 +622,7 @@ impl CellShiftPatch {
                 });
             }
         }
-        patch.wire_valid().then_some(patch)
+        patch.can_install(wb).then_some(patch)
     }
 
     /// Recompute on the authoritative document before accepting a guest's first request.
@@ -608,15 +647,31 @@ impl CellShiftPatch {
             return None;
         }
         // A guest joining without the base file may only know a subset of names.
-        let host_names: HashMap<_, _> = canonical.names.iter().map(|n| ((n.scope, &n.name), n)).collect();
-        if self.names.iter().any(|n| host_names.get(&(n.scope, &n.name)) != Some(&n)) {
+        let host_names: HashMap<_, _> = canonical
+            .names
+            .iter()
+            .map(|n| ((n.scope, &n.name), n))
+            .collect();
+        if self.names.len() > host_names.len()
+            || self
+                .names
+                .iter()
+                .any(|n| host_names.get(&(n.scope, &n.name)) != Some(&n))
+        {
             return None;
         }
+        let expected_sheet_names = self
+            .referenced_sheets()
+            .into_iter()
+            .map(|idx| wb.sheets.get(idx).map(|s| (idx, s.name.clone())))
+            .collect::<Option<Vec<_>>>()?;
+        let sheet_names = std::mem::replace(&mut canonical.sheet_names, expected_sheet_names);
         let names = std::mem::replace(&mut canonical.names, self.names.clone());
         let sources = std::mem::replace(&mut canonical.sources, self.sources.clone());
         if canonical != *self {
             return None;
         }
+        canonical.sheet_names = sheet_names;
         canonical.sources = sources;
         canonical.names = names;
         Some(canonical)
@@ -657,11 +712,54 @@ impl CellShiftPatch {
         self.matches_document(wb, forward, true)
     }
 
+    fn effective_operation(&self, forward: bool) -> CellShift {
+        let direction = if self.horizontal {
+            crate::cells::Shift::Horizontal
+        } else {
+            crate::cells::Shift::Vertical
+        };
+        CellShift::new(self.rect, direction, self.insert == forward)
+    }
+
+    fn merges_complete(&self, sheet: &Sheet, effective_op: CellShift, forward: bool) -> bool {
+        let Some(mut expected) = effective_op.shifted_merges(&sheet.merges) else {
+            return false;
+        };
+        let mut actual_merges = sheet.merges.clone();
+        self.merge_history
+            .install_merges(&mut actual_merges, &self.merges, forward);
+        let mut actual = actual_merges.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if self.insert || forward {
+            return expected == actual;
+        }
+        // Undoing a delete (`!self.insert && !forward`): `actual` must contain
+        // `expected` plus only deleted merges restored wholly inside `self.rect`.
+        let (r1, c1, r2, c2) = self.rect;
+        let inside_deleted_rect = |m: Rect| m.0 >= r1 && m.2 <= r2 && m.1 >= c1 && m.3 <= c2;
+        let mut ei = 0;
+        for m in actual {
+            if ei < expected.len() && expected[ei] == m {
+                ei += 1;
+            } else if !inside_deleted_rect(m) {
+                return false;
+            }
+        }
+        ei == expected.len()
+    }
+
     fn matches_document(&self, wb: &Workbook, forward: bool, allow_missing_sources: bool) -> bool {
         if !self.can_install(wb) {
             return false;
         }
         let sheet = &wb.sheets[self.sheet];
+        let effective_op = self.effective_operation(forward);
+        if effective_op.preflight_merges(sheet).is_err()
+            || effective_op.preflight_objects(wb, self.sheet).is_err()
+        {
+            return false;
+        }
         let rich_changes: BTreeSet<_> = self.rich.iter().map(|p| (p.row, p.col)).collect();
         let cells_match = self.cells.iter().all(|c| {
             let sh = &wb.sheets[c.sheet];
@@ -686,7 +784,9 @@ impl CellShiftPatch {
         {
             return false;
         }
-        if !self.merge_history.matches(sheet, &self.merges, forward) {
+        if !self.merge_history.matches(sheet, &self.merges, forward)
+            || !self.merges_complete(sheet, effective_op, forward)
+        {
             return false;
         }
         self.cf
@@ -701,17 +801,35 @@ impl CellShiftPatch {
     }
 
     fn names_match(&self, wb: &Workbook, forward: bool, allow_missing: bool) -> bool {
-        let mut expected: HashMap<_, _> = self.names.iter().map(|n| ((n.scope, n.name.as_str()), n)).collect();
+        let mut expected: HashMap<_, _> = self
+            .names
+            .iter()
+            .map(|n| ((n.scope, n.name.as_str()), n))
+            .collect();
+        let mut matched = std::collections::HashSet::with_capacity(expected.len());
         let mut shift = self.operation().reference_shift();
         shift.target_sheet.clone_from(&wb.sheets[self.sheet].name);
-        if !forward { shift.delete = !shift.delete; }
+        if !forward {
+            shift.delete = !shift.delete;
+        }
         for (name, scope, text) in &wb.names {
-            if let Some(delta) = expected.remove(&(*scope, name.as_str())) {
-                if text != pick(&delta.before, &delta.after, !forward) { return false; }
+            let key = (*scope, name.as_str());
+            if matched.contains(&key) {
+                return false;
+            }
+            if let Some(delta) = expected.remove(&key) {
+                if text != pick(&delta.before, &delta.after, !forward) {
+                    return false;
+                }
+                matched.insert(key);
             } else if shared_name(name) {
                 shift.own_sheet.clear();
-                if let Some(sh) = scope.and_then(|i| wb.sheets.get(i)) { shift.own_sheet.push_str(&sh.name); }
-                if crate::refs::rewrite(text, &shift) != *text { return false; }
+                if let Some(sh) = scope.and_then(|i| wb.sheets.get(i)) {
+                    shift.own_sheet.push_str(&sh.name);
+                }
+                if crate::refs::rewrite(text, &shift) != *text {
+                    return false;
+                }
             }
         }
         allow_missing || expected.is_empty()

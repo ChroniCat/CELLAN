@@ -104,21 +104,20 @@ impl MergeHistory {
         )
     }
 
-    pub(super) fn install(
+    pub(super) fn install_merges(
         &self,
-        sh: &mut Sheet,
+        merges: &mut Merges,
         items: &[ShiftPoint<Option<Rect>>],
         forward: bool,
     ) {
         if let Some((a, b)) = &self.overlapping {
-            sh.merges = pick(a, b, forward).clone().into();
+            *merges = pick(a, b, forward).clone().into();
         } else {
             if items.is_empty() {
                 return;
             }
             let changed: BTreeSet<_> = items.iter().map(|p| (p.row, p.col)).collect();
-            let mut kept = sh
-                .merges
+            let mut kept = merges
                 .iter()
                 .copied()
                 .filter(|r| !changed.contains(&(r.0, r.1)));
@@ -133,14 +132,23 @@ impl MergeHistory {
                 })
                 .collect();
             place.sort_unstable_by_key(|(i, _)| *i);
-            let mut out = Vec::with_capacity(sh.merges.len());
+            let mut out = Vec::with_capacity(merges.len());
             for (i, r) in place {
                 out.extend((&mut kept).take(i.saturating_sub(out.len())));
                 out.push(r);
             }
             out.extend(kept);
-            sh.merges = out.into();
+            *merges = out.into();
         }
+    }
+
+    pub(super) fn install(
+        &self,
+        sh: &mut Sheet,
+        items: &[ShiftPoint<Option<Rect>>],
+        forward: bool,
+    ) {
+        self.install_merges(&mut sh.merges, items, forward);
         sh.merges_dirty = true;
     }
 }

@@ -2360,7 +2360,7 @@ pub fn snapshot_cell_shift(wb: &Workbook, sheet: usize, op: &crate::structural::
 /// Ordinary cell/formula/style edits need only sparse cell deltas. Avoid cloning
 /// sheet and workbook state when none of the metadata a partial shift can change exists.
 pub fn snapshot_cell_shift_if_metadata(wb: &Workbook, sheet: usize, op: &crate::structural::CellShift) -> Option<StructureSnapshot> {
-    let target = &wb.sheets[sheet];
+    let target = wb.sheets.get(sheet)?;
     let has_metadata = !target.notes.is_empty() || !target.threads.is_empty() || !target.merges.is_empty()
         || !target.rich.is_empty() || !target.hyperlinks.is_empty() || !wb.sources.is_empty() || !wb.names.is_empty()
         || wb.sheets.iter().any(|sh| !sh.cf.blocks.is_empty() || !sh.dv.is_empty());
@@ -3186,9 +3186,11 @@ impl UndoStack {
     pub fn push_room_cell_shift(&mut self, transaction: u64, patch: std::sync::Arc<crate::cell_shift_patch::CellShiftPatch>, wb: &Workbook) {
         let mut bytes = CountBytes(0);
         let _ = serde_json::to_writer(&mut bytes, &*patch);
-        let indices: std::collections::BTreeSet<_> = std::iter::once(patch.target_sheet())
-            .chain(patch.cells.iter().map(|c| c.sheet)).collect();
-        let sheet_ids = indices.into_iter().map(|i| (i, wb.sheets[i].identity)).collect();
+        let sheet_ids = patch
+            .referenced_sheets()
+            .into_iter()
+            .filter_map(|i| wb.sheets.get(i).map(|s| (i, s.identity)))
+            .collect();
         self.done.push(Entry::RoomCellShift(next_entry(bytes.0), RoomCellShiftAction {
             transaction, patch, sheet_ids, ownership_conflict: false, site: self.site,
         }));

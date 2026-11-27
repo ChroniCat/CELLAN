@@ -171,8 +171,11 @@ impl CellShiftOverlay {
                 .sum::<u64>()
                 <= crate::sync::MAX_BATCH_ITEMS as u64
             && count + self.sources.len() + self.names.len() <= crate::sync::MAX_BATCH_ITEMS
-            && self.names.iter().all(|(n, scope, _)| valid_defined_name(n, *scope)
-                && scope.is_none_or(|i| i < self.sheets.len()))
+            && self.names.iter().all(|(n, scope, text)| {
+                valid_defined_name(n, *scope)
+                    && super::valid_name_formula(text)
+                    && scope.is_none_or(|i| i < self.sheets.len())
+            })
             && self.sheets.iter().all(|s| {
                 s.name.len() <= crate::sync::MAX_SHORT_TEXT
                     && s.styles.valid(self.palette.len())

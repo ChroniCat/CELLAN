@@ -307,7 +307,11 @@ fn parse_row_ref(b: &[u8], start: usize, sh: &AxisMapper, qualified: Option<&str
     if b.get(i).is_some_and(|c| is_ident_byte(*c) || *c == b'$' || *c == b'!') {
         return None;
     }
-    if !shift_applies(sh, qualified) || (sh.translate.is_none() && sh.axis != Axis::Row) {
+    if !shift_applies(sh, qualified)
+        || (sh.translate.is_none()
+            && (sh.axis != Axis::Row
+                || sh.col_filter.is_some_and(|(a, b)| a > 0 || b < crate::sync::MAX_COLS - 1)))
+    {
         return Some(unchanged_ref(b, start, i));
     }
     let mapped = match sh.translate {
@@ -372,7 +376,9 @@ fn parse_ref(b: &[u8], start: usize, sh: &AxisMapper, qualified_sheet: Option<&s
                     return None;
                 }
                 if let (Some(c1), Some(c2)) = (col_index(letters), col_index(&b[ls2..j])) {
-                    if (sh.translate.is_none() && sh.axis != Axis::Col)
+                    if (sh.translate.is_none()
+                        && (sh.axis != Axis::Col
+                            || sh.row_filter.is_some_and(|(a, b)| a > 0 || b < crate::sync::MAX_ROWS - 1)))
                         || !shift_applies(sh, qualified_sheet)
                     {
                         return Some(unchanged_ref(b, start, j));
@@ -440,7 +446,7 @@ fn parse_ref(b: &[u8], start: usize, sh: &AxisMapper, qualified_sheet: Option<&s
                     return Some(unchanged_ref(b, start, j));
                 }
                 let none2 = (None::<u32>, None::<u32>);
-                if !allowed(sh, r1, c1) && !allowed(sh, r2, c2) {
+                if sh.translate.is_none() && (!allowed(sh, r1, c1) || !allowed(sh, r2, c2)) {
                     return Some(unchanged_ref(b, start, j));
                 }
                 let (p1, p2) = if sh.translate.is_some() {

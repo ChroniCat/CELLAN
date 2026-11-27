@@ -188,6 +188,7 @@ fn room_shift_replays_all_metadata_styles_and_foreign_references_atomically() {
 #[test]
 fn room_shift_reconnect_uses_current_metadata_local_source_path_and_local_values() {
     let mut host = fixture();
+    host.sheets[0].merges.clear();
     // A partial cut across the destination footprint detaches this source.
     let op = CellShift::new((0, 1, 0, 1), Shift::Horizontal, true);
     let patch = CellShiftPatch::prepare(&host, 0, op).unwrap();
