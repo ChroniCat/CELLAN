@@ -50126,9 +50126,15 @@ impl eframe::App for SheetApp {
                     Vec2::new(96.0, 24.0),
                 );
                 let name_hot = ui.rect_contains_pointer(nb);
-                if name_hot || self.name_edit || self.name_dropdown || fx_pal.theme == theme::AppTheme::HighContrast {
+                let name_active = self.name_edit || self.name_dropdown || fx_pal.theme == theme::AppTheme::HighContrast;
+                let name_hov_t = ui_kit::anim_hover(ctx, egui::Id::new("name_box_hov"), name_hot && !name_active);
+                if name_active {
                     let stroke = if self.name_edit { fx_pal.accent } else { fx_pal.card_border };
                     painter.rect(nb, 4.0, fx_pal.card_bg, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+                } else if name_hov_t > 0.01 {
+                    let fill = ui_kit::lerp_color(Color32::TRANSPARENT, fx_pal.card_bg, name_hov_t);
+                    let stroke = ui_kit::lerp_color(Color32::TRANSPARENT, fx_pal.card_border, name_hov_t);
+                    painter.rect(nb, 4.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
                 }
                 let inner = Rect::from_min_max(
                     nb.min + Vec2::new(6.0, 2.0),
@@ -50261,12 +50267,21 @@ impl eframe::App for SheetApp {
                         egui::Id::new(("fxbtn", *kind)),
                         if active { Sense::click() } else { Sense::hover() },
                     );
-                    if resp.hovered() && active {
-                        painter.rect_filled(b, 4.0, fx_pal.hover);
+                    let hov_t = ui_kit::anim_hover(ctx, resp.id.with("hov"), active && resp.hovered());
+                    let bg = if active && resp.is_pointer_button_down_on() {
+                        fx_pal.pressed
+                    } else {
+                        ui_kit::lerp_color(Color32::TRANSPARENT, fx_pal.hover, hov_t)
+                    };
+                    if bg != Color32::TRANSPARENT {
+                        painter.rect_filled(b, 4.0, bg);
                     }
-                    let col = if !active { fx_pal.text_muted }
-                        else if resp.hovered() && *kind == "cancel" { fx_pal.err_fg }
-                        else if resp.hovered() { fx_pal.accent } else { fx_pal.text_weak };
+                    let hot_col = if *kind == "cancel" { fx_pal.err_fg } else { fx_pal.accent };
+                    let col = if !active {
+                        fx_pal.text_muted
+                    } else {
+                        ui_kit::lerp_color(fx_pal.text_weak, hot_col, hov_t)
+                    };
                     let cc = b.center();
                     let st = Stroke::new(1.2, col);
                     match *kind {
@@ -50300,11 +50315,17 @@ impl eframe::App for SheetApp {
                     Vec2::new(24.0, 24.0),
                 );
                 let cresp = ui.interact(chev, egui::Id::new("fx_expand"), Sense::click());
-                if cresp.hovered() {
-                    painter.rect_filled(chev, 3.0, fx_pal.hover);
+                let exp_hov = ui_kit::anim_hover(ctx, cresp.id.with("hov"), cresp.hovered());
+                let exp_bg = if cresp.is_pointer_button_down_on() {
+                    fx_pal.pressed
+                } else {
+                    ui_kit::lerp_color(Color32::TRANSPARENT, fx_pal.hover, exp_hov)
+                };
+                if exp_bg != Color32::TRANSPARENT {
+                    painter.rect_filled(chev, 4.0, exp_bg);
                 }
                 let cc = chev.center();
-                let cst = Stroke::new(1.1, fx_pal.text_weak);
+                let cst = Stroke::new(1.1, ui_kit::lerp_color(fx_pal.text_weak, fx_pal.text, exp_hov));
                 if self.fx_expanded {
                     painter.line_segment([egui::pos2(cc.x - 4.0, cc.y + 2.0), egui::pos2(cc.x, cc.y - 2.0)], cst);
                     painter.line_segment([egui::pos2(cc.x, cc.y - 2.0), egui::pos2(cc.x + 4.0, cc.y + 2.0)], cst);

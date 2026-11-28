@@ -327,6 +327,7 @@ fn command_groups(app: &mut SheetApp, ui: &mut egui::Ui) {
     ui_kit::set_group_pad(if mid_tier || app.ribbon_compact { 5.0 } else { 8.0 });
     let panel_log = crate::debug_flags::panel_log();
     let mut used = 0.0f32;
+    let mut collapsed_started = false;
     let mut i = 0usize;
     while i < tab.groups.len() {
         let g = &tab.groups[i];
@@ -366,6 +367,20 @@ fn command_groups(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
         // 给「更多 ▾」预留 60pt：不留的话最后会画到裁切区外（760×420 实测溢出 11px）
         if known.is_some() && used + w + reserve > avail && used > 0.0 {
+            if !collapsed_started {
+                let pal = crate::theme::palette();
+                let center = ui.cursor().top() + ui_kit::RIBBON_BODY_H * 0.5;
+                let sep_x = ui.cursor().left();
+                if ui.clip_rect().right() - sep_x >= 62.0 {
+                    ui.painter().vline(
+                        sep_x,
+                        (center - 17.0)..=(center + 17.0),
+                        egui::Stroke::new(crate::tokens::stroke::HAIR, pal.chrome_separator()),
+                    );
+                    ui.add_space(6.0);
+                }
+                collapsed_started = true;
+            }
             if avail - used >= 92.0 {
                 menu_chevron(ui, &g.label, |ui| {
                     nodes(app, ui, rc, &g.children);
@@ -390,8 +405,8 @@ fn command_groups(app: &mut SheetApp, ui: &mut egui::Ui) {
                 more(ui);
             } else {
                 let rect = egui::Rect::from_min_size(
-                    egui::pos2((clip.right() - 58.0).max(clip.left()), ui.cursor().min.y),
-                    egui::Vec2::new(56.0, 22.0),
+                    egui::pos2((clip.right() - 58.0).max(clip.left()), ui.cursor().min.y + 16.0),
+                    egui::Vec2::new(56.0, 24.0),
                 );
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| more(ui));
             }
@@ -570,6 +585,8 @@ fn group_compact(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, 
     let mut leaves = Vec::new();
     compact_leaves(&g.children, &mut leaves);
     let cols = if leaves.len() >= 6 { 4 } else { 3 };
+    let rows_count = leaves.len().div_ceil(cols);
+    let (pad_top, row_gap) = if rows_count <= 2 { (10.0, 8.0) } else { (0.0, 2.0) };
     let body = |app: &mut SheetApp, ui: &mut egui::Ui| {
         ui.allocate_ui_with_layout(
             Vec2::new(w, 76.0),
@@ -577,6 +594,10 @@ fn group_compact(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, 
             |ui| {
                 ui.set_width(w);
                 ui.set_max_width(w);
+                ui.spacing_mut().item_spacing.y = row_gap;
+                if pad_top > 0.0 {
+                    ui.add_space(pad_top);
+                }
                 for row in leaves.chunks(cols) {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
@@ -2541,7 +2562,9 @@ fn gallery(
 /// 所以文字后面留空，再手画一个和「单元格样式」下拉同款的 V 形箭头。
 fn menu_chevron(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     let mut bounds = ui.available_rect_before_wrap();
-    bounds.min.y += 12.0;
+    if bounds.height() >= 48.0 {
+        bounds.min.y += 16.0;
+    }
     bounds.max.y = bounds.top() + 24.0;
     let mut row = ui.new_child(egui::UiBuilder::new().id_salt("collapsed_groups").max_rect(bounds)
         .layout(egui::Layout::left_to_right(egui::Align::Center)));

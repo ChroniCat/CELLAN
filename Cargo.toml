@@ -1,9 +1,9 @@
-﻿[workspace]
+[workspace]
 members = ["crates/core", "crates/app"]
 resolver = "2"
 
 [workspace.package]
-version = "1.85.0"
+version = "1.86.0"
 edition = "2024"
 license = "MIT"
 description = "CELLAN — Concurrent Engine for Local-first, Lock-free Async Networks"

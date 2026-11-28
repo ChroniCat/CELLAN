@@ -906,13 +906,13 @@ pub fn big_sized_galley(
     let col = if enabled { txt_col } else { disabled_color(pal) };
     let icon_size = 30.0_f32.min(size.y - 26.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 7.0 + icon_size / 2.0),
+        egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
     ui_icons::draw_control(ui, icon_rect, icon, col, enabled);
     if let Some(g) = galley {
         let pos = Align2::CENTER_CENTER
-            .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 12.0), g.size())
+            .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 15.0), g.size())
             .min;
         ui.painter().galley(pos, g, col);
     }
@@ -979,13 +979,13 @@ pub fn big_sized_split_galley(
     let col = if enabled { txt_col } else { disabled_color(pal) };
     let icon_size = 28.0_f32.min(size.y - 28.0).max(16.0);
     let icon_rect = Rect::from_center_size(
-        egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
+        egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
         Vec2::splat(icon_size),
     );
     ui_icons::draw_control(ui, icon_rect, icon, col, enabled);
     if let Some(g) = galley {
         let pos = Align2::CENTER_CENTER
-            .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 21.0), g.size())
+            .anchor_size(egui::pos2(rect.center().x, rect.bottom() - 24.0), g.size())
             .min;
         ui.painter().galley(pos, g, col);
     }
@@ -994,15 +994,15 @@ pub fn big_sized_split_galley(
     if sep_col != Color32::TRANSPARENT {
         ui.painter().line_segment(
             [
-                egui::pos2(rect.left() + 4.0, rect.bottom() - 13.5),
-                egui::pos2(rect.right() - 4.0, rect.bottom() - 13.5),
+                egui::pos2(rect.left() + 4.0, rect.bottom() - 15.0),
+                egui::pos2(rect.right() - 4.0, rect.bottom() - 15.0),
             ],
             Stroke::new(1.0, sep_col),
         );
     }
     caret(
         ui,
-        egui::pos2(rect.center().x, rect.bottom() - 7.0),
+        egui::pos2(rect.center().x, rect.bottom() - 8.5),
         if enabled { pal.text_weak } else { disabled_color(pal) },
     );
     (resp, aresp)

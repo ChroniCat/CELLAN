@@ -765,13 +765,19 @@ pub(crate) fn render_markdown(
                     for span in parse_inlines(text) {
                         match span {
                             InlineSpan::Code(code) => {
+                                let (code_bg, code_fg) =
+                                    if pal.theme == crate::theme::AppTheme::HighContrast {
+                                        (pal.surface_subtle(), pal.accent)
+                                    } else {
+                                        (pal.hover, pal.brand_ink())
+                                    };
                                 let code_fmt = TextFormat {
                                     font_id: FontId::new(
                                         (h_size - 1.0).max(12.0),
                                         FontFamily::Monospace,
                                     ),
-                                    color: pal.brand_ink(),
-                                    background: pal.hover,
+                                    color: code_fg,
+                                    background: code_bg,
                                     line_height: Some(line_height_for(h_size)),
                                     ..Default::default()
                                 };
@@ -1068,7 +1074,7 @@ fn render_table(
                     sw: 0,
                     se: 0,
                 })
-                .inner_margin(egui::Margin::symmetric(0, 4))
+                .inner_margin(egui::Margin::symmetric(0, 5))
                 .show(ui, |ui| {
                     ui.set_width(inner_w);
                     paint_table_row(ui, headers, alignments, &col_ws, true, pal);
@@ -1079,7 +1085,7 @@ fn render_table(
                 let (sep_r, _) = ui.allocate_exact_size(Vec2::new(inner_w, 1.0), Sense::hover());
                 ui.painter().rect_filled(sep_r, 0.0, pal.chrome_separator());
                 egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(0, 4))
+                    .inner_margin(egui::Margin::symmetric(0, 5))
                     .show(ui, |ui| {
                         ui.set_width(inner_w);
                         paint_table_row(ui, row, alignments, &col_ws, false, pal);
@@ -1111,9 +1117,9 @@ fn paint_table_row(
                 egui::Layout::top_down(layout_align),
                 |ui| {
                     egui::Frame::NONE
-                        .inner_margin(egui::Margin::symmetric(6, 0))
+                        .inner_margin(egui::Margin::symmetric(8, 0))
                         .show(ui, |ui| {
-                            let content_w = (cw - 12.0).max(20.0);
+                            let content_w = (cw - 16.0).max(20.0);
                             if is_header {
                                 let mut job = LayoutJob::default();
                                 job.wrap.max_width = content_w;
