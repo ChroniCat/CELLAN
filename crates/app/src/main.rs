@@ -9526,11 +9526,16 @@ impl SheetApp {
         // Submit after the field has processed every text event from this frame.
         let submit = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
         let mut run = None;
+        let pal_card_id = egui::Id::new("cmd_palette_card");
+        let pal_enter = ui_kit::anim_enter(ctx, pal_card_id);
+        let pal_scrim = ui_kit::lerp_color(Color32::TRANSPARENT, pal.dialog_scrim, pal_enter);
         egui::Area::new(egui::Id::new("cmd_palette_backdrop"))
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                ui.painter().rect_filled(screen, 0.0, pal.dialog_scrim);
+                if pal_scrim != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(screen, 0.0, pal_scrim);
+                }
                 if ui
                     .interact(screen, egui::Id::new("cmd_palette_bg_click"), Sense::click())
                     .clicked()
@@ -9538,9 +9543,9 @@ impl SheetApp {
                     dismiss = true;
                 }
             });
-        egui::Area::new(egui::Id::new("cmd_palette_card"))
+        egui::Area::new(pal_card_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(px, py))
+            .fixed_pos(egui::pos2(px, py + (1.0 - pal_enter) * 3.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(pal.dialog_bg)
@@ -9686,12 +9691,18 @@ impl SheetApp {
                                         Vec2::new(ui.available_width(), row_height),
                                         Sense::click(),
                                     );
-                                    if selected || resp.hovered() {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            5.0,
-                                            if selected { selected_fill } else { pal.hover },
-                                        );
+                                    let row_hov = ui_kit::anim_hover(
+                                        ui.ctx(),
+                                        resp.id.with(("cp_hov", index)),
+                                        !selected && resp.hovered(),
+                                    );
+                                    let row_bg = if selected {
+                                        selected_fill
+                                    } else {
+                                        ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, row_hov)
+                                    };
+                                    if row_bg != Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(rect, 5.0, row_bg);
                                     }
                                     if selected {
                                         let pill = Rect::from_center_size(
@@ -44996,6 +45007,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             let r = ui.interact(row, egui::Id::new(("home_nav", kind)), Sense::click());
             let active = kind == 0;
             ui_kit::a11y_name(&r, label, true, Some(active));
+            let nav_hov = ui_kit::anim_hover(ui.ctx(), r.id.with("hov"), !active && r.hovered());
             if active {
                 if is_hc {
                     p.rect_filled(row, 8.0, selected_fill);
@@ -45013,8 +45025,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                     Vec2::new(2.5, 16.0),
                 );
                 p.rect_filled(pill, 1.25, if is_hc { selected_ink } else { pal.accent });
-            } else if r.hovered() {
-                p.rect_filled(row, 8.0, pal.hover_on_page);
+            } else {
+                let bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, nav_hov);
+                if bg != Color32::TRANSPARENT {
+                    p.rect_filled(row, 8.0, bg);
+                }
             }
             if r.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -45025,10 +45040,8 @@ fn elide(s: &str, max_chars: usize) -> String {
             );
             let ic_col = if active {
                 if is_hc { selected_ink } else { pal.accent }
-            } else if r.hovered() {
-                pal.text
             } else {
-                pal.text_weak
+                ui_kit::lerp_color(pal.text_weak, pal.text, nav_hov)
             };
             match kind {
                 3 => ui_icons::draw_mono(&p, ir, Icon::AiSparkle, ic_col),
@@ -45080,15 +45093,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                 Vec2::new(rail_w - 24.0, 38.0),
             );
             let rb = ui.interact(back_card, egui::Id::new("home_nav_return"), Sense::click());
+            let rb_hov = ui_kit::anim_hover(ui.ctx(), rb.id.with("hov"), rb.hovered());
             p.rect(
                 back_card,
                 8.0,
-                if rb.hovered() {
-                    pal.accent_tint
-                } else {
-                    pal.card_bg
-                },
-                Stroke::new(1.0, if rb.hovered() { pal.accent } else { pal.card_border }),
+                ui_kit::lerp_color(pal.card_bg, pal.accent_tint, rb_hov),
+                Stroke::new(1.0, ui_kit::lerp_color(pal.card_border, pal.accent, rb_hov)),
                 egui::StrokeKind::Inside,
             );
             if rb.hovered() {
@@ -45121,14 +45131,11 @@ fn elide(s: &str, max_chars: usize) -> String {
             Vec2::new(rail_w - 24.0, 40.0),
         );
         let rf = ui.interact(foot_card, egui::Id::new("home_rail_about"), Sense::click());
+        let rf_hov = ui_kit::anim_hover(ui.ctx(), rf.id.with("hov"), rf.hovered());
         p.rect(
             foot_card,
             8.0,
-            if rf.hovered() {
-                pal.card_bg
-            } else {
-                pal.page_bg
-            },
+            ui_kit::lerp_color(pal.page_bg, pal.card_bg, rf_hov),
             egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
@@ -45210,16 +45217,22 @@ fn elide(s: &str, max_chars: usize) -> String {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             ui_kit::a11y_name(&r, title, true, None);
+            let card_hov = ui_kit::anim_toggle(ui.ctx(), id.with("card_hov"), r.hovered());
             if compact_cards {
                 let icon = [Icon::NewFile, Icon::Open, Icon::AiSparkle, Icon::Share][*kind];
                 let ink = if *kind == 0 { pal.accent } else { pal.text };
-                p.rect(card, 6.0, if r.hovered() { pal.hover } else { pal.card_bg },
-                    Stroke::new(1.0, if r.hovered() { pal.accent } else { pal.card_border }), egui::StrokeKind::Inside);
+                p.rect(
+                    card,
+                    6.0,
+                    ui_kit::lerp_color(pal.card_bg, pal.hover, card_hov),
+                    Stroke::new(1.0, ui_kit::lerp_color(pal.card_border, pal.accent, card_hov)),
+                    egui::StrokeKind::Inside,
+                );
                 ui_icons::draw_mono(&p, Rect::from_center_size(card.left_center() + Vec2::new(19.0, 0.0), Vec2::splat(16.0)), icon, ink);
                 let label = Rect::from_min_max(card.min + Vec2::new(34.0, 0.0), card.max - Vec2::new(6.0, 0.0));
                 paint_fitted_label(&p, label, title, ui_kit::medium_in(ui.ctx(), 12.0), pal.text);
             } else {
-                Self::paint_home_quick_card(&p, *kind, card, title, r.hovered());
+                Self::paint_home_quick_card(&p, *kind, card, title, card_hov);
             }
             ui_kit::focus_ring(ui, &r, card, 6.0);
             if r.clicked() {
@@ -45295,8 +45308,12 @@ fn elide(s: &str, max_chars: usize) -> String {
             let pr_resp = ui.interact(pr_r, egui::Id::new("home_prune_recent"), Sense::click());
             ui_kit::a11y_name(&pr_resp, "清理失效", true, None);
             ui_kit::focus_ring(ui, &pr_resp, pr_r, 4.0);
+            let pr_hov = ui_kit::anim_hover(ui.ctx(), pr_resp.id.with("hov"), pr_resp.hovered());
+            let pr_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, pr_hov);
+            if pr_bg != Color32::TRANSPARENT {
+                p.rect_filled(pr_r, 4.0, pr_bg);
+            }
             if pr_resp.hovered() {
-                p.rect_filled(pr_r, 4.0, pal.hover);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             p.text(
@@ -45304,7 +45321,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 egui::Align2::CENTER_CENTER,
                 "清理失效",
                 FontId::proportional(11.0),
-                pal.text_weak,
+                ui_kit::lerp_color(pal.text_weak, pal.text, pr_hov),
             );
             if pr_resp
                 .on_hover_text("移除已不存在的本地文件记录（网络共享盘路径不会被自动删除）")
@@ -45380,8 +45397,12 @@ fn elide(s: &str, max_chars: usize) -> String {
                 let x = ui.interact(xr, egui::Id::new("home_search_clear"), Sense::click());
                 ui_kit::a11y_name(&x, "清除搜索", true, None);
                 ui_kit::focus_ring(ui, &x, xr, 4.0);
+                let x_hov = ui_kit::anim_hover(ui.ctx(), x.id.with("hov"), x.hovered());
+                let x_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.pressed, x_hov);
+                if x_bg != Color32::TRANSPARENT {
+                    p.rect_filled(xr, 4.0, x_bg);
+                }
                 if x.hovered() {
-                    p.rect_filled(xr, 4.0, pal.pressed);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 p.line_segment(
@@ -45443,14 +45464,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                 Vec2::new(112.0, 32.0),
             );
             let re = ui.interact(eb, egui::Id::new("home_empty_new"), Sense::click());
+            let re_hov = ui_kit::anim_hover(ui.ctx(), re.id.with("hov"), re.hovered());
             p.rect_filled(
                 eb,
                 6.0,
-                if re.hovered() {
-                    pal.accent_hover
-                } else {
-                    pal.accent
-                },
+                ui_kit::lerp_color(pal.accent, pal.accent_hover, re_hov),
             );
             if re.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -45587,8 +45605,12 @@ fn elide(s: &str, max_chars: usize) -> String {
 
                 let interact_rect = row.intersect(body_rect);
                 let r = ui.interact(interact_rect, egui::Id::new(("home_row", path)), Sense::click());
+                let row_hov = ui_kit::anim_hover(ui.ctx(), r.id.with("hov"), r.hovered());
+                let row_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, row_hov);
+                if row_bg != Color32::TRANSPARENT {
+                    bp.rect_filled(row, 0.0, row_bg);
+                }
                 if r.hovered() {
-                    bp.rect_filled(row, 0.0, pal.hover);
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
                 if i > 0 {
@@ -45709,12 +45731,22 @@ fn elide(s: &str, max_chars: usize) -> String {
                         pin_id,
                         Sense::click(),
                     );
-                    if pin_resp.hovered() {
-                        bp.rect_filled(pin_btn, 4.0, pal.pressed);
+                    let pin_hov = ui_kit::anim_hover(ui.ctx(), pin_id.with("hov"), pin_resp.hovered());
+                    let pin_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.pressed, pin_hov);
+                    if pin_bg != Color32::TRANSPARENT {
+                        bp.rect_filled(pin_btn, 4.0, pin_bg);
                     }
                     let pin_label = if ent.pinned { "取消固定" } else { "固定到顶部" };
-                    ui_icons::draw_mono(&bp, Rect::from_center_size(pin_btn.center(), Vec2::splat(14.0)),
-                        Icon::Pin, if ent.pinned { pal.accent } else { pal.text_weak });
+                    ui_icons::draw_mono(
+                        &bp,
+                        Rect::from_center_size(pin_btn.center(), Vec2::splat(14.0)),
+                        Icon::Pin,
+                        if ent.pinned {
+                            pal.accent
+                        } else {
+                            ui_kit::lerp_color(pal.text_weak, pal.text, pin_hov)
+                        },
+                    );
                     ui_kit::a11y_name(&pin_resp, pin_label, true, Some(ent.pinned));
                     ui_kit::focus_ring(ui, &pin_resp, pin_btn, 4.0);
                     if pin_resp.on_hover_text(pin_label)
@@ -45730,11 +45762,17 @@ fn elide(s: &str, max_chars: usize) -> String {
                         remove_id,
                         Sense::click(),
                     );
-                    if rm_resp.hovered() {
-                        bp.rect_filled(rm_btn, 4.0, pal.err_bg);
+                    let rm_hov = ui_kit::anim_hover(ui.ctx(), remove_id.with("hov"), rm_resp.hovered());
+                    let rm_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.err_bg, rm_hov);
+                    if rm_bg != Color32::TRANSPARENT {
+                        bp.rect_filled(rm_btn, 4.0, rm_bg);
                     }
-                    ui_icons::draw_mono(&bp, Rect::from_center_size(rm_btn.center(), Vec2::splat(12.0)),
-                        Icon::Close, if rm_resp.hovered() { pal.err_fg } else { pal.text_weak });
+                    ui_icons::draw_mono(
+                        &bp,
+                        Rect::from_center_size(rm_btn.center(), Vec2::splat(12.0)),
+                        Icon::Close,
+                        ui_kit::lerp_color(pal.text_weak, pal.err_fg, rm_hov),
+                    );
                     ui_kit::a11y_name(&rm_resp, "从最近列表移除", true, None);
                     ui_kit::focus_ring(ui, &rm_resp, rm_btn, 4.0);
                     if rm_resp.on_hover_text("从最近列表移除").clicked() {
@@ -45835,27 +45873,28 @@ fn elide(s: &str, max_chars: usize) -> String {
         kind: usize,
         card: Rect,
         title: &str,
-        hovered: bool,
+        hover_t: f32,
     ) {
         let pal = theme::palette();
-        let lift = if hovered { -1.5 } else { 0.0 };
+        let hover_t = hover_t.clamp(0.0, 1.0);
+        let lift = egui::lerp(0.0_f32..=-2.0_f32, hover_t);
         let draw_card = card.translate(Vec2::new(0.0, lift));
-        p.rect_filled(
-            draw_card.translate(Vec2::new(0.0, if hovered { 4.0 } else { 2.0 })),
-            10.0,
-            Color32::from_black_alpha(if hovered { 18 } else { 8 }),
-        );
+        if pal.theme != theme::AppTheme::HighContrast {
+            let shadow_y = egui::lerp(2.0_f32..=5.0_f32, hover_t);
+            let shadow_a = egui::lerp(8.0_f32..=20.0_f32, hover_t).round() as u8;
+            p.rect_filled(
+                draw_card.translate(Vec2::new(0.0, shadow_y)),
+                10.0,
+                Color32::from_black_alpha(shadow_a),
+            );
+        }
         p.rect(
             draw_card,
             10.0,
             pal.card_bg,
             egui::Stroke::new(
-                if hovered { 1.5 } else { 1.0 },
-                if hovered {
-                    pal.accent
-                } else {
-                    pal.card_border
-                },
+                egui::lerp(1.0_f32..=1.5_f32, hover_t),
+                ui_kit::lerp_color(pal.card_border, pal.accent, hover_t),
             ),
             egui::StrokeKind::Inside,
         );
@@ -46044,7 +46083,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         _prev: &templates::Preview,
         hovered: bool,
     ) {
-        Self::paint_home_quick_card(p, idx, card, t.name, hovered);
+        Self::paint_home_quick_card(p, idx, card, t.name, if hovered { 1.0 } else { 0.0 });
     }
 
     /// 检查更新（手动点击入口）：零弹窗选目录，后台异步探测发版源，发现签名新版则打开一键更新面板
@@ -49693,23 +49732,18 @@ impl eframe::App for SheetApp {
                 let pill_on = delegated || self.tasks.shared_autosave.unwrap_or(self.autosave);
                 let (as_r, as_resp) = tab_ui.allocate_exact_size(Vec2::new(if full.width() >= 1120.0 { 78.0 } else { 34.0 }, 20.0), Sense::click());
                 let as_pill = Rect::from_min_size(egui::pos2(as_r.left(), as_r.center().y - 8.0), Vec2::new(28.0, 16.0));
-                tab_ui.painter().rect_filled(
-                    as_pill,
-                    8.0,
-                    if pill_on {
-                        ribbon_pal.accent
-                    } else if as_resp.hovered() {
-                        if ribbon_dark { ribbon_pal.pressed } else { Color32::from_rgb(180, 192, 208) }
-                    } else if ribbon_dark {
-                        ribbon_pal.hover
-                    } else {
-                        Color32::from_rgb(203, 213, 225)
-                    },
-                );
+                let on_t = ui_kit::anim_toggle(ctx, as_resp.id.with("autosave_on"), pill_on);
+                let hov_t = ui_kit::anim_hover(ctx, as_resp.id.with("autosave_hov"), as_resp.hovered() && !delegated);
+                let off_idle = if ribbon_dark { ribbon_pal.hover } else { Color32::from_rgb(203, 213, 225) };
+                let off_hov = if ribbon_dark { ribbon_pal.pressed } else { Color32::from_rgb(180, 192, 208) };
+                let off_col = ui_kit::lerp_color(off_idle, off_hov, hov_t);
+                let on_col = ui_kit::lerp_color(ribbon_pal.accent, ribbon_pal.accent_hover, hov_t);
+                let track_col = ui_kit::lerp_color(off_col, on_col, on_t);
+                tab_ui.painter().rect_filled(as_pill, 8.0, track_col);
                 if ribbon_pal.theme == theme::AppTheme::HighContrast && !pill_on {
                     tab_ui.painter().rect_stroke(as_pill, 8.0, Stroke::new(1.0, ribbon_pal.card_border), egui::StrokeKind::Inside);
                 }
-                let kx = if pill_on { as_pill.right() - 8.0 } else { as_pill.left() + 8.0 };
+                let kx = egui::lerp((as_pill.left() + 8.0)..=(as_pill.right() - 8.0), on_t);
                 let knob_col = if pill_on && ribbon_pal.theme == theme::AppTheme::HighContrast {
                     Color32::BLACK
                 } else {
@@ -49757,8 +49791,14 @@ impl eframe::App for SheetApp {
                     let on = self.command_enabled(action);
                     let (b, resp) = tab_ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
                     ui_kit::a11y_name(&resp, qname, on, None);
-                    if resp.hovered() && on {
-                        tab_ui.painter().rect_filled(b, 4.0, ribbon_pal.hover_on_page);
+                    let q_hov = ui_kit::anim_hover(ctx, resp.id.with("qat_hov"), resp.hovered() && on);
+                    let q_bg = if resp.is_pointer_button_down_on() && on {
+                        ribbon_pal.pressed
+                    } else {
+                        ui_kit::lerp_color(Color32::TRANSPARENT, ribbon_pal.hover_on_page, q_hov)
+                    };
+                    if q_bg != Color32::TRANSPARENT {
+                        tab_ui.painter().rect_filled(b, 4.0, q_bg);
                     }
                     let col = if on { ribbon_pal.text } else { ribbon_pal.text_muted };
                     ui_icons::draw_excel(tab_ui.painter(), b.shrink(4.0), *icon, col, on);
@@ -49771,10 +49811,10 @@ impl eframe::App for SheetApp {
                         let is_undo = *action == "Undo";
                         let (db, dresp) =
                             tab_ui.allocate_exact_size(Vec2::new(12.0, 24.0), Sense::click());
-                        if dresp.hovered() && on {
-                            tab_ui
-                                .painter()
-                                .rect_filled(db, 3.0, ribbon_pal.hover_on_page);
+                        let d_hov = ui_kit::anim_hover(ctx, dresp.id.with("qat_d_hov"), dresp.hovered() && on);
+                        let d_bg = ui_kit::lerp_color(Color32::TRANSPARENT, ribbon_pal.hover_on_page, d_hov);
+                        if d_bg != Color32::TRANSPARENT {
+                            tab_ui.painter().rect_filled(db, 3.0, d_bg);
                         }
                         ui_kit::caret(
                             &mut tab_ui,
@@ -49808,11 +49848,17 @@ impl eframe::App for SheetApp {
                         // 显式折叠 / 展开功能区按钮 (^ / v)
                         let (cb, cresp) = ui.allocate_exact_size(Vec2::new(24.0, 22.0), Sense::click());
                         ui_kit::a11y_name(&cresp, if self.ribbon_collapsed { "展开功能区" } else { "折叠功能区" }, true, Some(!self.ribbon_collapsed));
-                        if cresp.hovered() {
-                            ui.painter().rect_filled(cb, 4.0, ribbon_pal.hover_on_page);
+                        let c_hov = ui_kit::anim_hover(ctx, cresp.id.with("col_hov"), cresp.hovered());
+                        let c_bg = if cresp.is_pointer_button_down_on() {
+                            ribbon_pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, ribbon_pal.hover_on_page, c_hov)
+                        };
+                        if c_bg != Color32::TRANSPARENT {
+                            ui.painter().rect_filled(cb, 4.0, c_bg);
                         }
                         let cc = cb.center();
-                        let st = Stroke::new(1.25, ribbon_pal.text_weak);
+                        let st = Stroke::new(1.25, ui_kit::lerp_color(ribbon_pal.text_weak, ribbon_pal.text, c_hov));
                         if self.ribbon_collapsed {
                             ui.painter().line_segment([egui::pos2(cc.x - 4.0, cc.y - 2.0), egui::pos2(cc.x, cc.y + 2.5)], st);
                             ui.painter().line_segment([egui::pos2(cc.x, cc.y + 2.5), egui::pos2(cc.x + 4.0, cc.y - 2.0)], st);
@@ -50796,17 +50842,25 @@ impl eframe::App for SheetApp {
                         ui.spacing_mut().interact_size.y = 18.0;
                         // 缩放百分比
                         let ztext = format!("{:.0}%", self.zoom * 100.0);
-                        if ui
-                            .add_sized(
-                                [44.0, 18.0],
-                                egui::Button::new(
-                                    egui::RichText::new(ztext).size(11.0).color(status_pal.text),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("点击回到 100%")
-                            .clicked()
-                        {
+                        let (zr, zresp) = ui.allocate_exact_size(Vec2::new(44.0, 18.0), Sense::click());
+                        let z_hov = ui_kit::anim_hover(ui.ctx(), zresp.id.with("hov"), zresp.hovered());
+                        let z_bg = if zresp.is_pointer_button_down_on() {
+                            status_pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, status_pal.hover_on_page, z_hov)
+                        };
+                        if z_bg != Color32::TRANSPARENT {
+                            ui.painter().rect_filled(zr, 3.0, z_bg);
+                        }
+                        ui.painter().text(
+                            zr.center(),
+                            Align2::CENTER_CENTER,
+                            ztext,
+                            FontId::proportional(11.0),
+                            status_pal.text,
+                        );
+                        ui_kit::focus_ring(ui, &zresp, zr, 3.0);
+                        if zresp.on_hover_text("点击回到 100%").clicked() {
                             self.set_zoom(1.0);
                         }
                         // 从右往左布局，让百分比紧邻缩放控件。
@@ -50828,9 +50882,22 @@ impl eframe::App for SheetApp {
                             theme::AppTheme::Dark => "深色",
                             theme::AppTheme::HighContrast => "高对比",
                         };
-                        let theme_response = ui.add_sized(
-                            [40.0, 18.0],
-                            egui::Button::new(egui::RichText::new(theme_short).size(11.0).color(status_pal.text_weak)).frame(false),
+                        let (tr_rect, theme_response) = ui.allocate_exact_size(Vec2::new(40.0, 18.0), Sense::click());
+                        let th_hov = ui_kit::anim_hover(ui.ctx(), theme_response.id.with("hov"), theme_response.hovered());
+                        let th_bg = if theme_response.is_pointer_button_down_on() {
+                            status_pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, status_pal.hover_on_page, th_hov)
+                        };
+                        if th_bg != Color32::TRANSPARENT {
+                            ui.painter().rect_filled(tr_rect, 3.0, th_bg);
+                        }
+                        ui.painter().text(
+                            tr_rect.center(),
+                            Align2::CENTER_CENTER,
+                            theme_short,
+                            FontId::proportional(11.0),
+                            ui_kit::lerp_color(status_pal.text_weak, status_pal.text, th_hov),
                         );
                         ui_kit::a11y_name(&theme_response, "切换主题", true, None);
                         ui_kit::focus_ring(ui, &theme_response, theme_response.rect, 3.0);
@@ -50850,11 +50917,18 @@ impl eframe::App for SheetApp {
                             );
                             let resp = ui.interact(b, egui::Id::new(("viewbtn", i)), Sense::click());
                             let on = self.view_mode == i as u8;
-                            if on || resp.hovered() {
-                                let fill = if on { status_pal.accent_tint } else { status_pal.hover_on_page };
+                            let v_hov = ui_kit::anim_hover(ui.ctx(), resp.id.with("hov"), !on && resp.hovered());
+                            let v_on = ui_kit::anim_toggle(ui.ctx(), resp.id.with("on"), on);
+                            let hov_bg = ui_kit::lerp_color(Color32::TRANSPARENT, status_pal.hover_on_page, v_hov);
+                            let fill = ui_kit::lerp_color(hov_bg, status_pal.accent_tint, v_on);
+                            if fill != Color32::TRANSPARENT {
                                 ui.painter().rect_filled(b.shrink2(Vec2::new(1.0, 2.0)), 3.0, fill);
                             }
-                            let col = if on { status_pal.accent } else { status_pal.text_weak };
+                            let col = ui_kit::lerp_color(
+                                ui_kit::lerp_color(status_pal.text_weak, status_pal.text, v_hov),
+                                status_pal.accent,
+                                v_on,
+                            );
                             let st = Stroke::new(1.2, col);
                             // Excel 的三个视图图标：普通（行头竖条）、页面布局（页边距）、
                             // 分页预览（右三分之一填色）
@@ -50925,16 +50999,21 @@ impl eframe::App for SheetApp {
                         let spot_on = self.prefs.spotlight;
                         let compact = bar.width() < 760.0;
                         let (sb_r, sb_resp) = ui.allocate_exact_size(Vec2::new(if compact { 22.0 } else { 58.0 }, 18.0), Sense::click());
-                        if spot_on {
-                            ui.painter().rect_filled(
-                                sb_r,
-                                4.0,
-                                status_pal.accent_tint,
-                            );
-                        } else if sb_resp.hovered() {
-                            ui.painter().rect_filled(sb_r, 4.0, status_pal.hover_on_page);
+                        let spot_hov = ui_kit::anim_hover(ui.ctx(), sb_resp.id.with("hov"), !spot_on && sb_resp.hovered());
+                        let spot_t = ui_kit::anim_toggle(ui.ctx(), sb_resp.id.with("on"), spot_on);
+                        let spot_bg = ui_kit::lerp_color(
+                            ui_kit::lerp_color(Color32::TRANSPARENT, status_pal.hover_on_page, spot_hov),
+                            status_pal.accent_tint,
+                            spot_t,
+                        );
+                        if spot_bg != Color32::TRANSPARENT {
+                            ui.painter().rect_filled(sb_r, 4.0, spot_bg);
                         }
-                        let spot_col = if spot_on { status_pal.accent } else { status_pal.text_weak };
+                        let spot_col = ui_kit::lerp_color(
+                            ui_kit::lerp_color(status_pal.text_weak, status_pal.text, spot_hov),
+                            status_pal.accent,
+                            spot_t,
+                        );
                         ui_icons::draw(
                             ui.painter(),
                             Rect::from_center_size(egui::pos2(if compact { sb_r.center().x } else { sb_r.left() + 10.0 }, sb_r.center().y), Vec2::splat(12.0)),
@@ -51747,7 +51826,9 @@ fn scrollbar(
     } else {
         0.0
     };
-    let thick = (if resp.hovered() || resp.dragged() { 8.0_f32 } else { 5.0_f32 })
+    let hov_t = ui_kit::anim_hover(ui.ctx(), sb_id.with("sb_hov"), resp.hovered() || resp.dragged());
+    let drag_t = ui_kit::anim_hover(ui.ctx(), sb_id.with("sb_drag"), resp.dragged());
+    let thick = egui::lerp(5.0_f32..=8.0_f32, hov_t)
         .min(if horizontal { inner.height() } else { inner.width() }.max(4.0));
     let base = if horizontal { inner.left() } else { inner.top() };
     let pos = base + t * (span - thumb_len);
@@ -51762,13 +51843,8 @@ fn scrollbar(
             Vec2::new(thick, thumb_len),
         )
     };
-    let thumb_col = if resp.dragged() {
-        pal.accent
-    } else if resp.hovered() {
-        pal.text_weak
-    } else {
-        pal.text_muted
-    };
+    let rest_to_hov = ui_kit::lerp_color(pal.text_muted, pal.text_weak, hov_t);
+    let thumb_col = ui_kit::lerp_color(rest_to_hov, pal.accent, drag_t);
     p.rect_filled(thumb, thick * 0.5, thumb_col);
     if resp.drag_started() {
         let press = ui
@@ -51847,10 +51923,33 @@ fn paint_fitted_label(p: &egui::Painter, rect: Rect, text: &str, font: FontId, c
 
 fn zoom_step_button(ui: &mut egui::Ui, increase: bool, enabled: bool) -> egui::Response {
     let (symbol, name) = if increase { ("+", "放大") } else { ("−", "缩小") };
-    let button = egui::Button::new(egui::RichText::new(symbol).size(14.0))
-        .frame(false)
-        .min_size(Vec2::new(20.0, 18.0));
-    let response = ui.add_enabled(enabled, button);
+    let pal = theme::palette();
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(20.0, 18.0),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    let hov_t = ui_kit::anim_hover(ui.ctx(), response.id.with("hov"), enabled && response.hovered());
+    let bg = if enabled && response.is_pointer_button_down_on() {
+        pal.pressed
+    } else {
+        ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, hov_t)
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 3.0, bg);
+    }
+    let fg = if enabled {
+        ui_kit::lerp_color(pal.text_weak, pal.text, hov_t)
+    } else {
+        ui_kit::disabled_color(pal)
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        symbol,
+        FontId::proportional(14.0),
+        fg,
+    );
+    ui_kit::focus_ring(ui, &response, rect, 3.0);
     ui_kit::a11y_name(&response, name, enabled, None);
     response.on_hover_text(name)
 }

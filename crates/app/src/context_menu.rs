@@ -68,8 +68,14 @@ fn paste_strip(ui: &mut egui::Ui, rect: Rect, enabled: bool) -> Option<CtxAct> {
                 Sense::hover()
             },
         );
-        if enabled && resp.hovered() {
-            ui.painter().rect_filled(hit.shrink(1.0), 3.0, pal.hover);
+        let hov_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("paste_hov"), enabled && resp.hovered());
+        let pbg = if enabled && resp.is_pointer_button_down_on() {
+            pal.pressed
+        } else {
+            ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, hov_t)
+        };
+        if pbg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(hit.shrink(1.0), 3.0, pbg);
         }
         let glyph = Rect::from_center_size(hit.center(), Vec2::splat(16.0));
         if enabled {
@@ -100,11 +106,13 @@ struct MenuPanel<'a> {
 impl MenuPanel<'_> {
     fn show(self, ctx: &egui::Context) -> MenuResponse {
         let mut result = MenuResponse::default();
+        let enter = ui_kit::anim_enter(ctx, self.id.with(self.opened));
+        let draw_pos = self.rect.min + Vec2::new(0.0, (1.0 - enter) * 3.0);
         egui::Area::new(self.id)
             .order(egui::Order::Foreground)
             .movable(false)
             .constrain(false)
-            .fixed_pos(self.rect.min)
+            .fixed_pos(draw_pos)
             .default_size(self.rect.size())
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(self.rect.size(), Sense::hover());
@@ -184,9 +192,15 @@ impl MenuPanel<'_> {
                 result.clicked = Some(idx);
             }
             let selected = self.selected == idx;
-            if selected {
+            let row_hov = ui_kit::anim_hover(ui.ctx(), id.with("ctx_sel"), selected);
+            let row_bg = if row.enabled && resp.is_pointer_button_down_on() {
+                pal.pressed
+            } else {
+                ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, row_hov)
+            };
+            if row_bg != Color32::TRANSPARENT {
                 ui.painter()
-                    .rect_filled(r.shrink2(Vec2::new(4.0, 1.0)), 4.0, pal.hover);
+                    .rect_filled(r.shrink2(Vec2::new(4.0, 1.0)), 4.0, row_bg);
             }
             let fg = if row.enabled {
                 pal.text

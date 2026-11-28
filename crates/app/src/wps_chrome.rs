@@ -581,9 +581,11 @@ impl SheetApp {
         let mut sub_anchor_y = pos.y + 42.0;
 
         let pal = crate::theme::palette();
-        let main_resp = egui::Area::new(egui::Id::new("wps_file_menu"))
+        let menu_id = egui::Id::new("wps_file_menu");
+        let menu_enter = ui_kit::anim_enter(ctx, menu_id);
+        let main_resp = egui::Area::new(menu_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(pos)
+            .fixed_pos(egui::pos2(pos.x, pos.y + (1.0 - menu_enter) * 3.0))
             .show(ctx, |ui| {
                 scrollable_file_menu(ui, menu_w, screen.bottom() - pos.y - 6.0, |ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
@@ -599,8 +601,14 @@ impl SheetApp {
                                 Vec2::new(ui.available_width(), 28.0),
                                 Sense::click(),
                             );
-                            if resp.hovered() || sub_on {
-                                ui.painter().rect_filled(r, 5.0, pal.hover);
+                            let hov_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("fm_hov"), resp.hovered() || sub_on);
+                            let bg = if resp.is_pointer_button_down_on() {
+                                pal.pressed
+                            } else {
+                                ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, hov_t)
+                            };
+                            if bg != Color32::TRANSPARENT {
+                                ui.painter().rect_filled(r, 5.0, bg);
                             }
                             ui_icons::draw_excel(
                                 ui.painter(),
@@ -726,9 +734,11 @@ impl SheetApp {
             let sub_y = sub_anchor_y.clamp(screen.top() + 4.0, (screen.bottom() - 280.0).max(4.0));
             let rec_entries = self.ensure_recent_cache().to_vec();
             let pal = crate::theme::palette();
-            let sub_resp = egui::Area::new(egui::Id::new("wps_file_menu_cascade"))
+            let cascade_id = egui::Id::new("wps_file_menu_cascade");
+            let cascade_enter = ui_kit::anim_enter(ctx, cascade_id);
+            let sub_resp = egui::Area::new(cascade_id)
                 .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(sub_x, sub_y))
+                .fixed_pos(egui::pos2(sub_x, sub_y + (1.0 - cascade_enter) * 3.0))
                 .show(ctx, |ui| {
                     scrollable_file_menu(ui, sub_w, screen.bottom() - sub_y - 6.0, |ui| {
                             if rec_entries.is_empty() {
@@ -753,10 +763,18 @@ impl SheetApp {
                                     let open_resp = ui.interact(open_rect, ui.id().with(("recent_open", idx)), Sense::click());
                                     let pin_resp = ui.interact(pin_btn, ui.id().with(("recent_pin", idx)), Sense::click());
                                     let rm_resp = ui.interact(rm_btn, ui.id().with(("recent_rm", idx)), Sense::click());
-                                    if open_resp.is_pointer_button_down_on() {
-                                        ui.painter().rect_filled(row, 5.0, pal.pressed);
-                                    } else if open_resp.hovered() || pin_resp.hovered() || rm_resp.hovered() {
-                                        ui.painter().rect_filled(row, 5.0, pal.hover);
+                                    let row_hov = ui_kit::anim_hover(
+                                        ui.ctx(),
+                                        open_resp.id.with("rec_row_hov"),
+                                        open_resp.hovered() || pin_resp.hovered() || rm_resp.hovered(),
+                                    );
+                                    let row_bg = if open_resp.is_pointer_button_down_on() {
+                                        pal.pressed
+                                    } else {
+                                        ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, row_hov)
+                                    };
+                                    if row_bg != Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(row, 5.0, row_bg);
                                     }
                                     let label = format!("{}  ({})", ent.name, ent.short_dir);
                                     let text_rect = Rect::from_min_max(
@@ -781,14 +799,16 @@ impl SheetApp {
                                     }
 
                                     let pin_tip = if ent.pinned { "取消固定" } else { "固定到顶部" };
-                                    if pin_resp.hovered() {
-                                        ui.painter().rect_filled(pin_btn, 4.0, pal.pressed);
+                                    let pin_hov = ui_kit::anim_hover(ui.ctx(), pin_resp.id.with("pin_hov"), pin_resp.hovered());
+                                    let pin_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.pressed, pin_hov);
+                                    if pin_bg != Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(pin_btn, 4.0, pin_bg);
                                     }
                                     ui_icons::draw_mono(
                                         ui.painter(),
                                         Rect::from_center_size(pin_btn.center(), Vec2::splat(14.0)),
                                         Icon::Pin,
-                                        if ent.pinned { pal.accent } else { pal.text_weak },
+                                        if ent.pinned { pal.accent } else { ui_kit::lerp_color(pal.text_weak, pal.text, pin_hov) },
                                     );
                                     ui_kit::focus_ring(ui, &pin_resp, pin_btn, 4.0);
                                     ui_kit::a11y_name(&pin_resp, pin_tip, true, Some(ent.pinned));
@@ -796,14 +816,16 @@ impl SheetApp {
                                         act = Some(FileMenuAction::TogglePinRecent(ent.path.clone()));
                                     }
 
-                                    if rm_resp.hovered() {
-                                        ui.painter().rect_filled(rm_btn, 4.0, pal.err_bg);
+                                    let rm_hov = ui_kit::anim_hover(ui.ctx(), rm_resp.id.with("rm_hov"), rm_resp.hovered());
+                                    let rm_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.err_bg, rm_hov);
+                                    if rm_bg != Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(rm_btn, 4.0, rm_bg);
                                     }
                                     ui_icons::draw_mono(
                                         ui.painter(),
                                         Rect::from_center_size(rm_btn.center(), Vec2::splat(12.0)),
                                         Icon::Close,
-                                        if rm_resp.hovered() { pal.err_fg } else { pal.text_weak },
+                                        ui_kit::lerp_color(pal.text_weak, pal.err_fg, rm_hov),
                                     );
                                     ui_kit::focus_ring(ui, &rm_resp, rm_btn, 4.0);
                                     ui_kit::a11y_name(&rm_resp, "从最近列表移除", true, None);
@@ -940,9 +962,11 @@ impl SheetApp {
         let recent = self.recent_colors.clone();
 
         let pal = crate::theme::palette();
-        let area_resp = egui::Area::new(egui::Id::new("wps_color_popup"))
+        let color_pop_id = egui::Id::new("wps_color_popup");
+        let color_enter = ui_kit::anim_enter(ctx, color_pop_id);
+        let area_resp = egui::Area::new(color_pop_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(pos)
+            .fixed_pos(egui::pos2(pos.x, pos.y + (1.0 - color_enter) * 3.0))
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(pal.dialog_bg)
@@ -1088,6 +1112,7 @@ impl SheetApp {
                     };
                     let hresp = ui.interact(hb, egui::Id::new("title_home_btn"), Sense::click());
                     ui_kit::a11y_role(&hresp, "主页", egui::accesskit::Role::Tab, Some(home_active));
+                    let home_hov = ui_kit::anim_hover(ctx, hresp.id.with("hov"), !home_active && hresp.hovered());
                     if home_active {
                         let rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
                         painter.rect(
@@ -1097,10 +1122,21 @@ impl SheetApp {
                             Stroke::new(1.0, pal.card_border),
                             egui::StrokeKind::Inside,
                         );
-                    } else if hresp.hovered() {
-                        painter.rect_filled(hb, 4.0, if hresp.is_pointer_button_down_on() { pal.pressed } else { hover });
+                    } else {
+                        let hbg = if hresp.is_pointer_button_down_on() {
+                            pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, hover, home_hov)
+                        };
+                        if hbg != Color32::TRANSPARENT {
+                            painter.rect_filled(hb, 4.0, hbg);
+                        }
                     }
-                    let hic = if home_active || hresp.hovered() { fg } else { pal.text_weak };
+                    let hic = if home_active {
+                        fg
+                    } else {
+                        ui_kit::lerp_color(pal.text_weak, fg, home_hov)
+                    };
                     ui_kit::draw_clean_icon(
                         &painter,
                         Rect::from_min_size(egui::pos2(hb.left() + 8.0, hb.center().y - 7.0), Vec2::splat(14.0)),
@@ -1160,6 +1196,11 @@ impl SheetApp {
                         let tr = ui.interact(tab_hit, egui::Id::new(("wps_doctab", i)), Sense::click());
                         let cr = ui.interact(close, egui::Id::new(("wps_doctabx", i)), Sense::click());
                         let rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                        let tab_hov = ui_kit::anim_hover(
+                            ctx,
+                            tr.id.with("hov"),
+                            !*active && (tr.hovered() || cr.hovered()),
+                        );
                         if *active {
                             painter.rect(
                                 tab,
@@ -1168,19 +1209,27 @@ impl SheetApp {
                                 Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
                             );
-                        } else if tr.hovered() || cr.hovered() {
-                            painter.rect_filled(tab, rad, hover);
+                        } else {
+                            let bg = ui_kit::lerp_color(Color32::TRANSPARENT, hover, tab_hov);
+                            if bg != Color32::TRANSPARENT {
+                                painter.rect_filled(tab, rad, bg);
+                            }
                         }
                         let text_pos = egui::pos2(tab.left() + 10.0, tab.center().y - galley.size().y / 2.0);
                         painter.galley(text_pos, galley, tc);
                         if *dirty {
                             painter.circle_filled(egui::pos2(tab.right() - 26.0, tab.center().y), 3.0, pal.warn_fg);
                         }
-                        if cr.hovered() {
-                            let fill = if cr.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
-                            painter.rect_filled(close.shrink(2.0), 4.0, fill);
+                        let close_hov = ui_kit::anim_hover(ctx, cr.id.with("hov"), cr.hovered());
+                        let close_fill = if cr.is_pointer_button_down_on() {
+                            pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, close_hov)
+                        };
+                        if close_fill != Color32::TRANSPARENT {
+                            painter.rect_filled(close.shrink(2.0), 4.0, close_fill);
                         }
-                        let cc = if cr.hovered() { pal.text } else { pal.text_weak };
+                        let cc = ui_kit::lerp_color(pal.text_weak, pal.text, close_hov);
                         let cc0 = close.center();
                         painter.line_segment([egui::pos2(cc0.x - 3.2, cc0.y - 3.2), egui::pos2(cc0.x + 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
                         painter.line_segment([egui::pos2(cc0.x + 3.2, cc0.y - 3.2), egui::pos2(cc0.x - 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
@@ -1210,8 +1259,14 @@ impl SheetApp {
                         if resp.clicked() {
                             ui.memory_mut(|m| m.toggle_popup(switcher_id));
                         }
-                        if ui.memory(|m| m.is_popup_open(switcher_id)) || resp.hovered() {
-                            painter.rect_filled(button, 5.0, hover);
+                        let sw_hov = ui_kit::anim_hover(
+                            ctx,
+                            resp.id.with("hov"),
+                            ui.memory(|m| m.is_popup_open(switcher_id)) || resp.hovered(),
+                        );
+                        let sw_bg = ui_kit::lerp_color(Color32::TRANSPARENT, hover, sw_hov);
+                        if sw_bg != Color32::TRANSPARENT {
+                            painter.rect_filled(button, 5.0, sw_bg);
                         }
                         ui_kit::caret(ui, button.center(), fg);
                         ui_kit::focus_ring(ui, &resp, button, 5.0);
@@ -1237,12 +1292,19 @@ impl SheetApp {
                     if plus.right() <= right_limit {
                         let pr = ui.interact(plus, egui::Id::new("wps_tab_plus"), Sense::click());
                         ui_kit::a11y_name(&pr, "新建空白工作簿", true, None);
-                        if pr.hovered() {
-                            painter.rect_filled(plus, 5.0, hover);
+                        let plus_hov = ui_kit::anim_hover(ctx, pr.id.with("hov"), pr.hovered());
+                        let plus_bg = if pr.is_pointer_button_down_on() {
+                            pal.pressed
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, hover, plus_hov)
+                        };
+                        if plus_bg != Color32::TRANSPARENT {
+                            painter.rect_filled(plus, 5.0, plus_bg);
                         }
                         let pc = plus.center();
-                        painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, pal.text_weak));
-                        painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, pal.text_weak));
+                        let plus_col = ui_kit::lerp_color(pal.text_weak, pal.text, plus_hov);
+                        painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, plus_col));
+                        painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, plus_col));
                         ui_kit::focus_ring(ui, &pr, plus, 5.0);
                         if pr.on_hover_text("新建空白标签页 (Ctrl+N)").clicked() {
                             new_tab = true;
@@ -1264,14 +1326,14 @@ impl SheetApp {
                 if show_search {
                     let sr = Rect::from_min_size(egui::pos2(sx, rect.center().y - 13.0), Vec2::new(search_w, 26.0));
                     let search = ui.interact(sr, egui::Id::new("title_command_search"), Sense::click());
+                    let search_hov = ui_kit::anim_hover(ctx, search.id.with("hov"), search.hovered());
                     let fill = if search.is_pointer_button_down_on() {
                         pal.pressed
-                    } else if search.hovered() {
-                        pal.hover
                     } else {
-                        pal.card_bg
+                        ui_kit::lerp_color(pal.card_bg, pal.hover, search_hov)
                     };
-                    painter.rect(sr, 6.0, fill, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
+                    let s_border = ui_kit::lerp_color(pal.card_border, pal.text_muted, search_hov);
+                    painter.rect(sr, 6.0, fill, Stroke::new(1.0, s_border), egui::StrokeKind::Inside);
                     ui_icons::draw_mono(
                         &painter,
                         Rect::from_center_size(egui::pos2(sr.left() + 15.0, sr.center().y), Vec2::splat(13.0)),
@@ -1292,8 +1354,14 @@ impl SheetApp {
 
                 // 5. 账户胶囊
                 let aresp = ui.interact(acc, egui::Id::new("account"), Sense::click());
-                if aresp.hovered() {
-                    painter.rect_filled(acc, 4.0, if aresp.is_pointer_button_down_on() { pal.pressed } else { hover });
+                let acc_hov = ui_kit::anim_hover(ctx, aresp.id.with("hov"), aresp.hovered());
+                let acc_bg = if aresp.is_pointer_button_down_on() {
+                    pal.pressed
+                } else {
+                    ui_kit::lerp_color(Color32::TRANSPARENT, hover, acc_hov)
+                };
+                if acc_bg != Color32::TRANSPARENT {
+                    painter.rect_filled(acc, 4.0, acc_bg);
                 }
                 let ac = egui::pos2(acc.left() + 13.0, acc.center().y);
                 painter.circle_filled(ac, 9.5, pal.info_bg);
@@ -1333,16 +1401,30 @@ impl SheetApp {
                         || (name == "max" && crate::win_chrome::maximize_button_nc_hovered());
                     let pressed = resp.is_pointer_button_down_on()
                         || (name == "max" && crate::win_chrome::maximize_button_nc_pressed());
-                    if is_hovered {
-                        let fill = match (name, pressed) {
-                            ("close", true) => Color32::from_rgb(157, 31, 24),
-                            ("close", false) => Color32::from_rgb(196, 43, 28),
-                            (_, true) => pal.pressed,
-                            _ => hover,
-                        };
+                    let wb_hov = ui_kit::anim_hover(ctx, resp.id.with("wb_hov"), is_hovered);
+                    let fill = if name == "close" {
+                        if pressed {
+                            Color32::from_rgb(157, 31, 24)
+                        } else {
+                            ui_kit::lerp_color(Color32::TRANSPARENT, Color32::from_rgb(196, 43, 28), wb_hov)
+                        }
+                    } else if pressed {
+                        pal.pressed
+                    } else {
+                        ui_kit::lerp_color(Color32::TRANSPARENT, hover, wb_hov)
+                    };
+                    if fill != Color32::TRANSPARENT {
                         painter.rect_filled(br, 0.0, fill);
                     }
-                    let col = if name == "close" && is_hovered { Color32::WHITE } else { fg };
+                    let col = if name == "close" {
+                        if pressed {
+                            Color32::WHITE
+                        } else {
+                            ui_kit::lerp_color(fg, Color32::WHITE, wb_hov)
+                        }
+                    } else {
+                        fg
+                    };
                     // Align outline edges to physical pixels, including fractional monitor scaling.
                     let snap = |v: f32| (v * ppp).round() / ppp;
                     let line = snap(1.0).max(1.0 / ppp);
@@ -1634,8 +1716,10 @@ impl SheetApp {
                         let sense = if can { Sense::click() } else { Sense::hover() };
                         let resp = ui.interact(b, egui::Id::new(("tabscroll", i)), sense);
                         ui_kit::a11y_name(&resp, label, can, None);
-                        if resp.hovered() && can {
-                            ui.painter().rect_filled(b.shrink(4.0), 3.0, pal.hover_on_page);
+                        let nav_hov = ui_kit::anim_hover(ctx, resp.id.with("hov"), resp.hovered() && can);
+                        let nav_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, nav_hov);
+                        if nav_bg != Color32::TRANSPARENT {
+                            ui.painter().rect_filled(b.shrink(4.0), 3.0, nav_bg);
                         }
                         if resp.clicked() && can {
                             let boundary = if d < 0.0 {
@@ -1648,7 +1732,14 @@ impl SheetApp {
                             ctx.request_repaint();
                         }
                         let c = b.center();
-                        let st = Stroke::new(1.1, if can { pal.text_weak } else { pal.text_muted });
+                        let st = Stroke::new(
+                            1.1,
+                            if can {
+                                ui_kit::lerp_color(pal.text_weak, pal.text, nav_hov)
+                            } else {
+                                pal.text_muted
+                            },
+                        );
                         if can {
                             ui_kit::focus_ring(ui, &resp, b.shrink(3.0), 3.0);
                             resp.on_hover_text(label);
@@ -1659,8 +1750,10 @@ impl SheetApp {
                     let list = Rect::from_min_size(egui::pos2(content_left + 48.0, left_rect.top() + 1.0), Vec2::new(24.0, 30.0));
                     let resp = ui.interact(list, egui::Id::new("sheet_list_button"), Sense::click());
                     ui_kit::a11y_name(&resp, "工作表列表", true, None);
-                    if resp.hovered() {
-                        ui.painter().rect_filled(list.shrink(2.0), 4.0, pal.hover_on_page);
+                    let list_hov = ui_kit::anim_hover(ctx, resp.id.with("hov"), resp.hovered());
+                    let list_bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, list_hov);
+                    if list_bg != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(list.shrink(2.0), 4.0, list_bg);
                     }
                     for dx in [-4.0, 0.0, 4.0] {
                         ui.painter().circle_filled(list.center() + Vec2::new(dx, 0.0), 1.3, pal.text);
@@ -1678,11 +1771,24 @@ impl SheetApp {
                 let nresp = ui.interact(nb, egui::Id::new("newsheet"), if can_add { Sense::click() } else { Sense::hover() });
                 ui_kit::a11y_name(&nresp, "新建工作表", can_add, None);
                 ui_kit::focus_ring(ui, &nresp, nb.shrink(3.0), 3.0);
-                if nresp.hovered() && can_add {
-                    ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, pal.hover_on_page);
+                let add_hov = ui_kit::anim_hover(ctx, nresp.id.with("hov"), nresp.hovered() && can_add);
+                let add_bg = if nresp.is_pointer_button_down_on() && can_add {
+                    pal.pressed
+                } else {
+                    ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, add_hov)
+                };
+                if add_bg != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(nb.shrink2(Vec2::new(2.0, 4.0)), 5.0, add_bg);
                 }
                 let c = nb.center();
-                let st = Stroke::new(1.2, if can_add { pal.text } else { pal.text_muted });
+                let st = Stroke::new(
+                    1.2,
+                    if can_add {
+                        ui_kit::lerp_color(pal.text_weak, pal.text, add_hov)
+                    } else {
+                        pal.text_muted
+                    },
+                );
                 ui.painter().line_segment([egui::pos2(c.x - 4.5, c.y), egui::pos2(c.x + 4.5, c.y)], st);
                 ui.painter().line_segment([egui::pos2(c.x, c.y - 4.5), egui::pos2(c.x, c.y + 4.5)], st);
                 if nresp.on_hover_text(structure_unavailable.unwrap_or("新建工作表")).clicked() && can_add {
@@ -1695,11 +1801,8 @@ impl SheetApp {
                     ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
                 let sc = split_rect.center();
-                let dot_col = if sresp.hovered() || sresp.dragged() {
-                    pal.accent
-                } else {
-                    pal.text_muted
-                };
+                let grip_t = ui_kit::anim_hover(ctx, sresp.id.with("grip_hov"), sresp.hovered() || sresp.dragged());
+                let dot_col = ui_kit::lerp_color(pal.text_muted, pal.accent, grip_t);
                 for dy in [-4.0f32, 0.0, 4.0] {
                     ui.painter().circle_filled(egui::pos2(sc.x, sc.y + dy), 1.3, dot_col);
                 }

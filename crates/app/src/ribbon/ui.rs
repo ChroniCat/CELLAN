@@ -168,6 +168,12 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     }
     let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
     let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
+    let ov_hov = ui_kit::anim_hover(
+        ui.ctx(),
+        resp.id.with("ov_hov"),
+        active_hidden.is_none() && (resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id))),
+    );
+    let ov_act = ui_kit::anim_toggle(ui.ctx(), resp.id.with("ov_act"), active_hidden.is_some());
     if active_hidden.is_some() {
         if is_hc {
             ui.painter().rect_filled(rect, 4.0, selected_fill);
@@ -181,10 +187,17 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
             );
         }
         let bar_y = if is_hc { rect.bottom() + 1.0 } else { rect.bottom() - 1.5 };
-        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(16.0, 2.0));
-        ui.painter().rect_filled(bar, 1.0, pal.accent);
-    } else if resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id)) {
-        ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
+        let bar_w = egui::lerp(8.0_f32..=16.0_f32, ov_act);
+        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(bar_w, 2.0));
+        let bar_col = ui_kit::lerp_color(Color32::TRANSPARENT, pal.accent, ov_act);
+        if bar_col != Color32::TRANSPARENT {
+            ui.painter().rect_filled(bar, 1.0, bar_col);
+        }
+    } else {
+        let bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, ov_hov);
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, 4.0, bg);
+        }
     }
     ui_kit::caret(ui, rect.center(), if active_hidden.is_some() { selected_ink } else { pal.text });
     ui_kit::tab_focus_ring(ui, &resp, rect, 4.0, active_hidden.is_some());
@@ -1131,7 +1144,15 @@ fn menu_a11y(
         let w = ctl.width.unwrap_or(min_w).max(min_w);
         let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
         let pal = crate::theme::palette();
-        let bg = ui_kit::state_bg(enabled, false, r.hovered(), r.is_pointer_button_down_on(), pal.theme.is_dark());
+        let bg = ui_kit::anim_state_bg(
+            ui.ctx(),
+            r.id,
+            enabled,
+            false,
+            r.hovered(),
+            r.is_pointer_button_down_on(),
+            pal.theme.is_dark(),
+        );
         if bg != Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, 4.0, bg);
         }
@@ -1178,19 +1199,16 @@ fn paint_value_selector(ui: &egui::Ui, resp: &egui::Response, popup: Option<&Pop
     let rect = resp.rect;
     let open = popup.is_some_and(|p| matches!(p.kind, PopupKind::Items(_)) && p.pos.distance_sq(rect.left_bottom()) < 1.0);
     let pal = crate::theme::palette();
+    let hov_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("val_sel_hov"), resp.hovered() && !open);
     let bg = if open || resp.is_pointer_button_down_on() {
         pal.pressed
-    } else if resp.hovered() {
-        pal.hover
     } else {
-        pal.grid_bg
+        ui_kit::lerp_color(pal.grid_bg, pal.hover, hov_t)
     };
     let border_col = if open || resp.has_focus() {
         pal.accent
-    } else if resp.hovered() {
-        pal.card_border
     } else {
-        pal.chrome_separator()
+        ui_kit::lerp_color(pal.chrome_separator(), pal.card_border, hov_t)
     };
     ui.painter().rect(
         rect,
@@ -1584,12 +1602,16 @@ fn popup_menu_row(
     let clipped = label_g.elided;
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 27.0), sense);
-    if enabled && resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 4.0, pal.pressed);
-    } else if active_sub && enabled {
-        ui.painter().rect_filled(rect, 4.0, pal.accent_tint);
-    } else if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, pal.hover);
+    let hov_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("pmr_hov"), enabled && resp.hovered() && !active_sub);
+    let sub_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("pmr_sub"), enabled && active_sub);
+    let bg = if enabled && resp.is_pointer_button_down_on() {
+        pal.pressed
+    } else {
+        let base = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, hov_t);
+        ui_kit::lerp_color(base, pal.accent_tint, sub_t)
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, bg);
     }
     if icon_gutter {
         if let Some(rgb) = swatch {
@@ -1678,18 +1700,13 @@ fn paste_visual_grid(
                     if paste_on { Sense::click() } else { Sense::hover() },
                 );
                 let pal = crate::theme::palette();
+                let hov_t = ui_kit::anim_hover(ui.ctx(), resp.id.with("pv_hov"), paste_on && resp.hovered());
                 let fill = if paste_on && resp.is_pointer_button_down_on() {
                     pal.pressed
-                } else if paste_on && resp.hovered() {
-                    pal.hover
                 } else {
-                    pal.card_bg
+                    ui_kit::lerp_color(pal.card_bg, pal.hover, hov_t)
                 };
-                let stroke_col = if paste_on && resp.hovered() {
-                    pal.accent
-                } else {
-                    pal.card_border
-                };
+                let stroke_col = ui_kit::lerp_color(pal.card_border, pal.accent, hov_t);
                 ui.painter().rect(
                     tr,
                     5.0,
@@ -1921,8 +1938,11 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
     let mut hover_non_sub = false;
     let active_sub_id = app.ribbon_sub.as_ref().map(|(_, s, _)| s.ctl.id.clone());
 
-    let area = egui::Area::new(egui::Id::new("ribbon_popup"))
-        .fixed_pos(p.pos)
+    let pop_id = egui::Id::new("ribbon_popup");
+    let enter = ui_kit::anim_enter(&ctx, pop_id);
+    let draw_pos = egui::pos2(p.pos.x, p.pos.y + (1.0 - enter) * 3.0);
+    let area = egui::Area::new(pop_id)
+        .fixed_pos(draw_pos)
         .constrain_to(bounds)
         .order(egui::Order::Foreground)
         .show(&ctx, |ui| {
@@ -1959,10 +1979,18 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                     let (bg, fg, bold) = style_preview(&it.id);
                                     let (rect, r) =
                                         ui.allocate_exact_size(Vec2::new(inner_w, 27.0), Sense::click());
-                                    if r.is_pointer_button_down_on() {
-                                        ui.painter().rect_filled(rect, 4.0, crate::theme::palette().pressed);
-                                    } else if r.hovered() {
-                                        ui.painter().rect_filled(rect, 4.0, crate::theme::palette().hover);
+                                    let pal = crate::theme::palette();
+                                    let row_bg = ui_kit::anim_state_bg(
+                                        ui.ctx(),
+                                        r.id,
+                                        true,
+                                        false,
+                                        r.hovered(),
+                                        r.is_pointer_button_down_on(),
+                                        pal.theme.is_dark(),
+                                    );
+                                    if row_bg != Color32::TRANSPARENT {
+                                        ui.painter().rect_filled(rect, 4.0, row_bg);
                                     }
                                     let sw = Rect::from_center_size(
                                         egui::pos2(rect.left() + 20.0, rect.center().y),
@@ -2038,8 +2066,10 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
         let mut dummy_sub: Option<(String, Menu, egui::Pos2)> = None;
         let mut dummy_hover = false;
-        let sub_area = egui::Area::new(egui::Id::new("ribbon_sub_popup"))
-            .fixed_pos(spos)
+        let sub_pop_id = egui::Id::new("ribbon_sub_popup");
+        let sub_enter = ui_kit::anim_enter(&ctx, sub_pop_id.with(&sub.ctl.id));
+        let sub_area = egui::Area::new(sub_pop_id)
+            .fixed_pos(egui::pos2(spos.x, spos.y + (1.0 - sub_enter) * 3.0))
             .constrain_to(bounds)
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
@@ -2117,17 +2147,22 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         let pal = crate::theme::palette();
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         let hovered = ui.rect_contains_pointer(crect);
-        let stroke_col = if focused || app.font_menu {
+        let active = focused || app.font_menu;
+        let hov_t = ui_kit::anim_hover(ui.ctx(), fid.with("combo_hov"), hovered && !active);
+        let stroke_col = if active {
             pal.accent
-        } else if hovered {
-            pal.card_border
         } else {
-            pal.chrome_separator()
+            ui_kit::lerp_color(pal.chrome_separator(), pal.card_border, hov_t)
+        };
+        let fill_col = if active {
+            pal.grid_bg
+        } else {
+            ui_kit::lerp_color(pal.grid_bg, pal.hover, hov_t)
         };
         ui.painter().rect(
             crect,
             4.0,
-            if hovered && !focused && !app.font_menu { pal.hover } else { pal.grid_bg },
+            fill_col,
             egui::Stroke::new(1.0, stroke_col),
             egui::StrokeKind::Inside,
         );
@@ -2194,8 +2229,10 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         let ctx = ui.ctx().clone();
         let mut pick: Option<String> = None;
         let mut close = false;
-        let area = egui::Area::new(egui::Id::new("font_list"))
-            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0))
+        let font_list_id = egui::Id::new("font_list");
+        let font_enter = ui_kit::anim_enter(&ctx, font_list_id);
+        let area = egui::Area::new(font_list_id)
+            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0 + (1.0 - font_enter) * 3.0))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
                 ui_kit::popup_frame(ui.style()).show(ui, |ui| {
@@ -2256,17 +2293,22 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
         let hovered = ui.rect_contains_pointer(crect);
         let size_focused = ui.memory(|m| m.has_focus(sid));
-        let stroke_col = if size_focused || app.size_menu {
+        let active = size_focused || app.size_menu;
+        let hov_t = ui_kit::anim_hover(ui.ctx(), sid.with("combo_hov"), hovered && !active);
+        let stroke_col = if active {
             pal.accent
-        } else if hovered {
-            pal.card_border
         } else {
-            pal.chrome_separator()
+            ui_kit::lerp_color(pal.chrome_separator(), pal.card_border, hov_t)
+        };
+        let fill_col = if active {
+            pal.grid_bg
+        } else {
+            ui_kit::lerp_color(pal.grid_bg, pal.hover, hov_t)
         };
         ui.painter().rect(
             crect,
             4.0,
-            if hovered && !size_focused && !app.size_menu { pal.hover } else { pal.grid_bg },
+            fill_col,
             egui::Stroke::new(1.0, stroke_col),
             egui::StrokeKind::Inside,
         );
@@ -2323,8 +2365,10 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
         let ctx = ui.ctx().clone();
         let mut pick: Option<f32> = None;
         let mut close = false;
-        let area = egui::Area::new(egui::Id::new("size_list"))
-            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0))
+        let size_list_id = egui::Id::new("size_list");
+        let size_enter = ui_kit::anim_enter(&ctx, size_list_id);
+        let area = egui::Area::new(size_list_id)
+            .fixed_pos(egui::pos2(arrow_pos.x, arrow_pos.y + 3.0 + (1.0 - size_enter) * 3.0))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
                 ui_kit::popup_frame(ui.style()).show(ui, |ui| {
