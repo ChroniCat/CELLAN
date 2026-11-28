@@ -26,13 +26,13 @@ pub const BRAND_AQUA: Color32 = Color32::from_rgb(69, 214, 172);
 pub const BRAND_AQUA_LIGHT: Color32 = Color32::from_rgb(132, 238, 208);
 
 /// 悬浮卡片：纯白四圆角卡片浮于柔和 PAGE_BG 之上，配清晰利落的 1px CARD_BORDER（与 Light 调色板对齐）。
-pub const PAGE_BG: Color32 = Color32::from_rgb(245, 246, 248);
-pub const CARD_BORDER: Color32 = Color32::from_rgb(224, 227, 232);
+pub const PAGE_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(218, 223, 231);
 /// 页签栏底色（Fluent 架构下直接与 PAGE_BG 融为一体，消除双拼色断层边框）
-pub const TABSTRIP_BG: Color32 = Color32::from_rgb(245, 246, 248);
-pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(224, 227, 232);
+pub const TABSTRIP_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(218, 223, 231);
 /// 灰底上的悬停色：与页面底色拉开明确明度差
-pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(233, 236, 242);
+pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(231, 236, 243);
 /// 卡片圆角：功能区卡片 8px
 pub const CARD_R: u8 = 8;
 
@@ -388,18 +388,18 @@ pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 pub const HEAD_LINE: Color32 = Color32::from_rgb(171, 171, 171);
 /// 功能区分组之间的竖线
 pub const SEP: Color32 = Color32::from_rgb(228, 232, 240);
-pub const TEXT: Color32 = Color32::from_rgb(31, 35, 41);
-pub const TEXT_WEAK: Color32 = Color32::from_rgb(100, 106, 115);
-pub const HEADER_BG: Color32 = Color32::from_rgb(247, 248, 250);
-pub const HEADER_SEL: Color32 = Color32::from_rgb(226, 242, 234);
-pub const GRID_LINE: Color32 = Color32::from_rgb(228, 231, 236);
+pub const TEXT: Color32 = Color32::from_rgb(26, 31, 39);
+pub const TEXT_WEAK: Color32 = Color32::from_rgb(92, 100, 112);
+pub const HEADER_BG: Color32 = Color32::from_rgb(247, 248, 251);
+pub const HEADER_SEL: Color32 = Color32::from_rgb(224, 241, 232);
+pub const GRID_LINE: Color32 = Color32::from_rgb(226, 230, 236);
 /// 页签行底色
-pub const TABBAR_BG: Color32 = Color32::from_rgb(245, 246, 248);
+pub const TABBAR_BG: Color32 = Color32::from_rgb(243, 245, 248);
 /// 标题栏底色
-pub const TITLE_BG: Color32 = Color32::from_rgb(240, 243, 248);
-pub const HOVER: Color32 = Color32::from_rgb(241, 243, 246);
-pub const PRESSED: Color32 = Color32::from_rgb(225, 229, 236);
-pub const STATUS_BG: Color32 = Color32::from_rgb(245, 246, 248);
+pub const TITLE_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const HOVER: Color32 = Color32::from_rgb(238, 242, 247);
+pub const PRESSED: Color32 = Color32::from_rgb(222, 228, 237);
+pub const STATUS_BG: Color32 = Color32::from_rgb(245, 247, 250);
 
 /// 标题栏（自绘，含文档标签与窗口按钮）
 pub const TITLE_H: f32 = 38.0;
@@ -2991,9 +2991,10 @@ mod state_tests {
 
     #[test]
     fn pressed_beats_hover_and_checked_beats_hover() {
-        assert_eq!(state_bg(true, false, true, true, false), PRESSED);
-        assert_eq!(state_bg(true, true, true, false, false), PRESSED);
-        assert_eq!(state_bg(true, false, true, false, false), HOVER);
+        let light = crate::theme::palette_for(crate::theme::AppTheme::Light);
+        assert_eq!(state_bg(true, false, true, true, false), light.pressed);
+        assert_eq!(state_bg(true, true, true, false, false), light.pressed);
+        assert_eq!(state_bg(true, false, true, false, false), light.hover);
         assert_eq!(state_bg(true, false, false, false, false), Color32::TRANSPARENT);
     }
 
