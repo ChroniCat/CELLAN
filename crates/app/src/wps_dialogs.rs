@@ -158,9 +158,11 @@ impl SheetApp {
         let mut apply_font_direct = false;
 
         let pal = crate::theme::palette();
-        egui::Area::new(egui::Id::new("wps_mini_toolbar"))
+        let mini_id = egui::Id::new("wps_mini_toolbar");
+        let mini_enter = ui_kit::anim_enter(ctx, mini_id.with(session));
+        egui::Area::new(mini_id)
             .order(egui::Order::Foreground)
-            .fixed_pos(mini_rect.min)
+            .fixed_pos(mini_rect.min + Vec2::new(0.0, (1.0 - mini_enter) * 3.0))
             .show(ctx, |ui| {
                 ui_kit::popup_frame(ui.style())
                     .inner_margin(egui::Margin::symmetric(6, 5))
@@ -173,11 +175,12 @@ impl SheetApp {
                             ui.spacing_mut().item_spacing.x = 2.0;
                             let flabel = if cur.font.is_empty() { "默认" } else { cur.font.as_str() };
                             let (fr, fresp) = ui.allocate_exact_size(Vec2::new(74.0, 22.0), Sense::click());
+                            let f_hov = ui_kit::anim_hover(ui.ctx(), fresp.id.with("hov"), fresp.hovered() || pop_mode == 1);
                             ui.painter().rect(
                                 fr,
                                 4.0,
-                                if fresp.hovered() || pop_mode == 1 { pal.hover } else { pal.grid_bg },
-                                Stroke::new(1.0, pal.card_border),
+                                ui_kit::lerp_color(pal.grid_bg, pal.hover, f_hov),
+                                Stroke::new(1.0, if pop_mode == 1 { pal.accent } else { pal.card_border }),
                                 egui::StrokeKind::Inside,
                             );
                             let font_label = Rect::from_min_max(
@@ -197,11 +200,12 @@ impl SheetApp {
                             }
 
                             let (sr, sresp) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::click());
+                            let s_hov = ui_kit::anim_hover(ui.ctx(), sresp.id.with("hov"), sresp.hovered() || pop_mode == 2);
                             ui.painter().rect(
                                 sr,
                                 4.0,
-                                if sresp.hovered() || pop_mode == 2 { pal.hover } else { pal.grid_bg },
-                                Stroke::new(1.0, pal.card_border),
+                                ui_kit::lerp_color(pal.grid_bg, pal.hover, s_hov),
+                                Stroke::new(1.0, if pop_mode == 2 { pal.accent } else { pal.card_border }),
                                 egui::StrokeKind::Inside,
                             );
                             ui.painter().text(
@@ -291,9 +295,10 @@ impl SheetApp {
                 if pop_mode == 1 { mini_rect.left() + 6.0 } else { mini_rect.left() + 82.0 },
                 (mini_rect.top() + 30.0).min((screen.bottom() - 200.0).max(screen.top() + 4.0)),
             );
+            let pop_enter = ui_kit::anim_enter(ctx, size_pop_id.with(pop_mode));
             let pr = egui::Area::new(size_pop_id)
                 .order(egui::Order::Foreground)
-                .fixed_pos(pop_pos)
+                .fixed_pos(egui::pos2(pop_pos.x, pop_pos.y + (1.0 - pop_enter) * 3.0))
                 .show(ctx, |ui| {
                     ui_kit::popup_frame(ui.style())
                         .inner_margin(egui::Margin::same(4))
@@ -370,11 +375,12 @@ impl SheetApp {
             .fixed_pos(btn_pos)
             .show(ctx, |ui| {
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(72.0, 22.0), Sense::click());
+                let hov = ui_kit::anim_hover(ui.ctx(), resp.id.with("fill_badge_hov"), resp.hovered() || is_open);
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
-                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
+                    ui_kit::lerp_color(pal.page_bg, pal.card_bg, hov),
+                    Stroke::new(1.0, if is_open { pal.accent } else { ui_kit::lerp_color(pal.card_border, pal.text_muted, hov) }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -395,9 +401,11 @@ impl SheetApp {
                 btn_pos.x.min((screen.right() - 156.0).max(6.0)),
                 (btn_pos.y + 24.0).min((screen.bottom() - 150.0).max(40.0)),
             );
-            egui::Area::new(egui::Id::new("wps_fill_badge_pop"))
+            let fpop_id = egui::Id::new("wps_fill_badge_pop");
+            let fpop_enter = ui_kit::anim_enter(ctx, fpop_id);
+            egui::Area::new(fpop_id)
                 .order(egui::Order::Foreground)
-                .fixed_pos(pop_pos)
+                .fixed_pos(egui::pos2(pop_pos.x, pop_pos.y + (1.0 - fpop_enter) * 3.0))
                 .show(ctx, |ui| {
                     egui::Frame::NONE
                         .fill(pal.card_bg)
@@ -466,11 +474,12 @@ impl SheetApp {
             .fixed_pos(btn_pos)
             .show(ctx, |ui| {
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(72.0, 22.0), Sense::click());
+                let hov = ui_kit::anim_hover(ui.ctx(), resp.id.with("paste_badge_hov"), resp.hovered() || is_open);
                 ui.painter().rect(
                     r,
                     5.0,
-                    if resp.hovered() || is_open { pal.card_bg } else { pal.page_bg },
-                    Stroke::new(1.0, if is_open { pal.accent } else { pal.card_border }),
+                    ui_kit::lerp_color(pal.page_bg, pal.card_bg, hov),
+                    Stroke::new(1.0, if is_open { pal.accent } else { ui_kit::lerp_color(pal.card_border, pal.text_muted, hov) }),
                     egui::StrokeKind::Inside,
                 );
                 ui.painter().text(
@@ -491,9 +500,11 @@ impl SheetApp {
                 btn_pos.x.min((screen.right() - 170.0).max(6.0)),
                 (btn_pos.y + 24.0).min((screen.bottom() - 250.0).max(40.0)),
             );
-            egui::Area::new(egui::Id::new("wps_paste_badge_pop"))
+            let ppop_id = egui::Id::new("wps_paste_badge_pop");
+            let ppop_enter = ui_kit::anim_enter(ctx, ppop_id);
+            egui::Area::new(ppop_id)
                 .order(egui::Order::Foreground)
-                .fixed_pos(pop_pos)
+                .fixed_pos(egui::pos2(pop_pos.x, pop_pos.y + (1.0 - ppop_enter) * 3.0))
                 .show(ctx, |ui| {
                     egui::Frame::NONE
                         .fill(pal.card_bg)

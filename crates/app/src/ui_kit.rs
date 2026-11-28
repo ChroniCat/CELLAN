@@ -460,6 +460,146 @@ pub fn disabled_color(pal: crate::theme::ThemePalette) -> Color32 {
     }
 }
 
+const HOVER_ANIM_SECS: f32 = 0.11;
+const TOGGLE_ANIM_SECS: f32 = 0.14;
+const ENTER_ANIM_SECS: f32 = 0.12;
+
+#[inline]
+fn motion_duration(base_secs: f32) -> f32 {
+    if crate::theme::current_theme() == crate::theme::AppTheme::HighContrast
+        || crate::debug_flags::is_set("SC_SHOT")
+    {
+        0.0
+    } else {
+        base_secs
+    }
+}
+
+/// Alpha-safe sRGBA color interpolation for micro-animations.
+///
+/// - Exact endpoints: `t <= 0.001` returns `a`; `t >= 0.999` returns `b`.
+/// - When one endpoint is fully transparent (`alpha == 0`), animates alpha `0..other.a()`
+///   while preserving the visible endpoint's RGB (never blending through opaque black).
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    if t <= 0.001 {
+        return a;
+    }
+    if t >= 0.999 {
+        return b;
+    }
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    let [ar, ag, ab, aa] = a.to_srgba_unmultiplied();
+    let [br, bg, bb, ba] = b.to_srgba_unmultiplied();
+    if aa == 0 {
+        Color32::from_rgba_unmultiplied(br, bg, bb, mix(0, ba))
+    } else if ba == 0 {
+        Color32::from_rgba_unmultiplied(ar, ag, ab, mix(aa, 0))
+    } else {
+        Color32::from_rgba_unmultiplied(
+            mix(ar, br),
+            mix(ag, bg),
+            mix(ab, bb),
+            mix(aa, ba),
+        )
+    }
+}
+
+/// Smooth ~110ms hover ease-out (`0.0..=1.0`). Zero repaints at rest; immediate in HighContrast / `SC_SHOT`.
+pub fn anim_hover(ctx: &egui::Context, id: egui::Id, active: bool) -> f32 {
+    let dur = motion_duration(HOVER_ANIM_SECS);
+    if dur <= 0.0 {
+        return if active { 1.0 } else { 0.0 };
+    }
+    ctx.animate_bool_with_time_and_easing(id, active, dur, egui::emath::easing::cubic_out)
+}
+
+/// Smooth ~140ms toggle/active ease-out (`0.0..=1.0`). Zero repaints at rest; immediate in HighContrast / `SC_SHOT`.
+pub fn anim_toggle(ctx: &egui::Context, id: egui::Id, on: bool) -> f32 {
+    let dur = motion_duration(TOGGLE_ANIM_SECS);
+    if dur <= 0.0 {
+        return if on { 1.0 } else { 0.0 };
+    }
+    ctx.animate_bool_with_time_and_easing(id, on, dur, egui::emath::easing::cubic_out)
+}
+
+/// Subtle ~120ms entrance ease-out (`0.0..=1.0`) from the first shown pass.
+///
+/// Snaps immediately to `1.0` when `dt == 0.0`, in static single-frame test harnesses
+/// (`time <= 0.0`), in HighContrast, or during `SC_SHOT` captures so unit tests and
+/// screenshots always settle at crisp final opacity and geometry.
+pub fn anim_enter(ctx: &egui::Context, id: egui::Id) -> f32 {
+    let dur = motion_duration(ENTER_ANIM_SECS);
+    if dur <= 0.0 {
+        return 1.0;
+    }
+    let pass = ctx.cumulative_pass_nr();
+    let (now, dt) = ctx.input(|i| (i.time, i.unstable_dt));
+    let key = id.with("__anim_enter");
+    let (start_time, opening) = ctx.data_mut(|d| {
+        let prev = d.get_temp::<(u64, f64)>(key);
+        let opening = prev.is_none_or(|(last_pass, _)| pass.saturating_sub(last_pass) > 1);
+        let start = if opening {
+            // On initial boot / single-frame test pass (`pass == 0`), or when `now <= 0.0` / `dt <= 0.0`,
+            // settle immediately at 1.0 so static tests and startup frames land crisp.
+            if pass == 0 || now <= 0.0 || dt <= 0.0 {
+                -10.0
+            } else {
+                now
+            }
+        } else {
+            prev.unwrap().1
+        };
+        d.insert_temp(key, (pass, start));
+        (start, opening)
+    });
+    if start_time < 0.0 || (!opening && (now - start_time) <= 0.0) {
+        return 1.0;
+    }
+    let elapsed = (now - start_time).max(0.0) as f32;
+    if elapsed >= dur {
+        return 1.0;
+    }
+    let t = (elapsed / dur).clamp(0.0, 1.0);
+    let eased = egui::emath::easing::cubic_out(t);
+    ctx.request_repaint();
+    eased
+}
+
+/// Smoothly animated control surface background:
+/// disabled → transparent, pointer down → immediate crisp `pressed`,
+/// hover → 110ms alpha-safe fade to `hover`, toggled `on` → 140ms fade to `pressed`.
+pub fn anim_state_bg(
+    ctx: &egui::Context,
+    id: egui::Id,
+    enabled: bool,
+    on: bool,
+    hovered: bool,
+    down: bool,
+    dark: bool,
+) -> Color32 {
+    let pal = crate::theme::palette();
+    let effective = if dark && !pal.theme.is_dark() {
+        crate::theme::palette_for(crate::theme::AppTheme::Dark)
+    } else {
+        pal
+    };
+    let hover_t = anim_hover(ctx, id.with("__hov"), enabled && hovered);
+    let on_t = anim_toggle(ctx, id.with("__on"), enabled && on);
+    if !enabled {
+        return Color32::TRANSPARENT;
+    }
+    if down {
+        return effective.pressed;
+    }
+    let hover_col = lerp_color(Color32::TRANSPARENT, effective.hover, hover_t);
+    lerp_color(hover_col, effective.pressed, on_t)
+}
+
 /// Excel 浅色主题；深色沿用原来的深灰配色（Excel 也有深色模式）。
 /// 两套主题都要显式写入：egui 切主题时会用「该主题已保存的样式」，
 /// 只改当前主题会让系统深色模式下功能区变成默认灰。
@@ -598,10 +738,17 @@ pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> 
     let w = (galley.size().x + 24.0).max(min_w).max(ui.available_width());
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
-    if enabled && resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, pal.pressed);
-    } else if enabled && resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, pal.hover);
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        pal.theme.is_dark(),
+    );
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 5.0, bg);
     }
     let pos = Align2::LEFT_CENTER
         .anchor_size(egui::pos2(rect.left() + 10.0, rect.center().y), galley.size())
@@ -678,14 +825,16 @@ pub fn launcher_at(ui: &mut egui::Ui, group_rect: Rect, id: &str) -> bool {
     );
     let resp = ui.interact(rect, egui::Id::new(("grp_launch", id)), Sense::click());
     let pal = crate::theme::palette();
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 3.0, pal.hover);
-    }
-    let c = if resp.hovered() {
-        pal.accent
+    let hov_t = anim_hover(ui.ctx(), resp.id.with("hov"), resp.hovered());
+    let bg = if resp.is_pointer_button_down_on() {
+        pal.pressed
     } else {
-        pal.text_weak
+        lerp_color(Color32::TRANSPARENT, pal.hover, hov_t)
     };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 3.0, bg);
+    }
+    let c = lerp_color(pal.text_weak, pal.accent, hov_t);
     let p = ui.painter();
     let st = Stroke::new(1.1, c);
     p.line_segment(
@@ -741,15 +890,15 @@ pub fn big_sized_galley(
     let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let bg = if !enabled {
-        Color32::TRANSPARENT
-    } else if resp.is_pointer_button_down_on() {
-        pal.pressed
-    } else if resp.hovered() {
-        pal.hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        pal.theme.is_dark(),
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, bg);
     }
@@ -812,14 +961,17 @@ pub fn big_sized_split_galley(
     );
     let hovered_any = resp.hovered() || aresp.hovered();
     let over_arrow = arrow_rect.contains(resp.hover_pos().unwrap_or(rect.center()));
+    let hov_t = anim_hover(
+        ui.ctx(),
+        resp.id.with("split_hov"),
+        enabled && ((resp.hovered() && !over_arrow) || aresp.hovered()),
+    );
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() || aresp.is_pointer_button_down_on() {
         pal.pressed
-    } else if (resp.hovered() && !over_arrow) || aresp.hovered() {
-        pal.hover
     } else {
-        Color32::TRANSPARENT
+        lerp_color(Color32::TRANSPARENT, pal.hover, hov_t)
     };
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, bg);
@@ -837,13 +989,15 @@ pub fn big_sized_split_galley(
             .min;
         ui.painter().galley(pos, g, col);
     }
-    if hovered_any && enabled {
+    let sep_t = anim_hover(ui.ctx(), resp.id.with("split_sep"), hovered_any && enabled);
+    let sep_col = lerp_color(Color32::TRANSPARENT, pal.card_border, sep_t);
+    if sep_col != Color32::TRANSPARENT {
         ui.painter().line_segment(
             [
                 egui::pos2(rect.left() + 4.0, rect.bottom() - 13.5),
                 egui::pos2(rect.right() - 4.0, rect.bottom() - 13.5),
             ],
-            Stroke::new(1.0, pal.card_border),
+            Stroke::new(1.0, sep_col),
         );
     }
     caret(
@@ -858,15 +1012,15 @@ pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response 
     let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
-    let bg = if !enabled {
-        Color32::TRANSPARENT
-    } else if on {
-        pal.pressed
-    } else if resp.hovered() {
-        pal.hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        on,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        pal.theme.is_dark(),
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
@@ -899,7 +1053,15 @@ pub fn check_row(ui: &mut egui::Ui, label: &str, checked: bool, enabled: bool, w
         (v.dark_mode, text_color(v))
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click());
-    let bg = state_bg(enabled, false, resp.hovered(), resp.is_pointer_button_down_on(), dark);
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        dark,
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 2.0, bg);
     }
@@ -996,15 +1158,15 @@ pub fn labeled_w_on_galley(
     let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
-    let bg = if !enabled {
-        Color32::TRANSPARENT
-    } else if on || resp.is_pointer_button_down_on() {
-        pal.pressed
-    } else if resp.hovered() {
-        pal.hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        on,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        pal.theme.is_dark(),
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
@@ -1038,8 +1200,14 @@ pub fn labeled_tint(
 ) -> Response {
     let pal = crate::theme::palette();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
+    let hov_t = anim_hover(ui.ctx(), resp.id.with("tint_hov"), resp.hovered());
+    let bg = if resp.is_pointer_button_down_on() {
+        pal.pressed
+    } else {
+        lerp_color(Color32::TRANSPARENT, pal.hover_on_page, hov_t)
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, bg);
     }
     let ir = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
@@ -1108,7 +1276,9 @@ pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Resp
     let dark = ui.visuals().dark_mode || pal.theme.is_dark();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let bg = state_bg(
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
         enabled,
         false,
         resp.hovered(),
@@ -1133,7 +1303,9 @@ pub fn color_button(
     let pal = crate::theme::palette();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
-    let bg = state_bg(
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
         enabled,
         false,
         resp.hovered(),
@@ -1190,7 +1362,9 @@ pub fn text_toggle(
     let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
-    let bg = state_bg(
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
         enabled,
         on,
         resp.hovered(),
@@ -1303,15 +1477,18 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, TAB_H), Sense::click());
     let pill = rect.shrink2(Vec2::new(2.0, 3.0));
     let (selected_fill, selected_ink) = active_tab_colors(pal);
+    let hov_t = anim_hover(ui.ctx(), resp.id.with("tab_hov"), resp.hovered());
+    let active_t = anim_toggle(ui.ctx(), resp.id.with("tab_act"), active && !green);
     if green {
-        let fill = if resp.hovered() {
-            if dark {
-                pal.pressed
-            } else {
-                pal.accent_tint.lerp_to_gamma(pal.accent, 0.14)
-            }
+        let hover_fill = if dark {
+            pal.pressed
         } else {
-            pal.accent_tint
+            pal.accent_tint.lerp_to_gamma(pal.accent, 0.14)
+        };
+        let fill = if resp.is_pointer_button_down_on() {
+            pal.pressed
+        } else {
+            lerp_color(pal.accent_tint, hover_fill, hov_t)
         };
         ui.painter().rect_filled(pill, 5.0, fill);
         if is_hc {
@@ -1334,24 +1511,31 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
                 egui::StrokeKind::Inside,
             );
         }
-        // 精致 2px 圆角底部强调指示条（居中贴合标签）
-        let bar_w = text_w.clamp(16.0, (pill.width() - 8.0).max(16.0));
+        // 精致 2px 圆角底部强调指示条（切页时从中心平滑展开并淡入）
+        let full_w = text_w.clamp(16.0, (pill.width() - 8.0).max(16.0));
+        let bar_w = egui::lerp((full_w * 0.45)..=full_w, active_t);
         let bar_y = if is_hc {
             rect.bottom() - 1.0
         } else {
             pill.bottom() - 1.5
         };
         let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(bar_w, 2.0));
-        ui.painter().rect_filled(bar, 1.0, pal.accent);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(pill, 5.0, pal.hover_on_page);
+        let bar_col = lerp_color(Color32::TRANSPARENT, pal.accent, active_t);
+        if bar_col != Color32::TRANSPARENT {
+            ui.painter().rect_filled(bar, 1.0, bar_col);
+        }
+    } else {
+        let bg = lerp_color(Color32::TRANSPARENT, pal.hover_on_page, hov_t);
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(pill, 5.0, bg);
+        }
     }
     let col = if green {
         pal.accent
     } else if active {
         selected_ink
     } else {
-        pal.text_weak
+        lerp_color(pal.text_weak, pal.text, hov_t * 0.65)
     };
     let text_center = if active && !green && !is_hc {
         rect.center() - Vec2::new(0.0, 0.5)
@@ -1852,12 +2036,11 @@ pub fn text_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> Response {
     // egui 0.31 在框体上处理鼠标，但返回的 rect 扣除了 TextEdit 的 margin。
     response.rect += margin;
     let focused = response.has_focus();
+    let hov_t = anim_hover(ui.ctx(), response.id.with("ti_hov"), response.hovered() && !focused);
     let border = if focused {
         Stroke::new(crate::tokens::stroke::FOCUS, pal.accent)
-    } else if response.hovered() {
-        Stroke::new(1.0, pal.text_muted)
     } else {
-        Stroke::new(1.0, pal.card_border)
+        Stroke::new(1.0, lerp_color(pal.card_border, pal.text_muted, hov_t))
     };
     ui.painter().set(shape, egui::epaint::RectShape::new(
         response.rect,
@@ -1881,15 +2064,15 @@ pub fn pill(ui: &mut egui::Ui, label: &str, tip: &str) -> Response {
         crate::tokens::size::BTN_H,
     );
     let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
-    let bg = if !enabled {
-        Color32::TRANSPARENT
-    } else if resp.is_pointer_button_down_on() {
-        pal.pressed
-    } else if resp.hovered() {
-        pal.hover
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = anim_state_bg(
+        ui.ctx(),
+        resp.id,
+        enabled,
+        false,
+        resp.hovered(),
+        resp.is_pointer_button_down_on(),
+        pal.theme.is_dark(),
+    );
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
@@ -1920,13 +2103,21 @@ pub fn close_icon_button(ui: &mut egui::Ui, tip: &str) -> Response {
 
 fn paint_close_button(ui: &egui::Ui, rect: Rect, resp: Response, tip: &str) -> Response {
     let pal = crate::theme::palette();
-    if resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 4.0, pal.pressed);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 4.0, pal.hover);
+    let hov_t = anim_hover(ui.ctx(), resp.id.with("close_hov"), resp.hovered());
+    let bg = if resp.is_pointer_button_down_on() {
+        pal.pressed
+    } else {
+        lerp_color(Color32::TRANSPARENT, pal.hover, hov_t)
+    };
+    if bg != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, bg);
     }
     focus_ring(ui, &resp, rect, 4.0);
-    let col = if resp.hovered() || resp.has_focus() { pal.text } else { pal.text_weak };
+    let col = if resp.has_focus() {
+        pal.text
+    } else {
+        lerp_color(pal.text_weak, pal.text, hov_t)
+    };
     ui_icons::draw_mono(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(20.0)), Icon::Close, col);
     a11y_name(&resp, if tip.is_empty() { "关闭" } else { tip }, resp.enabled(), None);
     if !tip.is_empty() {
@@ -1970,12 +2161,17 @@ pub fn sheet_tab(
     } else {
         rect.shrink2(Vec2::new(1.0, 3.0))
     };
+    let hov_t = anim_hover(ui.ctx(), resp.id.with("sheet_hov"), !active && !grouped && resp.hovered());
+    let act_t = anim_toggle(ui.ctx(), resp.id.with("sheet_act"), active);
     let (fill, text_color) = if active {
         active_tab_colors(pal)
     } else if grouped {
         (pal.accent_tint, pal.accent_hover)
     } else {
-        (if resp.hovered() { pal.hover_on_page } else { Color32::TRANSPARENT }, pal.text_weak)
+        (
+            lerp_color(Color32::TRANSPARENT, pal.hover_on_page, hov_t),
+            lerp_color(pal.text_weak, pal.text, hov_t * 0.6),
+        )
     };
     if active {
         let rad = egui::CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 };
@@ -1996,15 +2192,19 @@ pub fn sheet_tab(
                 Stroke::new(1.0, fill),
             );
         }
-        // 精致 2px 圆角底部强调条（有自定义标签色时采用自定义色，否则采用主题强调色）
+        // 精致 2px 圆角底部强调条（有自定义标签色时采用自定义色，否则采用主题强调色；切换时平滑展开）
         let bar_col = color
             .map(|[r, g, b]| Color32::from_rgb(r, g, b))
             .unwrap_or(pal.accent);
-        let bar_w = (chip.width() - 12.0).max(16.0).min((chip.width() - 4.0).max(8.0));
+        let full_w = (chip.width() - 12.0).max(16.0).min((chip.width() - 4.0).max(8.0));
+        let bar_w = egui::lerp((full_w * 0.45)..=full_w, act_t);
         let bar_y = if is_hc { rect.bottom() - 1.0 } else { chip.bottom() - 1.5 };
         let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
-        ui.painter().rect_filled(bar, 1.0, bar_col);
-        if !is_hc {
+        let anim_bar_col = lerp_color(Color32::TRANSPARENT, bar_col, act_t);
+        if anim_bar_col != Color32::TRANSPARENT {
+            ui.painter().rect_filled(bar, 1.0, anim_bar_col);
+        }
+        if !is_hc && act_t >= 0.5 {
             let lum = |c: Color32| egui::Rgba::from(c).intensity() + 0.05;
             let (a, b) = (lum(bar_col), lum(fill));
             if a.max(b) / a.min(b) < 1.8 {
@@ -2220,14 +2420,18 @@ impl Dlg {
             d.insert_temp(egui::Id::new("dlg_born"), born);
         });
         let pal = crate::theme::palette();
+        let enter = anim_enter(ctx, id);
         // 模态遮挡：半透明深灰蓝遮罩压暗底层密集网格线，让弹窗干净浮出，并吞掉背景点击
         if self.block_background {
+            let scrim = lerp_color(Color32::TRANSPARENT, pal.dialog_scrim, enter);
             egui::Area::new(id.with("block"))
                 .order(egui::Order::Middle)
                 .fixed_pos(screen.min)
                 .show(ctx, |ui| {
                     let r = egui::Rect::from_min_size(screen.min, screen.size());
-                    ui.painter().rect_filled(r, 0.0, pal.dialog_scrim);
+                    if scrim != Color32::TRANSPARENT {
+                        ui.painter().rect_filled(r, 0.0, scrim);
+                    }
                     // 遮挡层只吞点击，不参与 Tab 焦点（否则 Tab 会卡在它上面，进不到对话框里）
                     let resp = ui.interact(r, id.with("blocki"), drag_only_sense());
                     let _ = resp;
@@ -2238,9 +2442,14 @@ impl Dlg {
         } else {
             (screen.height() - 24.0).max(420.0)
         };
+        let slide_y = (1.0 - enter) * 3.0;
+        let draw_pos = egui::pos2(
+            pos.x,
+            (pos.y + slide_y).min((screen.bottom() - 40.0).max(screen.top() + 4.0)),
+        );
         let out = egui::Area::new(id.with("area"))
             .order(egui::Order::Foreground)
-            .fixed_pos(pos)
+            .fixed_pos(draw_pos)
             .default_size([w, area_h])
             .show(ctx, |ui| {
                 let high_contrast = pal.theme == crate::theme::AppTheme::HighContrast;
@@ -2516,7 +2725,12 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
         if resp.enabled() && *v < max { node.add_action(Action::Increment); }
         if resp.enabled() && *v > min { node.add_action(Action::Decrement); }
     });
-    let border_col = if focused { pal.accent } else if resp.hovered() { pal.text_muted } else { pal.card_border };
+    let spin_hov = anim_hover(ui.ctx(), resp.id.with("spin_hov"), resp.hovered() && !focused);
+    let border_col = if focused {
+        pal.accent
+    } else {
+        lerp_color(pal.card_border, pal.text_muted, spin_hov)
+    };
     ui.painter().rect(
         rect,
         4.0,
@@ -2543,14 +2757,23 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
     let pointer = resp.hover_pos();
     for (r, up, enabled) in [(a, true, *v < max), (b, false, *v > min)] {
         let hv = enabled && pointer.is_some_and(|pos| r.contains(pos));
-        if hv {
-            let fill = if resp.is_pointer_button_down_on() { pal.pressed } else { pal.hover };
+        let step_hov = anim_hover(ui.ctx(), resp.id.with(("spin_step", up)), hv);
+        let fill = if hv && resp.is_pointer_button_down_on() {
+            pal.pressed
+        } else {
+            lerp_color(Color32::TRANSPARENT, pal.hover, step_hov)
+        };
+        if fill != Color32::TRANSPARENT {
             ui.painter().rect_filled(r.shrink(1.0), 3.0, fill);
         }
         let c = r.center();
         let st = Stroke::new(
             1.3,
-            if !enabled { disabled_color(pal) } else if hv { pal.text } else { pal.text_weak },
+            if !enabled {
+                disabled_color(pal)
+            } else {
+                lerp_color(pal.text_weak, pal.text, step_hov)
+            },
         );
         let dy = if up { 1.5 } else { -1.5 };
         ui.painter().add(egui::Shape::line(vec![
@@ -2627,31 +2850,34 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
             let pos = Align2::CENTER_CENTER
                 .anchor_size(rect.center(), galley.size())
                 .min;
+            let chip = rect.shrink2(Vec2::new(1.0, 3.0));
+            let tab_hov = anim_hover(ui.ctx(), id.with(("dlgtab_hov", i)), !on && resp.hovered());
+            let tab_act = anim_toggle(ui.ctx(), id.with(("dlgtab_act", i)), on);
             if on {
                 let (fill, ink) = active_dialog_tab_colors(pal);
-                let chip = rect.shrink2(Vec2::new(1.0, 3.0));
                 ui.painter().rect_filled(chip, 6.0, fill);
-                let bar_w = galley.size().x.clamp(16.0, (chip.width() - 10.0).max(16.0));
+                let full_w = galley.size().x.clamp(16.0, (chip.width() - 10.0).max(16.0));
+                let bar_w = egui::lerp((full_w * 0.45)..=full_w, tab_act);
                 let bar_y = if pal.theme == crate::theme::AppTheme::HighContrast {
                     rect.bottom() - 1.0
                 } else {
                     chip.bottom() - 1.5
                 };
                 let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
-                ui.painter().rect_filled(bar, 1.0, pal.accent);
+                let bar_col = lerp_color(Color32::TRANSPARENT, pal.accent, tab_act);
+                if bar_col != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(bar, 1.0, bar_col);
+                }
                 ui.painter().galley_with_override_text_color(pos, galley, ink);
             } else {
-                if resp.hovered() {
-                    ui.painter().rect_filled(
-                        rect.shrink2(Vec2::new(1.0, 3.0)),
-                        6.0,
-                        pal.hover,
-                    );
+                let bg = lerp_color(Color32::TRANSPARENT, pal.hover, tab_hov);
+                if bg != Color32::TRANSPARENT {
+                    ui.painter().rect_filled(chip, 6.0, bg);
                 }
                 ui.painter().galley_with_override_text_color(
                     pos,
                     galley,
-                    if resp.hovered() { pal.text } else { pal.text_weak },
+                    lerp_color(pal.text_weak, pal.text, tab_hov),
                 );
             }
             tab_focus_ring(ui, &resp, rect.shrink2(Vec2::new(1.0, 3.0)), 6.0, on);
@@ -3047,5 +3273,150 @@ mod state_tests {
             });
             assert!(!out.shapes.is_empty(), "brand logo should emit vector shapes");
         }
+    }
+
+    #[test]
+    fn lerp_color_preserves_endpoints_and_transparent_rgb() {
+        let target = Color32::from_rgb(238, 242, 247);
+        let accent = Color32::from_rgb(33, 115, 70);
+        // Exact endpoint equality
+        assert_eq!(lerp_color(Color32::TRANSPARENT, target, 0.0), Color32::TRANSPARENT);
+        assert_eq!(lerp_color(Color32::TRANSPARENT, target, 0.0005), Color32::TRANSPARENT);
+        assert_eq!(lerp_color(Color32::TRANSPARENT, target, 1.0), target);
+        assert_eq!(lerp_color(Color32::TRANSPARENT, target, 0.9995), target);
+        assert_eq!(lerp_color(target, accent, 0.0), target);
+        assert_eq!(lerp_color(target, accent, 1.0), accent);
+
+        // Alpha-safe fade from TRANSPARENT keeps target RGB (never blends through black)
+        let mid_in = lerp_color(Color32::TRANSPARENT, target, 0.5);
+        let [r, g, b, a] = mid_in.to_srgba_unmultiplied();
+        assert!((120..=135).contains(&a), "expected ~50% alpha, got {a}");
+        assert!(
+            r.abs_diff(target.r()) <= 2 && g.abs_diff(target.g()) <= 2 && b.abs_diff(target.b()) <= 2,
+            "TRANSPARENT -> target must preserve target RGB: got ({r},{g},{b}) vs {:?}",
+            target
+        );
+
+        // Alpha-safe fade to TRANSPARENT keeps source RGB
+        let mid_out = lerp_color(accent, Color32::TRANSPARENT, 0.5);
+        let [r2, g2, b2, a2] = mid_out.to_srgba_unmultiplied();
+        assert!((120..=135).contains(&a2), "expected ~50% alpha, got {a2}");
+        assert!(
+            r2.abs_diff(accent.r()) <= 2 && g2.abs_diff(accent.g()) <= 2 && b2.abs_diff(accent.b()) <= 2,
+            "source -> TRANSPARENT must preserve source RGB: got ({r2},{g2},{b2}) vs {:?}",
+            accent
+        );
+    }
+
+    #[test]
+    fn anim_hover_and_toggle_reach_exact_endpoints_and_high_contrast_is_instant() {
+        let orig = crate::theme::current_theme();
+        crate::theme::set_current_theme(crate::theme::AppTheme::Light);
+
+        let ctx = egui::Context::default();
+        let hov_id = egui::Id::new("test_anim_hover");
+        let tog_id = egui::Id::new("test_anim_toggle");
+        let run_step = |t: f64, active: bool| -> (f32, f32) {
+            let mut hv = 0.0;
+            let mut tg = 0.0;
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    hv = anim_hover(ctx, hov_id, active);
+                    tg = anim_toggle(ctx, tog_id, active);
+                },
+            );
+            (hv, tg)
+        };
+
+        // Initialized at rest -> exact 0.0
+        assert_eq!(run_step(1.0, false), (0.0, 0.0));
+        // Mid-transition at +50ms -> strictly between 0 and 1
+        let (hv_mid, tg_mid) = run_step(1.05, true);
+        assert!(hv_mid > 0.0 && hv_mid < 1.0, "hover mid={hv_mid}");
+        assert!(tg_mid > 0.0 && tg_mid < 1.0, "toggle mid={tg_mid}");
+        // Settled well past 140ms -> exact 1.0
+        assert_eq!(run_step(1.30, true), (1.0, 1.0));
+        // Fade back out -> settles to exact 0.0
+        let (hv_out, tg_out) = run_step(1.35, false);
+        assert!(hv_out > 0.0 && hv_out < 1.0, "hover out={hv_out}");
+        assert!(tg_out > 0.0 && tg_out < 1.0, "toggle out={tg_out}");
+        assert_eq!(run_step(1.60, false), (0.0, 0.0));
+
+        // HighContrast snaps immediately without muddy intermediate alpha
+        crate::theme::set_current_theme(crate::theme::AppTheme::HighContrast);
+        assert_eq!(run_step(1.61, true), (1.0, 1.0));
+        assert_eq!(run_step(1.62, false), (0.0, 0.0));
+
+        crate::theme::set_current_theme(orig);
+    }
+
+    #[test]
+    fn anim_enter_settles_cleanly_and_snaps_on_static_frames() {
+        let orig = crate::theme::current_theme();
+        crate::theme::set_current_theme(crate::theme::AppTheme::Light);
+
+        // 1. Static single-frame harness (`RawInput::default()`, pass == 0) snaps immediately to 1.0
+        let static_ctx = egui::Context::default();
+        let mut static_val = 0.0;
+        let _ = static_ctx.run(egui::RawInput::default(), |ctx| {
+            static_val = anim_enter(ctx, egui::Id::new("static_enter"));
+        });
+        assert_eq!(static_val, 1.0, "static single-frame test must land crisp at 1.0");
+
+        // 2. Real advancing time (opened after boot pass 0) eases smoothly 0.0 -> (0..1) -> 1.0 and stops repainting
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput { time: Some(1.0), ..Default::default() }, |_| {});
+        let eid = egui::Id::new("live_enter");
+        let step = |t: f64| -> (f32, bool) {
+            let mut val = 0.0;
+            let out = ctx.run(
+                egui::RawInput {
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    val = anim_enter(ctx, eid);
+                },
+            );
+            let repaint = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay.is_zero();
+            (val, repaint)
+        };
+        let (v0, rep0) = step(2.0);
+        assert_eq!(v0, 0.0);
+        assert!(rep0, "opening frame should request repaint to animate");
+        let (v1, rep1) = step(2.04);
+        assert!(v1 > 0.0 && v1 < 1.0, "mid entrance should ease smoothly: {v1}");
+        assert!(rep1, "mid entrance should continue repainting");
+        let (v2, _) = step(2.20);
+        assert_eq!(v2, 1.0, "entrance must settle at exact 1.0");
+        // Drain egui's single trailing pass from prior request_repaint(), then verify 0 idle repaints.
+        let (v3, _) = step(2.25);
+        assert_eq!(v3, 1.0);
+        let (v4, rep4) = step(2.30);
+        assert_eq!(v4, 1.0);
+        assert!(!rep4, "settled entrance must not request idle repaints");
+
+        // 3. Frozen clock (`dt == 0.0`) settles cleanly to 1.0
+        let fid = egui::Id::new("frozen_enter");
+        let _ = ctx.run(egui::RawInput { time: Some(3.0), ..Default::default() }, |ctx| {
+            let _ = anim_enter(ctx, fid);
+        });
+        let mut frozen_val = 0.0;
+        let _ = ctx.run(egui::RawInput { time: Some(3.0), ..Default::default() }, |ctx| {
+            frozen_val = anim_enter(ctx, fid);
+        });
+        assert_eq!(frozen_val, 1.0, "zero-dt repeated frame must settle to 1.0");
+
+        // 4. HighContrast always lands immediately at 1.0
+        crate::theme::set_current_theme(crate::theme::AppTheme::HighContrast);
+        let (vhc, rephc) = step(5.0);
+        assert_eq!(vhc, 1.0);
+        assert!(!rephc);
+
+        crate::theme::set_current_theme(orig);
     }
 }

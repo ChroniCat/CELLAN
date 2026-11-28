@@ -1839,10 +1839,10 @@ fn bottom_horizontal_scrollbar_mouse_wheel_moves_scroll_and_thumb() {
         let mut candidates = Vec::new();
         for cs in shapes {
             if let egui::epaint::Shape::Rect(r) = &cs.shape {
-                // 滑块位于底栏内；空闲时 5 点，悬停时 8 点。
+                // 滑块位于底栏内；空闲时 5 点，悬停时平滑扩展至 8 点。
                 if r.rect.top() >= 850.0
                     && r.rect.bottom() <= 876.0
-                    && (r.rect.height() == 5.0 || r.rect.height() == 8.0)
+                    && (4.9..=8.1).contains(&r.rect.height())
                     && r.rect.width() >= 24.0
                     && r.rect.width() < 520.0
                     && r.rect.left() > 700.0
