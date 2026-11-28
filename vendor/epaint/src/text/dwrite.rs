@@ -1205,13 +1205,13 @@ mod win_impl {
             }
         }
 
-        fn advance_px(
+        fn glyph_metrics_px(
             &self,
             glyph_id: u16,
             em_size_dips: f32,
             pixels_per_point: f32,
             measuring_mode: u32,
-        ) -> Option<f32> {
+        ) -> Option<(f32, f32)> {
             let mut gm = DWriteGlyphMetrics::default();
             let hr = match measuring_mode {
                 DWRITE_MEASURING_MODE_GDI_CLASSIC | DWRITE_MEASURING_MODE_GDI_NATURAL => {
@@ -1249,14 +1249,17 @@ mod win_impl {
             if !succeeded(hr) {
                 return None;
             }
-            let raw_px = (gm.advanceWidth as f32)
-                * (em_size_dips * pixels_per_point)
-                / (self.design_units_per_em as f32);
-            if pixels_per_point <= 1.25 || measuring_mode == DWRITE_MEASURING_MODE_GDI_CLASSIC {
-                Some(raw_px.round())
+            let scale = (em_size_dips * pixels_per_point) / (self.design_units_per_em as f32);
+            let raw_px = (gm.advanceWidth as f32) * scale;
+            let lsb_px = (gm.leftSideBearing as f32) * scale;
+            let adv_px = if pixels_per_point <= 1.25
+                || measuring_mode == DWRITE_MEASURING_MODE_GDI_CLASSIC
+            {
+                raw_px.round()
             } else {
-                Some(raw_px)
-            }
+                raw_px
+            };
+            Some((adv_px, lsb_px))
         }
 
         #[cfg(test)]
@@ -1288,8 +1291,8 @@ mod win_impl {
             let sys = dwrite_system()?;
             let (rendering_mode, measuring_mode) =
                 self.select_modes(sys, em_size_dips, pixels_per_point);
-            let advance_px =
-                self.advance_px(glyph_id, em_size_dips, pixels_per_point, measuring_mode)?;
+            let (advance_px, lsb_px) =
+                self.glyph_metrics_px(glyph_id, em_size_dips, pixels_per_point, measuring_mode)?;
 
             let run = DWriteGlyphRun {
                 fontFace: self.face.as_ptr(),
@@ -1401,16 +1404,60 @@ mod win_impl {
                 if !succeeded(hr_tex) {
                     return None;
                 }
+                // Trim all-zero transparent border rows/columns from aliased bitmap.
+                let mut x0 = 0usize;
+                let mut x1 = width;
+                let mut y0 = 0usize;
+                let mut y1 = height;
+                while y0 < y1 && alpha[y0 * width..(y0 + 1) * width].iter().all(|&a| a == 0) {
+                    y0 += 1;
+                }
+                while y1 > y0
+                    && alpha[(y1 - 1) * width..y1 * width].iter().all(|&a| a == 0)
+                {
+                    y1 -= 1;
+                }
+                while x0 < x1 && (y0..y1).all(|y| alpha[y * width + x0] == 0) {
+                    x0 += 1;
+                }
+                while x1 > x0 && (y0..y1).all(|y| alpha[y * width + (x1 - 1)] == 0) {
+                    x1 -= 1;
+                }
+                let tw = x1 - x0;
+                let th = y1 - y0;
+                if tw == 0 || th == 0 {
+                    return Some(RasterizedGlyph {
+                        left: 0,
+                        top: 0,
+                        width: 0,
+                        height: 0,
+                        advance_px,
+                        pixels: None,
+                    });
+                }
                 let pixels = if subpixel {
-                    GlyphPixels::SubpixelRgb(alpha.into_iter().map(|a| [a, a, a]).collect())
+                    let mut rgb = Vec::with_capacity(tw * th);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let a = alpha[y * width + x];
+                            rgb.push([a, a, a]);
+                        }
+                    }
+                    GlyphPixels::SubpixelRgb(rgb)
                 } else {
-                    GlyphPixels::Grayscale(alpha.into_iter().map(|a| a as f32 / 255.0).collect())
+                    let mut gray = Vec::with_capacity(tw * th);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            gray.push(alpha[y * width + x] as f32 / 255.0);
+                        }
+                    }
+                    GlyphPixels::Grayscale(gray)
                 };
                 Some(RasterizedGlyph {
-                    left: bounds.left,
-                    top: bounds.top,
-                    width,
-                    height,
+                    left: bounds.left + x0 as i32,
+                    top: bounds.top + y0 as i32,
+                    width: tw,
+                    height: th,
                     advance_px,
                     pixels: Some(pixels),
                 })
@@ -1431,32 +1478,119 @@ mod win_impl {
                 if !succeeded(hr_tex) {
                     return None;
                 }
+
+                // 1. Trim all-zero transparent border rows & columns (DirectWrite's 3-tap ClearType
+                //    filter always pads GetAlphaTextureBounds horizontally by 1px even when empty).
+                let px_rgb = |x: usize, y: usize| -> [u8; 3] {
+                    let i = (y * width + x) * 3;
+                    if bgr {
+                        [raw_rgb[i + 2], raw_rgb[i + 1], raw_rgb[i]]
+                    } else {
+                        [raw_rgb[i], raw_rgb[i + 1], raw_rgb[i + 2]]
+                    }
+                };
+                let mut x0 = 0usize;
+                let mut x1 = width;
+                let mut y0 = 0usize;
+                let mut y1 = height;
+                while y0 < y1 && (0..width).all(|x| px_rgb(x, y0) == [0, 0, 0]) {
+                    y0 += 1;
+                }
+                while y1 > y0 && (0..width).all(|x| px_rgb(x, y1 - 1) == [0, 0, 0]) {
+                    y1 -= 1;
+                }
+                while x0 < x1 && (y0..y1).all(|y| px_rgb(x0, y) == [0, 0, 0]) {
+                    x0 += 1;
+                }
+                while x1 > x0 && (y0..y1).all(|y| px_rgb(x1 - 1, y) == [0, 0, 0]) {
+                    x1 -= 1;
+                }
+
+                // 2. For non-overhanging glyphs (design leftSideBearing >= -0.25px), DirectWrite's
+                //    3-tap ClearType filter can spill a faint 1px apron into x = -1 (`bounds.left + x0 < 0`),
+                //    which pushes `visual_bounding_rect().min.x` 1px outside tight widget clip rects.
+                //    - In grayscale mode: trim x < 0 columns and fold their residual luma into x = 0.
+                //    - In ClearType subpixel mode: trim a pure filter-tail column at x < 0 whose outer
+                //      subpixel (R on RGB / B on BGR) is zero (not a real glyph stem).
+                let mut folded_left_gray: Option<Vec<f32>> = None;
+                if lsb_px >= -0.25 {
+                    if !subpixel {
+                        let mut fold = vec![0.0_f32; y1.saturating_sub(y0)];
+                        let mut trimmed_any = false;
+                        while x0 + 1 < x1 && bounds.left + x0 as i32 <= -1 {
+                            for (ry, y) in (y0..y1).enumerate() {
+                                let [r, g, b] = px_rgb(x0, y);
+                                fold[ry] += (0.299 * r as f32
+                                    + 0.587 * g as f32
+                                    + 0.114 * b as f32)
+                                    / 255.0;
+                            }
+                            x0 += 1;
+                            trimmed_any = true;
+                        }
+                        if trimmed_any {
+                            folded_left_gray = Some(fold);
+                        }
+                    } else {
+                        while x0 + 1 < x1 && bounds.left + x0 as i32 <= -1 {
+                            let is_filter_tail_only = (y0..y1).all(|y| {
+                                let [r, _g, _b] = px_rgb(x0, y);
+                                r == 0
+                            });
+                            if is_filter_tail_only {
+                                x0 += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let tw = x1 - x0;
+                let th = y1 - y0;
+                if tw == 0 || th == 0 {
+                    return Some(RasterizedGlyph {
+                        left: 0,
+                        top: 0,
+                        width: 0,
+                        height: 0,
+                        advance_px,
+                        pixels: None,
+                    });
+                }
+
                 let pixels = if subpixel {
-                    let mut rgb = Vec::with_capacity(pixel_count);
-                    for chunk in raw_rgb.chunks_exact(3) {
-                        if bgr {
-                            rgb.push([chunk[2], chunk[1], chunk[0]]);
-                        } else {
-                            rgb.push([chunk[0], chunk[1], chunk[2]]);
+                    let mut rgb = Vec::with_capacity(tw * th);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            rgb.push(px_rgb(x, y));
                         }
                     }
                     GlyphPixels::SubpixelRgb(rgb)
                 } else {
-                    let mut gray = Vec::with_capacity(pixel_count);
-                    for chunk in raw_rgb.chunks_exact(3) {
-                        let cov = (0.299 * chunk[0] as f32
-                            + 0.587 * chunk[1] as f32
-                            + 0.114 * chunk[2] as f32)
-                            / 255.0;
-                        gray.push(cov.clamp(0.0, 1.0));
+                    let mut gray = Vec::with_capacity(tw * th);
+                    for (ry, y) in (y0..y1).enumerate() {
+                        for (rx, x) in (x0..x1).enumerate() {
+                            let [r, g, b] = px_rgb(x, y);
+                            let mut cov = (0.299 * r as f32
+                                + 0.587 * g as f32
+                                + 0.114 * b as f32)
+                                / 255.0;
+                            if rx == 0 {
+                                if let Some(fold) = &folded_left_gray {
+                                    cov += fold[ry];
+                                }
+                            }
+                            gray.push(cov.clamp(0.0, 1.0));
+                        }
                     }
                     GlyphPixels::Grayscale(gray)
                 };
                 Some(RasterizedGlyph {
-                    left: bounds.left,
-                    top: bounds.top,
-                    width,
-                    height,
+                    left: bounds.left + x0 as i32,
+                    top: bounds.top + y0 as i32,
+                    width: tw,
+                    height: th,
                     advance_px,
                     pixels: Some(pixels),
                 })
@@ -1680,6 +1814,35 @@ mod win_impl {
                                 rast.advance_px
                             );
                         }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn dwrite_trims_empty_filter_apron_for_non_overhanging_glyphs() {
+            // Verify non-overhanging glyphs do not get a negative left offset from
+            // DirectWrite's 1px horizontal ClearType filter padding in either mode.
+            for (path, chars) in [
+                (r"C:\Windows\Fonts\segoeui.ttf", &['A', 'H', '0'][..]),
+                (r"C:\Windows\Fonts\msyh.ttc", &['查', '部', '营'][..]),
+            ] {
+                let Some(fd) = load_font_file(path, 0) else {
+                    continue;
+                };
+                let face = DWriteFace::from_font_data(&fd).expect("DWriteFace");
+                for &subpixel in &[false, true] {
+                    for &ch in chars {
+                        let gid = face.glyph_index_for_char(ch).unwrap();
+                        let rast = face
+                            .rasterize_glyph(gid, 12.0, 1.0, subpixel)
+                            .expect("rasterize");
+                        assert!(
+                            rast.left >= 0,
+                            "non-overhanging glyph {ch:?} in {path} (subpixel={subpixel}) had negative left={}",
+                            rast.left
+                        );
+                        assert!(rast.width > 0 && rast.height > 0);
                     }
                 }
             }
