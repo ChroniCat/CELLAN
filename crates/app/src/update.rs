@@ -24,7 +24,7 @@ pub const APP_NAME: &str = "CELLAN";
 pub const APP_FULL_NAME: &str = "Concurrent Engine for Local-first, Lock-free Async Networks";
 
 /// 当前版本（全应用唯一版本常量：开始页、关于窗口、检查更新、打包元数据共用）。
-pub const VERSION: &str = "1.88";
+pub const VERSION: &str = "1.89";
 
 /// 完整三段式版本号（与 Cargo.toml 及 PE FileVersion 保持一致，供关于窗口明确展示）。
 pub const FULL_VERSION: &str = env!("CARGO_PKG_VERSION");
