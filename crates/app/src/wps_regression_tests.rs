@@ -3550,3 +3550,79 @@ fn comments_editor_window_width_stable_and_sidebar_close_no_tofu() {
     );
     assert!(!app.comments_panel.open, "点击批注侧边栏矢量关闭按钮应关闭面板");
 }
+
+#[test]
+fn shell_geometry_and_focus_anchors_align_across_themes_and_sizes() {
+    fn collect_rects(shapes: &[egui::epaint::Shape], out: &mut Vec<egui::epaint::RectShape>) {
+        for s in shapes {
+            match s {
+                egui::epaint::Shape::Rect(r) => out.push(r.clone()),
+                egui::epaint::Shape::Vec(v) => collect_rects(v, out),
+                _ => {}
+            }
+        }
+    }
+
+    let _env = crate::test_env::TestEnv::new("shell-geometry-186");
+    let ctx = egui::Context::default();
+    install_fonts(&ctx);
+    let mut app = wps_app(&ctx);
+    let mut host = eframe::Frame::_new_kittest();
+
+    for theme in theme::AppTheme::ALL {
+        app.prefs.theme = theme as u8;
+        app.theme_applied = None;
+        for (w, h) in [(760.0, 420.0), (1440.0, 900.0), (1920.0, 1080.0)] {
+            let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(w, h));
+            let mut render = |app: &mut SheetApp| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ctx| eframe::App::update(app, ctx, &mut host),
+                )
+            };
+            let _ = render(&mut app);
+            let out = render(&mut app);
+            let pal = theme::palette();
+            let mut rects = Vec::new();
+            for cs in &out.shapes {
+                collect_rects(std::slice::from_ref(&cs.shape), &mut rects);
+            }
+
+            // Grid canvas must be edge-to-edge full-width (no 8px left/right gutter).
+            assert!(
+                app.last_pane.x.abs() <= 1.0,
+                "grid should align flush with left edge at {w}x{h} ({theme:?}), got last_pane={:?}",
+                app.last_pane
+            );
+            assert!(
+                (app.last_view.x + SB - w).abs() <= 2.0,
+                "grid + vertical scrollbar should span full viewport width {w} ({theme:?}), got last_view={:?}",
+                app.last_view
+            );
+            // Floating Ribbon body card uses 8px side margins and 8px radius.
+            assert!(
+                rects.iter().any(|r| {
+                    (r.rect.left() - 8.0).abs() <= 1.0
+                        && (r.rect.right() - (w - 8.0)).abs() <= 1.0
+                        && (r.rect.height() - ui_kit::RIBBON_BODY_H).abs() <= 2.0
+                        && r.fill == pal.ribbon_bg
+                }),
+                "ribbon body floating card missing at {w}x{h} ({theme:?})"
+            );
+            // Both active Ribbon tab and active Sheet tab paint a refined 2px accent indicator bar.
+            let accent_bars = rects
+                .iter()
+                .filter(|r| {
+                    r.fill == pal.accent && r.rect.width() >= 14.0 && r.rect.height() <= 2.5
+                })
+                .count();
+            assert!(
+                accent_bars >= 2,
+                "expected active Ribbon tab + active Sheet tab accent indicators at {w}x{h} ({theme:?}), got {accent_bars}"
+            );
+        }
+    }
+}

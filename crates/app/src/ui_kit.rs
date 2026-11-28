@@ -25,15 +25,15 @@ pub const BRAND_MINT: Color32 = Color32::from_rgb(15, 168, 126);
 pub const BRAND_AQUA: Color32 = Color32::from_rgb(69, 214, 172);
 pub const BRAND_AQUA_LIGHT: Color32 = Color32::from_rgb(132, 238, 208);
 
-/// 悬浮卡片：纯白四圆角卡片浮于冷灰蓝 PAGE_BG 之上，配清晰利落的 1px CARD_BORDER。
-pub const PAGE_BG: Color32 = Color32::from_rgb(240, 243, 248);
-pub const CARD_BORDER: Color32 = Color32::from_rgb(205, 213, 224);
+/// 悬浮卡片：纯白四圆角卡片浮于柔和 PAGE_BG 之上，配清晰利落的 1px CARD_BORDER（与 Light 调色板对齐）。
+pub const PAGE_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const CARD_BORDER: Color32 = Color32::from_rgb(218, 223, 231);
 /// 页签栏底色（Fluent 架构下直接与 PAGE_BG 融为一体，消除双拼色断层边框）
-pub const TABSTRIP_BG: Color32 = Color32::from_rgb(240, 243, 248);
-pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(205, 213, 224);
-/// 灰底上的悬停色：与冷灰底拉开明确明度差
-pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(225, 231, 240);
-/// 卡片圆角：功能区/网格 8px，编辑栏 6px
+pub const TABSTRIP_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const TABSTRIP_LINE: Color32 = Color32::from_rgb(218, 223, 231);
+/// 灰底上的悬停色：与页面底色拉开明确明度差
+pub const HOVER_ON_PAGE: Color32 = Color32::from_rgb(231, 236, 243);
+/// 卡片圆角：功能区卡片 8px
 pub const CARD_R: u8 = 8;
 
 /// 纯矢量绘制 CELLAN 品牌标志（240×240 归一化坐标系，与 `assets/logo.svg` 严格同源）。
@@ -152,6 +152,7 @@ pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
 
 /// 把一块已经画满（直角）的区域收成圆角卡片：四角先用页面底色「抠」掉，再描 1px 边。
 /// egui 的裁切只有矩形，网格、表头、滚动条又各自直角铺色，只能事后盖住四个角。
+#[allow(dead_code)]
 pub fn card_outline(painter: &egui::Painter, rect: Rect, r: f32, bg: Color32, border: Color32) {
     use egui::epaint::{Mesh, Shape};
     let mut mesh = Mesh::default();
@@ -212,11 +213,17 @@ fn fam_ui_medium() -> FontFamily {
     F.get_or_init(|| FontFamily::Name("ui-medium".into())).clone()
 }
 
+fn fam_ui_italic() -> FontFamily {
+    static F: OnceLock<FontFamily> = OnceLock::new();
+    F.get_or_init(|| FontFamily::Name("ui-italic".into())).clone()
+}
+
 const MASK_DEFAULT_BOLD: u8 = 1 << 0;
 const MASK_UI_BOLD: u8 = 1 << 1;
 const MASK_UI_MEDIUM: u8 = 1 << 2;
+const MASK_UI_ITALIC: u8 = 1 << 3;
 
-/// 按 `(UI_FONTS_GEN, system_fonts::generation())` 缓存三个常用 UI 字族是否存在，
+/// 按 `(UI_FONTS_GEN, system_fonts::generation())` 缓存四个常用 UI 字族是否存在，
 /// 消除每次调用 `ctx.fonts(|f| f.families())` 产生的 `Vec<FontFamily>` 堆分配。
 fn font_family_mask(ctx: &egui::Context) -> u8 {
     let key = (
@@ -240,6 +247,9 @@ fn font_family_mask(ctx: &egui::Context) -> u8 {
         }
         if fams.contains(&fam_ui_medium()) {
             m |= MASK_UI_MEDIUM;
+        }
+        if fams.contains(&fam_ui_italic()) {
+            m |= MASK_UI_ITALIC;
         }
         m
     });
@@ -276,13 +286,22 @@ pub fn ui_bold_in(ctx: &egui::Context, size: f32) -> FontId {
     }
 }
 
-/// 500~600 中黑字重（拉丁走 Segoe UI Semibold 600，中文走 Microsoft YaHei UI）。
+/// 500~600 中黑字重（拉丁走 Segoe UI Semibold 600，中文走 500 Medium / 微软雅黑 UI）。
 /// 小字号（12~13px）按钮/页签/文件名使用单遍原生渲染，彻底杜绝亚像素双描造成的竖画重影发虚。
 pub fn medium_in(ctx: &egui::Context, size: f32) -> FontId {
     if font_family_mask(ctx) & MASK_UI_MEDIUM != 0 {
         FontId::new(size, fam_ui_medium())
     } else {
         FontId::proportional(size)
+    }
+}
+
+/// 真斜体西文字族（`ui-italic`，由 `system_fonts` 挂载 `segoeuii.ttf` 时生效）；未注册时返回 `None`。
+pub fn ui_italic_in(ctx: &egui::Context, size: f32) -> Option<FontId> {
+    if font_family_mask(ctx) & MASK_UI_ITALIC != 0 {
+        Some(FontId::new(size, fam_ui_italic()))
+    } else {
+        None
     }
 }
 
@@ -369,17 +388,17 @@ pub const DISABLED: Color32 = Color32::from_rgb(166, 166, 166);
 pub const HEAD_LINE: Color32 = Color32::from_rgb(171, 171, 171);
 /// 功能区分组之间的竖线
 pub const SEP: Color32 = Color32::from_rgb(228, 232, 240);
-pub const TEXT: Color32 = Color32::from_rgb(23, 31, 46);
-pub const TEXT_WEAK: Color32 = Color32::from_rgb(100, 116, 139);
-pub const HEADER_BG: Color32 = Color32::from_rgb(245, 247, 250);
-pub const HEADER_SEL: Color32 = Color32::from_rgb(226, 232, 240);
-pub const GRID_LINE: Color32 = Color32::from_rgb(220, 225, 232);
+pub const TEXT: Color32 = Color32::from_rgb(26, 31, 39);
+pub const TEXT_WEAK: Color32 = Color32::from_rgb(92, 100, 112);
+pub const HEADER_BG: Color32 = Color32::from_rgb(247, 248, 251);
+pub const HEADER_SEL: Color32 = Color32::from_rgb(224, 241, 232);
+pub const GRID_LINE: Color32 = Color32::from_rgb(226, 230, 236);
 /// 页签行底色
-pub const TABBAR_BG: Color32 = Color32::from_rgb(240, 243, 248);
+pub const TABBAR_BG: Color32 = Color32::from_rgb(243, 245, 248);
 /// 标题栏底色
-pub const TITLE_BG: Color32 = Color32::from_rgb(240, 243, 248);
-pub const HOVER: Color32 = Color32::from_rgb(239, 243, 249);
-pub const PRESSED: Color32 = Color32::from_rgb(228, 234, 243);
+pub const TITLE_BG: Color32 = Color32::from_rgb(243, 245, 248);
+pub const HOVER: Color32 = Color32::from_rgb(238, 242, 247);
+pub const PRESSED: Color32 = Color32::from_rgb(222, 228, 237);
 pub const STATUS_BG: Color32 = Color32::from_rgb(245, 247, 250);
 
 /// 标题栏（自绘，含文档标签与窗口按钮）
@@ -431,13 +450,23 @@ pub(crate) fn text_color(v: &egui::Visuals) -> Color32 {
         .unwrap_or_else(|| crate::theme::palette().text)
 }
 
+/// 禁用态前景（文字与图标）：浅色主题与经典禁用灰 `DISABLED`（#A6A6A6）一致，
+/// 护眼 / 深色 / 高对比主题沿用当前调色板 `text_muted`。
+pub fn disabled_color(pal: crate::theme::ThemePalette) -> Color32 {
+    if pal.theme == crate::theme::AppTheme::Light {
+        DISABLED
+    } else {
+        pal.text_muted
+    }
+}
+
 /// Excel 浅色主题；深色沿用原来的深灰配色（Excel 也有深色模式）。
 /// 两套主题都要显式写入：egui 切主题时会用「该主题已保存的样式」，
 /// 只改当前主题会让系统深色模式下功能区变成默认灰。
 pub fn apply_theme(ctx: &egui::Context) {
     let mut base = (*ctx.style()).clone();
     base.text_styles = [
-        (egui::TextStyle::Heading, FontId::proportional(13.0)),
+        (egui::TextStyle::Heading, FontId::proportional(14.0)),
         (egui::TextStyle::Body, FontId::proportional(12.0)),
         (egui::TextStyle::Button, FontId::proportional(12.0)),
         (egui::TextStyle::Small, FontId::proportional(11.0)),
@@ -557,8 +586,9 @@ pub fn popup_frame(style: &egui::Style) -> egui::Frame {
 
 /// 浮层菜单标准行（27px 舒适行高、左对齐、5px 圆角悬停高亮）
 pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> Response {
+    let pal = crate::theme::palette();
     let col = if !enabled {
-        DISABLED
+        disabled_color(pal)
     } else {
         text_color(ui.visuals())
     };
@@ -568,7 +598,6 @@ pub fn popup_item(ui: &mut egui::Ui, label: &str, enabled: bool, min_w: f32) -> 
     let w = (galley.size().x + 24.0).max(min_w).max(ui.available_width());
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 27.0), sense);
-    let pal = crate::theme::palette();
     if enabled && resp.is_pointer_button_down_on() {
         ui.painter().rect_filled(rect, 5.0, pal.pressed);
     } else if enabled && resp.hovered() {
@@ -689,10 +718,11 @@ pub fn group_l(ui: &mut egui::Ui, title: &str, id: &str, add: impl FnOnce(&mut e
     launcher_at(ui, r, id)
 }
 pub fn big_sized(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Response {
+    let pal = crate::theme::palette();
     let col = if ui.is_enabled() {
         text_color(ui.visuals())
     } else {
-        DISABLED
+        disabled_color(pal)
     };
     let galley = (!label.is_empty()).then(|| {
         ui.painter()
@@ -707,23 +737,16 @@ pub fn big_sized_galley(
     galley: Option<Arc<egui::Galley>>,
     size: Vec2,
 ) -> Response {
-    let (dark, sel_bg, hov_bg, txt_col) = {
-        let v = ui.visuals();
-        (
-            v.dark_mode,
-            v.selection.bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            text_color(v),
-        )
-    };
+    let pal = crate::theme::palette();
+    let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() {
-        if dark { sel_bg } else { PRESSED }
+        pal.pressed
     } else if resp.hovered() {
-        if dark { hov_bg } else { HOVER }
+        pal.hover
     } else {
         Color32::TRANSPARENT
     };
@@ -731,7 +754,7 @@ pub fn big_sized_galley(
         ui.painter().rect_filled(rect, 5.0, bg);
     }
     focus_ring(ui, &resp, rect, 5.0);
-    let col = if enabled { txt_col } else { DISABLED };
+    let col = if enabled { txt_col } else { disabled_color(pal) };
     let icon_size = 30.0_f32.min(size.y - 26.0).max(16.0);
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.center().x, rect.top() + 7.0 + icon_size / 2.0),
@@ -755,10 +778,11 @@ pub fn big_sized_split(
     label: &str,
     size: Vec2,
 ) -> (Response, Response) {
+    let pal = crate::theme::palette();
     let col = if ui.is_enabled() {
         text_color(ui.visuals())
     } else {
-        DISABLED
+        disabled_color(pal)
     };
     let galley = (!label.is_empty()).then(|| {
         ui.painter()
@@ -773,15 +797,8 @@ pub fn big_sized_split_galley(
     galley: Option<Arc<egui::Galley>>,
     size: Vec2,
 ) -> (Response, Response) {
-    let (dark, sel_bg, hov_bg, txt_col) = {
-        let v = ui.visuals();
-        (
-            v.dark_mode,
-            v.selection.bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            text_color(v),
-        )
-    };
+    let pal = crate::theme::palette();
+    let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let arrow_rect = Rect::from_min_size(
@@ -798,16 +815,16 @@ pub fn big_sized_split_galley(
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if resp.is_pointer_button_down_on() || aresp.is_pointer_button_down_on() {
-        if dark { sel_bg } else { PRESSED }
+        pal.pressed
     } else if (resp.hovered() && !over_arrow) || aresp.hovered() {
-        if dark { hov_bg } else { HOVER }
+        pal.hover
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 5.0, bg);
     }
-    let col = if enabled { txt_col } else { DISABLED };
+    let col = if enabled { txt_col } else { disabled_color(pal) };
     let icon_size = 28.0_f32.min(size.y - 28.0).max(16.0);
     let icon_rect = Rect::from_center_size(
         egui::pos2(rect.center().x, rect.top() + 6.0 + icon_size / 2.0),
@@ -820,7 +837,6 @@ pub fn big_sized_split_galley(
             .min;
         ui.painter().galley(pos, g, col);
     }
-    let pal = crate::theme::palette();
     if hovered_any && enabled {
         ui.painter().line_segment(
             [
@@ -833,35 +849,28 @@ pub fn big_sized_split_galley(
     caret(
         ui,
         egui::pos2(rect.center().x, rect.bottom() - 7.0),
-        if enabled { pal.text_weak } else { pal.text_muted },
+        if enabled { pal.text_weak } else { disabled_color(pal) },
     );
     (resp, aresp)
 }
 pub fn small_on(ui: &mut egui::Ui, icon: Icon, on: bool, tip: &str) -> Response {
-    let (dark, sel_bg, hov_bg, txt_col) = {
-        let v = ui.visuals();
-        (
-            v.dark_mode,
-            v.selection.bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            text_color(v),
-        )
-    };
+    let pal = crate::theme::palette();
+    let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if on {
-        if dark { sel_bg } else { PRESSED }
+        pal.pressed
     } else if resp.hovered() {
-        if dark { hov_bg } else { HOVER }
+        pal.hover
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
-    let col = if !enabled { DISABLED } else { txt_col };
+    let col = if !enabled { disabled_color(pal) } else { txt_col };
     ui_icons::draw_control(ui, rect.shrink(4.0), icon, col, enabled);
     if !tip.is_empty() && (resp.hovered() || resp.contains_pointer()) {
         resp.on_hover_text(tip)
@@ -931,7 +940,7 @@ pub fn check_row(ui: &mut egui::Ui, label: &str, checked: bool, enabled: bool, w
             egui::StrokeKind::Inside,
         );
     }
-    let fg = if enabled { txt_col } else { DISABLED };
+    let fg = if enabled { txt_col } else { disabled_color(pal) };
     ui.painter().text(
         egui::pos2(rect.left() + 26.0, rect.center().y),
         Align2::LEFT_CENTER,
@@ -962,10 +971,11 @@ pub fn labeled_w_on(
     on: bool,
     tip: &str,
 ) -> Response {
+    let pal = crate::theme::palette();
     let col = if ui.is_enabled() {
         text_color(ui.visuals())
     } else {
-        DISABLED
+        disabled_color(pal)
     };
     let galley = (!label.is_empty()).then(|| {
         ui.painter()
@@ -982,30 +992,23 @@ pub fn labeled_w_on_galley(
     on: bool,
     tip: &str,
 ) -> Response {
-    let (dark, sel_bg, hov_bg, txt_col) = {
-        let v = ui.visuals();
-        (
-            v.dark_mode,
-            v.selection.bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            text_color(v),
-        )
-    };
+    let pal = crate::theme::palette();
+    let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
     let bg = if !enabled {
         Color32::TRANSPARENT
     } else if on || resp.is_pointer_button_down_on() {
-        if dark { sel_bg } else { PRESSED }
+        pal.pressed
     } else if resp.hovered() {
-        if dark { hov_bg } else { HOVER }
+        pal.hover
     } else {
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect, 3.0, bg);
     }
-    let col = if enabled { txt_col } else { DISABLED };
+    let col = if enabled { txt_col } else { disabled_color(pal) };
     let ir = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
         Vec2::splat(16.0),
@@ -1033,17 +1036,10 @@ pub fn labeled_tint(
     tint: Color32,
     tip: &str,
 ) -> Response {
-    let (dark, hov_bg) = {
-        let v = ui.visuals();
-        (v.dark_mode, v.widgets.hovered.weak_bg_fill)
-    };
+    let pal = crate::theme::palette();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::click());
     if resp.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            2.0,
-            if dark { hov_bg } else { HOVER },
-        );
+        ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
     }
     let ir = egui::Rect::from_min_size(
         egui::pos2(rect.left() + 4.0, rect.center().y - 8.0),
@@ -1086,15 +1082,21 @@ pub fn caret_right(ui: &mut egui::Ui, center: egui::Pos2, color: Color32) {
 
 
 
-/// 控件状态底色：禁用不给底、按下/选中用 PRESSED、悬停用 HOVER
+/// 控件状态底色：禁用不给底、按下/选中用当前主题 `pressed`、悬停用 `hover`
 pub fn state_bg(enabled: bool, on: bool, hovered: bool, down: bool, dark: bool) -> Color32 {
     if !enabled {
         return Color32::TRANSPARENT;
     }
+    let pal = crate::theme::palette();
+    let effective = if dark && !pal.theme.is_dark() {
+        crate::theme::palette_for(crate::theme::AppTheme::Dark)
+    } else {
+        pal
+    };
     if down || on {
-        if dark { Color32::from_rgb(62, 72, 86) } else { PRESSED }
+        effective.pressed
     } else if hovered {
-        if dark { Color32::from_rgb(55, 62, 72) } else { HOVER }
+        effective.hover
     } else {
         Color32::TRANSPARENT
     }
@@ -1102,7 +1104,8 @@ pub fn state_bg(enabled: bool, on: bool, hovered: bool, down: bool, dark: bool) 
 
 /// 拆分按钮右侧的小箭头按钮：悬停底色 + 细折线箭头
 pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Response {
-    let dark = ui.visuals().dark_mode;
+    let pal = crate::theme::palette();
+    let dark = ui.visuals().dark_mode || pal.theme.is_dark();
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let bg = state_bg(
@@ -1115,7 +1118,7 @@ pub fn arrow_glyph_button(ui: &mut egui::Ui, size: Vec2, color: Color32) -> Resp
     if bg != Color32::TRANSPARENT {
         ui.painter().rect_filled(rect.shrink(1.0), 2.0, bg);
     }
-    let c = if enabled { color } else { DISABLED };
+    let c = if enabled { color } else { disabled_color(pal) };
     caret(ui, rect.center(), c);
     resp
 }
@@ -1141,7 +1144,7 @@ pub fn color_button(
         ui.painter().rect_filled(rect, 2.0, bg);
     }
     focus_ring(ui, &resp, rect, 2.0);
-    let fg = if enabled { pal.text } else { pal.text_muted };
+    let fg = if enabled { pal.text } else { disabled_color(pal) };
     let center = rect.center() - Vec2::new(0.0, 2.0);
     if icon == Icon::FontColor {
         ui.painter().text(
@@ -1158,7 +1161,7 @@ pub fn color_button(
         egui::pos2(rect.left() + 4.0, rect.bottom() - 6.0),
         Vec2::new(16.0, 4.0),
     );
-    let swatch = if enabled { color } else { pal.text_muted };
+    let swatch = if enabled { color } else { disabled_color(pal) };
     ui.painter().rect_filled(bar, 1.0, swatch);
     let lum = |c: Color32| egui::Rgba::from(c).intensity() + 0.05;
     let (a, b) = (lum(swatch), lum(pal.ribbon_bg));
@@ -1172,7 +1175,7 @@ pub fn color_button(
     }
 }
 
-/// 字体类开关（B / I / U）：文字本身就是图标
+/// 字体类开关（B / I / U）：使用真实粗体字族、真实斜体字族（缺失时矢量斜体 `I`）与精细下划线。
 pub fn text_toggle(
     ui: &mut egui::Ui,
     label: &str,
@@ -1182,10 +1185,9 @@ pub fn text_toggle(
     italic: bool,
     underline: bool,
 ) -> Response {
-    let (dark, txt_col) = {
-        let v = ui.visuals();
-        (v.dark_mode, text_color(v))
-    };
+    let pal = crate::theme::palette();
+    let dark = ui.visuals().dark_mode || pal.theme.is_dark();
+    let txt_col = text_color(ui.visuals());
     let enabled = ui.is_enabled();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(24.0, 24.0), Sense::click());
     let bg = state_bg(
@@ -1199,23 +1201,43 @@ pub fn text_toggle(
         ui.painter().rect_filled(rect, 3.0, bg);
     }
     focus_ring(ui, &resp, rect, 3.0);
-    let col = if enabled { txt_col } else { DISABLED };
-    let _ = italic;
+    let col = if enabled { txt_col } else { disabled_color(pal) };
     let pos = rect.center() - Vec2::new(0.0, 0.5);
-    let g = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), col);
-    let gp = Align2::CENTER_CENTER.anchor_size(pos, g.size()).min;
-    ui.painter().galley(gp, g.clone(), col);
-    if strong {
-        // 小字号下用 0.55px 重描模拟加粗，比换字体更稳定（复用同一 Galley，零二次排版）
-        ui.painter().galley(gp + Vec2::new(0.55, 0.0), g, col);
+    if italic {
+        if let Some(italic_font) = ui_italic_in(ui.ctx(), 13.0) {
+            let g = ui.painter().layout_no_wrap(label.to_owned(), italic_font, col);
+            let gp = Align2::CENTER_CENTER.anchor_size(pos, g.size()).min;
+            ui.painter().galley(gp, g, col);
+        } else if label == "I" {
+            // 未注册 `ui-italic` 时绘制清晰光学倾斜矢量 `I`（顶部衬线 + 14° 倾斜竖干 + 底部衬线）
+            let p = ui.painter();
+            let c = rect.center();
+            let st = Stroke::new(1.35, col);
+            p.line_segment([egui::pos2(c.x - 1.2, c.y - 4.8), egui::pos2(c.x + 3.6, c.y - 4.8)], st);
+            p.line_segment([egui::pos2(c.x + 1.2, c.y - 4.8), egui::pos2(c.x - 1.2, c.y + 4.8)], st);
+            p.line_segment([egui::pos2(c.x - 3.6, c.y + 4.8), egui::pos2(c.x + 1.2, c.y + 4.8)], st);
+        } else {
+            let g = ui
+                .painter()
+                .layout_no_wrap(label.to_owned(), FontId::proportional(13.0), col);
+            let gp = Align2::CENTER_CENTER.anchor_size(pos, g.size()).min;
+            ui.painter().galley(gp, g, col);
+        }
+    } else {
+        let font = if strong {
+            ui_bold_in(ui.ctx(), 13.0)
+        } else {
+            FontId::proportional(13.0)
+        };
+        let g = ui.painter().layout_no_wrap(label.to_owned(), font, col);
+        let gp = Align2::CENTER_CENTER.anchor_size(pos, g.size()).min;
+        ui.painter().galley(gp, g, col);
     }
     if underline {
-        let uy = pos.y + 7.5;
+        let uy = pos.y + 6.5;
         ui.painter().line_segment(
-            [egui::pos2(pos.x - 5.0, uy), egui::pos2(pos.x + 5.0, uy)],
-            Stroke::new(1.4, col),
+            [egui::pos2(pos.x - 4.5, uy), egui::pos2(pos.x + 4.5, uy)],
+            Stroke::new(1.25, col),
         );
     }
     if !tip.is_empty() && (resp.hovered() || resp.contains_pointer()) {
@@ -1225,12 +1247,23 @@ pub fn text_toggle(
     }
 }
 
-/// 当前页的底色和文字色。高对比使用反白；其它主题的底色比悬停态深一级。
+/// 浮于页面底色（`page_bg` / `title_bg`）之上的当前页签底色和文字色：
+/// 浅色/护眼/深色使用精致抬升卡面 `card_bg` + 深/浅清晰墨色 `text`；高对比使用反白。
 pub fn active_tab_colors(pal: crate::theme::ThemePalette) -> (Color32, Color32) {
     if pal.theme == crate::theme::AppTheme::HighContrast {
         (pal.text, pal.page_bg)
     } else {
-        (pal.pressed, pal.text)
+        (pal.card_bg, pal.text)
+    }
+}
+
+/// 位于弹窗/浮层底面（`dialog_bg`）内部的选中项底色和文字色：
+/// 避免浅色模式下白底卡片与白底弹窗融为一体，改用柔和强调色底 `accent_tint` + 清晰墨色 `text`；高对比反白。
+pub fn active_dialog_tab_colors(pal: crate::theme::ThemePalette) -> (Color32, Color32) {
+    if pal.theme == crate::theme::AppTheme::HighContrast {
+        (pal.text, pal.page_bg)
+    } else {
+        (pal.accent_tint, pal.text)
     }
 }
 
@@ -1250,9 +1283,9 @@ pub fn tab_focus_ring(ui: &egui::Ui, resp: &Response, chip: Rect, radius: f32, a
 /// 按实际字重测量标签，溢出布局与最终绘制共用同一份字形。
 pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Galley>, f32) {
     let font = if emphasized {
-        medium_in(ui.ctx(), 12.5)
+        medium_in(ui.ctx(), 12.0)
     } else {
-        FontId::proportional(12.5)
+        FontId::proportional(12.0)
     };
     let galley = ui
         .painter()
@@ -1263,8 +1296,10 @@ pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Gal
 
 pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool, green: bool) -> Response {
     let (galley, width) = layout;
+    let text_w = galley.size().x;
     let pal = crate::theme::palette();
     let dark = ui.visuals().dark_mode || pal.theme.is_dark();
+    let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, TAB_H), Sense::click());
     let pill = rect.shrink2(Vec2::new(2.0, 3.0));
     let (selected_fill, selected_ink) = active_tab_colors(pal);
@@ -1273,15 +1308,13 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
             if dark {
                 pal.pressed
             } else {
-                Color32::from_rgba_unmultiplied(33, 115, 70, 32)
+                pal.accent_tint.lerp_to_gamma(pal.accent, 0.14)
             }
-        } else if dark {
-            pal.accent_tint
         } else {
-            Color32::from_rgba_unmultiplied(33, 115, 70, 18)
+            pal.accent_tint
         };
         ui.painter().rect_filled(pill, 5.0, fill);
-        if pal.theme == crate::theme::AppTheme::HighContrast {
+        if is_hc {
             ui.painter().rect_stroke(
                 pill,
                 5.0,
@@ -1290,7 +1323,26 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
             );
         }
     } else if active {
-        ui.painter().rect_filled(pill, 5.0, selected_fill);
+        if is_hc {
+            ui.painter().rect_filled(pill, 5.0, selected_fill);
+        } else {
+            ui.painter().rect(
+                pill,
+                5.0,
+                selected_fill,
+                Stroke::new(1.0, pal.chrome_separator()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        // 精致 2px 圆角底部强调指示条（居中贴合标签）
+        let bar_w = text_w.clamp(16.0, (pill.width() - 8.0).max(16.0));
+        let bar_y = if is_hc {
+            rect.bottom() - 1.0
+        } else {
+            pill.bottom() - 1.5
+        };
+        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(bar_w, 2.0));
+        ui.painter().rect_filled(bar, 1.0, pal.accent);
     } else if resp.hovered() {
         ui.painter().rect_filled(pill, 5.0, pal.hover_on_page);
     }
@@ -1301,8 +1353,13 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
     } else {
         pal.text_weak
     };
+    let text_center = if active && !green && !is_hc {
+        rect.center() - Vec2::new(0.0, 0.5)
+    } else {
+        rect.center()
+    };
     let pos = Align2::CENTER_CENTER
-        .anchor_size(rect.center(), galley.size())
+        .anchor_size(text_center, galley.size())
         .min;
     ui.painter().galley_with_override_text_color(pos, galley, col);
     resp
@@ -1310,14 +1367,7 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
 
 /// 分组之间的竖细线（功能区内手动用）
 pub fn hairline(ui: &mut egui::Ui) {
-    let line_col = {
-        let v = ui.visuals();
-        if v.dark_mode {
-            v.widgets.noninteractive.bg_stroke.color
-        } else {
-            SEP
-        }
-    };
+    let line_col = crate::theme::palette().chrome_separator();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, GROUP_BODY_H), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, line_col);
 }
@@ -1467,7 +1517,7 @@ pub fn state_view(
                 egui::Label::new(
                     RichText::new(detail)
                         .size(crate::tokens::text::SMALL)
-                        .color(TEXT_WEAK),
+                        .color(crate::theme::palette().text_weak),
                 )
                 .wrap(),
             );
@@ -1907,10 +1957,19 @@ pub fn sheet_tab(
     color: Option<[u8; 3]>,
 ) -> Response {
     let pal = crate::theme::palette();
+    let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
     let size = Vec2::new(galley.size().x + crate::tokens::size::SHEET_TAB_PAD, crate::tokens::size::SHEET_TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
-    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
+    let chip = if active {
+        // 活动表页签顶部齐平衔接上方工作表画布底边，底部保留圆角与强调指示条。
+        Rect::from_min_max(
+            egui::pos2(rect.left() + 1.0, rect.top()),
+            egui::pos2(rect.right() - 1.0, rect.bottom() - 3.0),
+        )
+    } else {
+        rect.shrink2(Vec2::new(1.0, 3.0))
+    };
     let (fill, text_color) = if active {
         active_tab_colors(pal)
     } else if grouped {
@@ -1918,19 +1977,56 @@ pub fn sheet_tab(
     } else {
         (if resp.hovered() { pal.hover_on_page } else { Color32::TRANSPARENT }, pal.text_weak)
     };
-    if fill != Color32::TRANSPARENT {
+    if active {
+        let rad = egui::CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 };
+        if is_hc {
+            ui.painter().rect_filled(chip, rad, fill);
+        } else {
+            ui.painter().rect(
+                chip,
+                rad,
+                fill,
+                Stroke::new(1.0, pal.chrome_separator()),
+                egui::StrokeKind::Inside,
+            );
+            // 抹去顶边细线，使活动表页签与上方网格画布浑然一体
+            ui.painter().hline(
+                (chip.left() + 1.0)..=(chip.right() - 1.0),
+                chip.top() + 0.5,
+                Stroke::new(1.0, fill),
+            );
+        }
+        // 精致 2px 圆角底部强调条（有自定义标签色时采用自定义色，否则采用主题强调色）
+        let bar_col = color
+            .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+            .unwrap_or(pal.accent);
+        let bar_w = (chip.width() - 12.0).max(16.0).min((chip.width() - 4.0).max(8.0));
+        let bar_y = if is_hc { rect.bottom() - 1.0 } else { chip.bottom() - 1.5 };
+        let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
+        ui.painter().rect_filled(bar, 1.0, bar_col);
+        if !is_hc {
+            let lum = |c: Color32| egui::Rgba::from(c).intensity() + 0.05;
+            let (a, b) = (lum(bar_col), lum(fill));
+            if a.max(b) / a.min(b) < 1.8 {
+                ui.painter().rect_stroke(bar, 1.0, Stroke::new(1.0, pal.text_weak), egui::StrokeKind::Inside);
+            }
+        }
+    } else if fill != Color32::TRANSPARENT {
         ui.painter().rect_filled(chip, 4.0, fill);
     }
 
+    let center_y = if active { chip.center().y - 1.0 } else { rect.center().y };
     let color_offset = if let Some([r, g, b]) = color {
-        let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, rect.center().y), Vec2::splat(8.0));
-        let edge = if active && pal.theme == crate::theme::AppTheme::HighContrast { text_color } else { pal.text_weak };
+        let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, center_y), Vec2::splat(8.0));
+        let edge = if active && is_hc { text_color } else { pal.text_weak };
         ui.painter().rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         5.0
     } else {
         0.0
     };
-    let text_pos = Align2::CENTER_CENTER.anchor_size(rect.center() + Vec2::new(color_offset, 0.0), galley.size()).min;
+    let text_pos = Align2::CENTER_CENTER
+        .anchor_size(egui::pos2(rect.center().x + color_offset, center_y), galley.size())
+        .min;
     let elided = galley.elided;
     ui.painter().galley_with_override_text_color(text_pos, galley, text_color);
     tab_focus_ring(ui, &resp, chip, 4.0, active);
@@ -2186,7 +2282,7 @@ impl Dlg {
                             egui::pos2(trect.left() + 20.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             &self.title,
-                            13.5,
+                            14.0,
                             pal.text,
                         );
                         // 内嵌圆角关闭按钮（替代老式铺满顶栏右角的红块）
@@ -2454,7 +2550,7 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
         let c = r.center();
         let st = Stroke::new(
             1.3,
-            if !enabled { pal.text_muted } else if hv { pal.text } else { pal.text_weak },
+            if !enabled { disabled_color(pal) } else if hv { pal.text } else { pal.text_weak },
         );
         let dy = if up { 1.5 } else { -1.5 };
         ui.painter().add(egui::Shape::line(vec![
@@ -2532,12 +2628,17 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 .anchor_size(rect.center(), galley.size())
                 .min;
             if on {
-                let (fill, ink) = active_tab_colors(pal);
-                ui.painter().rect_filled(
-                    rect.shrink2(Vec2::new(1.0, 3.0)),
-                    6.0,
-                    fill,
-                );
+                let (fill, ink) = active_dialog_tab_colors(pal);
+                let chip = rect.shrink2(Vec2::new(1.0, 3.0));
+                ui.painter().rect_filled(chip, 6.0, fill);
+                let bar_w = galley.size().x.clamp(16.0, (chip.width() - 10.0).max(16.0));
+                let bar_y = if pal.theme == crate::theme::AppTheme::HighContrast {
+                    rect.bottom() - 1.0
+                } else {
+                    chip.bottom() - 1.5
+                };
+                let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
+                ui.painter().rect_filled(bar, 1.0, pal.accent);
                 ui.painter().galley_with_override_text_color(pos, galley, ink);
             } else {
                 if resp.hovered() {
@@ -2890,10 +2991,44 @@ mod state_tests {
 
     #[test]
     fn pressed_beats_hover_and_checked_beats_hover() {
-        assert_eq!(state_bg(true, false, true, true, false), PRESSED);
-        assert_eq!(state_bg(true, true, true, false, false), PRESSED);
-        assert_eq!(state_bg(true, false, true, false, false), HOVER);
+        let light = crate::theme::palette_for(crate::theme::AppTheme::Light);
+        assert_eq!(state_bg(true, false, true, true, false), light.pressed);
+        assert_eq!(state_bg(true, true, true, false, false), light.pressed);
+        assert_eq!(state_bg(true, false, true, false, false), light.hover);
         assert_eq!(state_bg(true, false, false, false, false), Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn text_toggle_renders_real_bold_and_italic_without_double_draw_ghosting() {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    text_toggle(ui, "B", false, "", true, false, false);
+                    text_toggle(ui, "I", false, "", false, true, false);
+                    text_toggle(ui, "U", false, "", false, false, true);
+                });
+            });
+        });
+        let b_shapes = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "B"))
+            .count();
+        assert_eq!(b_shapes, 1, "Bold 'B' must render in a single pass without 0.55px double-draw");
+        // Without ui-italic installed, Italic 'I' renders a crisp 3-segment vector italic glyph
+        let i_text = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "I"))
+            .count();
+        assert_eq!(i_text, 0, "Without ui-italic font, 'I' should draw vector italic segments");
+        let lines = out
+            .shapes
+            .iter()
+            .filter(|s| matches!(&s.shape, egui::Shape::LineSegment { .. }))
+            .count();
+        assert!(lines >= 4, "Expected 3 italic 'I' vector segments + 1 underline segment, got {lines}");
     }
 
     #[test]

@@ -6269,7 +6269,7 @@ impl SheetApp {
                             ui.label(
                                 egui::RichText::new(err)
                                     .color(Color32::from_rgb(196, 43, 28))
-                                    .size(11.5),
+                                    .size(11.0),
                             );
                         }
                     }
@@ -6398,7 +6398,7 @@ impl SheetApp {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(&banner.detail)
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(pal.text),
                             )
                             .truncate(),
@@ -6420,7 +6420,7 @@ impl SheetApp {
                             if ui
                                 .add(
                                     egui::Button::new(
-                                        egui::RichText::new(label).size(11.5).color(accent),
+                                        egui::RichText::new(label).size(11.0).color(accent),
                                     )
                                     .fill(pal.card_bg)
                                     .stroke(Stroke::new(1.0, border))
@@ -9631,7 +9631,7 @@ impl SheetApp {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new(format!("{} 项命令", hits.len()))
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(pal.text_weak),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -9676,10 +9676,11 @@ impl SheetApp {
                                         egui::style::ScrollAnimation::none(),
                                     );
                                 }
+                                let is_hc = pal.theme == theme::AppTheme::HighContrast;
+                                let (selected_fill, selected_ink) = ui_kit::active_dialog_tab_colors(pal);
                                 for index in rows {
                                     let entry = &hits[index];
                                     let selected = index == self.palette_idx;
-                                    let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
                                     let path = entry.path();
                                     let (rect, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), row_height),
@@ -9688,11 +9689,22 @@ impl SheetApp {
                                     if selected || resp.hovered() {
                                         ui.painter().rect_filled(
                                             rect,
-                                            4.0,
+                                            5.0,
                                             if selected { selected_fill } else { pal.hover },
                                         );
                                     }
-                                    let path_font = FontId::proportional(11.5);
+                                    if selected {
+                                        let pill = Rect::from_center_size(
+                                            rect.left_center() + Vec2::new(3.0, 0.0),
+                                            Vec2::new(2.5, 16.0),
+                                        );
+                                        ui.painter().rect_filled(
+                                            pill,
+                                            1.25,
+                                            if is_hc { selected_ink } else { pal.accent },
+                                        );
+                                    }
+                                    let path_font = FontId::proportional(11.0);
                                     let path_width = ui
                                         .painter()
                                         .layout_no_wrap(path.clone(), path_font.clone(), pal.text_weak)
@@ -9707,7 +9719,7 @@ impl SheetApp {
                                         ui.painter(),
                                         label_rect,
                                         &entry.label,
-                                        if selected { ui_kit::medium_in(ctx, 12.5) } else { FontId::proportional(12.5) },
+                                        if selected { ui_kit::medium_in(ctx, 12.0) } else { FontId::proportional(12.0) },
                                         if selected { selected_ink } else { pal.text },
                                     );
                                     paint_fitted_label(
@@ -9715,10 +9727,10 @@ impl SheetApp {
                                         path_rect,
                                         &path,
                                         path_font,
-                                        if selected && pal.theme == theme::AppTheme::HighContrast { selected_ink } else { pal.text_weak },
+                                        if selected && is_hc { selected_ink } else { pal.text_weak },
                                     );
                                     ui_kit::a11y_name(&resp, &entry.label, true, Some(selected));
-                                    ui_kit::tab_focus_ring(ui, &resp, rect, 4.0, selected);
+                                    ui_kit::tab_focus_ring(ui, &resp, rect, 5.0, selected);
                                     if resp.gained_focus() && !down && !up {
                                         self.palette_idx = index;
                                     }
@@ -10991,25 +11003,26 @@ impl SheetApp {
             .default_width(408.0)
             .show(ctx, |ui| {
                 // 1. 顶部实时会话状态卡片
+                let pal = theme::palette();
                 let (bg_col, bd_col, dot_col, headline) = if hosting {
                     (
-                        Color32::from_rgb(240, 253, 244),
-                        Color32::from_rgb(187, 247, 208),
-                        Color32::from_rgb(22, 163, 74),
+                        pal.accent_tint,
+                        pal.accent.gamma_multiply(0.45),
+                        pal.accent,
                         format!("正在实时共享 · 在线 {} 人", self.peers_list.len().max(1)),
                     )
                 } else if connected {
                     (
-                        Color32::from_rgb(239, 246, 255),
-                        Color32::from_rgb(191, 219, 254),
-                        ui_kit::BRAND_NAVY,
+                        pal.info_bg,
+                        pal.info_fg.gamma_multiply(0.45),
+                        pal.info_fg,
                         format!("已接入实时协同 · 在线 {} 人", self.peers_list.len().max(1)),
                     )
                 } else {
                     (
-                        Color32::from_rgb(248, 250, 252),
-                        ui_kit::CARD_BORDER,
-                        Color32::from_rgb(148, 163, 184),
+                        pal.page_bg,
+                        pal.card_border,
+                        pal.text_muted,
                         "单机编辑模式".to_string(),
                     )
                 };
@@ -11028,8 +11041,8 @@ impl SheetApp {
                                 egui::pos2(drect.right() + 6.0, drect.center().y),
                                 Align2::LEFT_CENTER,
                                 &headline,
-                                12.5,
-                                ui_kit::TEXT,
+                                13.0,
+                                pal.text,
                             );
                         });
                         if let Some(addr) = &host_addr {
@@ -11039,8 +11052,8 @@ impl SheetApp {
                                     ui.label(
                                         egui::RichText::new(format!("会话地址：{addr}"))
                                             .monospace()
-                                            .size(11.5)
-                                            .color(ui_kit::TEXT),
+                                            .size(12.0)
+                                            .color(pal.text),
                                     );
                                     if ui_kit::pill(ui, "复制地址", "复制 IP:端口 发送给其他用户手动加入").clicked() {
                                         ctx.copy_text(addr.clone());
@@ -11134,8 +11147,8 @@ impl SheetApp {
                                 ui.painter().rect(
                                     row_rect,
                                     7.0,
-                                    Color32::from_rgb(250, 251, 253),
-                                    Stroke::new(1.0, Color32::from_rgb(228, 233, 241)),
+                                    pal.card_bg,
+                                    Stroke::new(1.0, pal.card_border),
                                     egui::StrokeKind::Inside,
                                 );
                                 // 彩色圆形首字头像
@@ -11154,7 +11167,7 @@ impl SheetApp {
                                     av.center(),
                                     Align2::CENTER_CENTER,
                                     &initial,
-                                    11.5,
+                                    11.0,
                                     Color32::WHITE,
                                 );
                                 let disp_name = if is_me {
@@ -11168,7 +11181,7 @@ impl SheetApp {
                                     Align2::LEFT_CENTER,
                                     &disp_name,
                                     12.0,
-                                    ui_kit::TEXT,
+                                    pal.text,
                                 );
                                 if let Some((sh, r, cc)) = target {
                                     let sh_name = self
@@ -11199,15 +11212,9 @@ impl SheetApp {
                                         Vec2::new(pill_w, 21.0),
                                     );
                                     let (pbg, pfg) = if locked_cell.is_some() {
-                                        (
-                                            Color32::from_rgb(254, 243, 199),
-                                            Color32::from_rgb(180, 83, 9),
-                                        )
+                                        (pal.warn_bg, pal.warn_fg)
                                     } else {
-                                        (
-                                            Color32::from_rgb(238, 242, 248),
-                                            ui_kit::TEXT_WEAK,
-                                        )
+                                        (pal.hover, pal.text_weak)
                                     };
                                     ui.painter().rect_filled(pill_r, 5.0, pbg);
                                     let mut tx_left = pill_r.left() + 7.0;
@@ -11242,8 +11249,8 @@ impl SheetApp {
                                         ui.painter().rect(
                                             jrect,
                                             5.0,
-                                            if jresp.hovered() { ui_kit::HOVER } else { Color32::WHITE },
-                                            Stroke::new(1.0, ui_kit::CARD_BORDER),
+                                            if jresp.hovered() { pal.hover } else { pal.card_bg },
+                                            Stroke::new(1.0, pal.card_border),
                                             egui::StrokeKind::Inside,
                                         );
                                         ui.painter().text(
@@ -11251,7 +11258,7 @@ impl SheetApp {
                                             Align2::CENTER_CENTER,
                                             "定位",
                                             FontId::proportional(11.0),
-                                            ui_kit::BRAND_NAVY,
+                                            pal.info_fg,
                                         );
                                         if jresp.on_hover_text("跳转到该用户当前所在工作表与单元格").clicked() {
                                             jump = Some((sh, r, cc));
@@ -11747,7 +11754,7 @@ impl SheetApp {
                                         2.0,
                                         Stroke::new(
                                             if active { 2.0 } else { 1.0 },
-                                            if active { ui_kit::ACCENT } else { Color32::GRAY },
+                                            if active { theme::palette().accent } else { Color32::GRAY },
                                         ),
                                         egui::StrokeKind::Inside,
                                     );
@@ -11767,7 +11774,7 @@ impl SheetApp {
                                         sw.center(),
                                         Align2::CENTER_CENTER,
                                         "A",
-                                        FontId::proportional(11.5),
+                                        FontId::proportional(11.0),
                                         Color32::from_rgb(fc[0], fc[1], fc[2]),
                                     );
                                     ui.painter().rect_stroke(
@@ -11775,7 +11782,7 @@ impl SheetApp {
                                         2.0,
                                         Stroke::new(
                                             if active { 2.0 } else { 1.0 },
-                                            if active { ui_kit::ACCENT } else { Color32::GRAY },
+                                            if active { theme::palette().accent } else { Color32::GRAY },
                                         ),
                                         egui::StrokeKind::Inside,
                                     );
@@ -17787,8 +17794,8 @@ fn clear_values(&mut self) {
                         },
                         self.zh_preview.len()
                     ))
-                    .size(11.5)
-                    .color(ui_kit::TEXT_WEAK),
+                    .size(11.0)
+                    .color(theme::palette().text_weak),
                 );
                 ui.add_space(2.0);
                 if self.zh_preview.is_empty() {
@@ -17812,7 +17819,7 @@ fn clear_values(&mut self) {
                                     ui.add_sized(
                                         [110.0, 20.0],
                                         egui::Label::new(
-                                            egui::RichText::new(addr).size(11.5).monospace(),
+                                            egui::RichText::new(addr).size(11.0).monospace(),
                                         )
                                         .truncate(),
                                     );
@@ -17820,16 +17827,16 @@ fn clear_values(&mut self) {
                                         [220.0, 20.0],
                                         egui::Label::new(
                                             egui::RichText::new(old.as_str())
-                                                .size(11.5)
-                                                .color(ui_kit::TEXT_WEAK),
+                                                .size(11.0)
+                                                .color(theme::palette().text_weak),
                                         )
                                         .truncate(),
                                     );
-                                    ui.label(egui::RichText::new("→").size(11.5));
+                                    ui.label(egui::RichText::new("→").size(11.0));
                                     ui.add_sized(
                                         [220.0, 20.0],
                                         egui::Label::new(
-                                            egui::RichText::new(new.as_str()).size(11.5),
+                                            egui::RichText::new(new.as_str()).size(11.0),
                                         )
                                         .truncate(),
                                     );
@@ -18145,8 +18152,8 @@ fn clear_values(&mut self) {
                         "当前表共 {} 处（点一行跳到那个单元格）",
                         self.proof_list.len()
                     ))
-                    .size(11.5)
-                    .color(ui_kit::TEXT_WEAK),
+                    .size(11.0)
+                    .color(theme::palette().text_weak),
                 );
                 ui.add_space(2.0);
                 if self.proof_list.is_empty() {
@@ -18220,7 +18227,7 @@ fn clear_values(&mut self) {
                                             egui::RichText::new(format!("{}（{n}）", kind.detail()))
                                                 .size(11.0)
                                                 .strong()
-                                                .color(ui_kit::ACCENT),
+                                                .color(theme::palette().accent),
                                         );
                                     }
                                     ProofRow::Item(idx) => {
@@ -18233,7 +18240,7 @@ fn clear_values(&mut self) {
                                                         egui::RichText::new(cell_name(
                                                             it.row, it.col,
                                                         ))
-                                                        .size(11.5)
+                                                        .size(11.0)
                                                         .monospace(),
                                                     )
                                                     .frame(false),
@@ -18246,14 +18253,14 @@ fn clear_values(&mut self) {
                                             ui.add_sized(
                                                 [150.0, 20.0],
                                                 egui::Label::new(
-                                                    egui::RichText::new(it.text.as_str()).size(11.5),
+                                                    egui::RichText::new(it.text.as_str()).size(11.0),
                                                 )
                                                 .truncate(),
                                             );
                                             ui.label(
                                                 egui::RichText::new(it.kind.detail())
                                                     .size(11.0)
-                                                    .color(ui_kit::TEXT_WEAK),
+                                                    .color(theme::palette().text_weak),
                                             );
                                         });
                                         let resp = row_resp
@@ -20582,8 +20589,8 @@ fn clear_selection(&mut self) {
                         "当前表共 {} 处（点一行跳到那个单元格）",
                         self.error_list.len()
                     ))
-                    .size(11.5)
-                    .color(ui_kit::TEXT_WEAK),
+                    .size(11.0)
+                    .color(theme::palette().text_weak),
                 );
                 ui.add_space(4.0);
                 if self.error_list.is_empty() {
@@ -20603,7 +20610,7 @@ fn clear_selection(&mut self) {
                                         .add_sized(
                                             [64.0, 20.0],
                                             egui::Button::new(
-                                                egui::RichText::new(addr).size(11.5).monospace(),
+                                                egui::RichText::new(addr).size(11.0).monospace(),
                                             )
                                             .frame(false),
                                         )
@@ -20619,14 +20626,14 @@ fn clear_selection(&mut self) {
                                             } else {
                                                 it.text.as_str()
                                             })
-                                            .size(11.5),
+                                            .size(11.0),
                                         )
                                         .truncate(),
                                     );
                                     ui.label(
                                         egui::RichText::new(it.kind.detail())
                                             .size(11.0)
-                                            .color(ui_kit::TEXT_WEAK),
+                                            .color(theme::palette().text_weak),
                                     );
                                 });
                             }
@@ -20992,8 +20999,8 @@ fn clear_selection(&mut self) {
                     ui.set_width(216.0);
                     ui.label(
                         egui::RichText::new(kind.detail())
-                            .size(11.5)
-                            .color(ui_kit::TEXT_WEAK),
+                            .size(11.0)
+                            .color(theme::palette().text_weak),
                     );
                     ui.separator();
                     if kind == sheetcore::errors::IssueKind::NumberAsText {
@@ -21405,7 +21412,7 @@ fn clear_selection(&mut self) {
                                 egui::pos2(r.left() + 8.0, r.center().y),
                                 Align2::LEFT_CENTER,
                                 lbl,
-                                FontId::proportional(11.5),
+                                FontId::proportional(11.0),
                                 pal.text,
                             );
                             if resp.clicked() {
@@ -21420,7 +21427,7 @@ fn clear_selection(&mut self) {
                     ui.label(
                         egui::RichText::new(format!("{verb} {n} 项操作"))
                             .size(11.0)
-                            .color(ui_kit::TEXT_WEAK),
+                            .color(theme::palette().text_weak),
                     );
                 });
             });
@@ -21566,15 +21573,15 @@ fn clear_selection(&mut self) {
                         ui.label(
                             egui::RichText::new(format!("（步入深度 {depth}）"))
                                 .size(11.0)
-                                .color(ui_kit::ACCENT),
+                                .color(theme::palette().accent),
                         );
                     }
                 });
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new("求值（带下划线部分将在下一步计算）：")
-                        .size(11.5)
-                        .color(ui_kit::TEXT_WEAK),
+                        .size(11.0)
+                        .color(theme::palette().text_weak),
                 );
                 egui::Frame::group(ui.style())
                     .fill(theme::palette().card_bg)
@@ -21583,7 +21590,7 @@ fn clear_selection(&mut self) {
                         ui.set_min_width(ui.available_width());
                         ui.set_min_height(48.0);
                         let mut job = egui::text::LayoutJob::default();
-                        let font = FontId::monospace(13.5);
+                        let font = FontId::monospace(13.0);
                         let pal = theme::palette();
                         let normal = egui::TextFormat {
                             font_id: font.clone(),
@@ -21673,8 +21680,8 @@ fn clear_selection(&mut self) {
                         "单元格 {} 的跨表关联引用（点击跳转）：",
                         cell_name(origin_rc.0, origin_rc.1)
                     ))
-                    .size(11.5)
-                    .color(ui_kit::TEXT_WEAK),
+                    .size(11.0)
+                    .color(theme::palette().text_weak),
                 );
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
@@ -21822,13 +21829,13 @@ fn clear_selection(&mut self) {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("这张表里保存的方案（点一条可以装载到下面的名称/备注）")
-                        .size(11.5)
-                        .color(ui_kit::TEXT_WEAK),
+                        .size(11.0)
+                        .color(theme::palette().text_weak),
                 );
                 ui.add_space(3.0);
                 egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                     if list.is_empty() {
-                        ui.label(egui::RichText::new("还没有方案").size(11.5));
+                        ui.label(egui::RichText::new("还没有方案").size(11.0));
                     }
                     for (i, sc) in list.iter().enumerate() {
                         let mut label = format!("{}（{} 个单元格）", sc.name, sc.cells.len());
@@ -21858,7 +21865,7 @@ fn clear_selection(&mut self) {
                     ui.label(
                         egui::RichText::new("例如 A1:C3")
                             .size(11.0)
-                            .color(ui_kit::TEXT_WEAK),
+                            .color(theme::palette().text_weak),
                     );
                 });
                 ui.horizontal(|ui| {
@@ -21867,12 +21874,12 @@ fn clear_selection(&mut self) {
                     ui.label(
                         egui::RichText::new("可选；摘要里额外列出这些格子在每个方案下的值")
                             .size(11.0)
-                            .color(ui_kit::TEXT_WEAK),
+                            .color(theme::palette().text_weak),
                     );
                 });
                 if !self.scen_msg.is_empty() {
                     ui.add_space(3.0);
-                    ui.label(egui::RichText::new(&self.scen_msg).size(11.5));
+                    ui.label(egui::RichText::new(&self.scen_msg).size(11.0));
                 }
                 ui_kit::footer(ui, |ui| {
                     if ui.button("添加/修改").clicked() {
@@ -22151,7 +22158,7 @@ fn clear_selection(&mut self) {
                 });
                 if !self.goal_msg.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.goal_msg).size(11.5));
+                    ui.label(egui::RichText::new(&self.goal_msg).size(11.0));
                 }
                 ui_kit::footer(ui, |ui| {
                     if has_preview {
@@ -22518,8 +22525,8 @@ fn clear_selection(&mut self) {
                          单变量（列）：公式在结果列上方，第一列是输入值。
                          单变量（行）：公式在结果行左侧，第一行是输入值。",
                     )
-                    .size(11.5)
-                    .color(ui_kit::TEXT_WEAK),
+                    .size(11.0)
+                    .color(theme::palette().text_weak),
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -22532,7 +22539,7 @@ fn clear_selection(&mut self) {
                 });
                 if !self.dtable_msg.is_empty() {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(&self.dtable_msg).size(11.5));
+                    ui.label(egui::RichText::new(&self.dtable_msg).size(11.0));
                 }
                 ui_kit::footer(ui, |ui| {
                     if ui_kit::primary_button(ui, "确定").clicked() {
@@ -22580,8 +22587,8 @@ fn clear_selection(&mut self) {
             .show(ctx, |ui| {
                 ui.label(
                     egui::RichText::new("点一个符号就插到当前单元格")
-                        .size(11.5)
-                        .color(ui_kit::TEXT_WEAK),
+                        .size(11.0)
+                        .color(theme::palette().text_weak),
                 );
                 ui.add_space(4.0);
                 let cats: [(&str, &[&str]); 6] = [
@@ -22773,7 +22780,7 @@ fn clear_selection(&mut self) {
                     egui::pos2(lbl_r.left(), lbl_r.center().y),
                     egui::Align2::LEFT_CENTER,
                     "显示名称",
-                    12.5,
+                    12.0,
                     pal.text,
                 );
                 let resp = ui_kit::text_input(ui, &mut self.profile_draft, "输入显示名称");
@@ -23575,7 +23582,7 @@ fn clear_selection(&mut self) {
                 });
                 ui.label(
                     egui::RichText::new("保存当前缩放、冻结窗格和选区；视图存在本机（不进 xlsx）")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 ui_kit::footer(ui, |ui| {
@@ -23639,7 +23646,7 @@ fn clear_selection(&mut self) {
                                     .map(|(r, c)| format!("冻结 {r} 行 {c} 列"))
                                     .unwrap_or_else(|| "无冻结".into())
                             ))
-                            .size(10.5)
+                            .size(11.0)
                             .weak(),
                         );
                         if ui.small_button("删除").clicked() {
@@ -23689,7 +23696,7 @@ fn clear_selection(&mut self) {
                 }
                 ui.label(
                     egui::RichText::new("选中一张表即可恢复显示（深度隐藏表需在保护/属性中解除）")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
             });
@@ -24073,7 +24080,8 @@ fn clear_selection(&mut self) {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         ui.spacing_mut().interact_size.y = tokens::size::BTN_H;
                         let pal = theme::palette();
-                        let (fill, ink) = ui_kit::active_tab_colors(pal);
+                        let is_hc = pal.theme == theme::AppTheme::HighContrast;
+                        let (fill, ink) = ui_kit::active_dialog_tab_colors(pal);
                         ui.visuals_mut().selection.bg_fill = fill;
                         ui.visuals_mut().selection.stroke.color = ink;
                         for i in matches {
@@ -24081,9 +24089,20 @@ fn clear_selection(&mut self) {
                             let active = i == self.sheet_idx;
                             let mut label = egui::RichText::new(name);
                             if active {
-                                label = label.color(ink);
+                                label = label.font(ui_kit::medium_in(ctx, 12.0)).color(ink);
                             }
                             let row = ui.selectable_label(active, label).on_hover_text(name);
+                            if active {
+                                let pill = Rect::from_center_size(
+                                    row.rect.left_center() + Vec2::new(2.0, 0.0),
+                                    Vec2::new(2.5, 14.0),
+                                );
+                                ui.painter().rect_filled(
+                                    pill,
+                                    1.25,
+                                    if is_hc { ink } else { pal.accent },
+                                );
+                            }
                             if row.clicked() {
                                 pick = Some(i);
                             }
@@ -24171,12 +24190,13 @@ fn clear_selection(&mut self) {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let n = list.len();
+                    let a11y_pal = theme::palette();
                     let (text, color) = if n == 0 {
-                        ("一切就绪：没有发现辅助功能问题".to_string(), ui_kit::ACCENT)
+                        ("一切就绪：没有发现辅助功能问题".to_string(), a11y_pal.accent)
                     } else {
-                        (format!("发现 {n} 项需要处理"), Color32::from_rgb(192, 0, 0))
+                        (format!("发现 {n} 项需要处理"), a11y_pal.err_fg)
                     };
-                    ui.label(egui::RichText::new(text).size(12.5).color(color));
+                    ui.label(egui::RichText::new(text).size(13.0).color(color));
                     if ui_kit::secondary_button(ui, "重新检查").clicked() {
                         rescan = true;
                     }
@@ -24213,7 +24233,7 @@ fn clear_selection(&mut self) {
                                     ))
                                     .size(11.0),
                                 );
-                                ui.label(egui::RichText::new(it.kind.advice()).size(10.5).weak());
+                                ui.label(egui::RichText::new(it.kind.advice()).size(11.0).weak());
                                 ui.end_row();
                             }
                         });
@@ -25077,7 +25097,7 @@ fn clear_selection(&mut self) {
                     if ui_kit::spin(ui, &mut sv, 0.0, 52.0, 1.0, 70.0) {
                         d.season_len = sv as usize;
                     }
-                    ui.label(egui::RichText::new("0 = 自动检测周期（如 4 季度 / 12 月）").size(10.5).weak());
+                    ui.label(egui::RichText::new("0 = 自动检测周期（如 4 季度 / 12 月）").size(11.0).weak());
                 });
                 ui_kit::field(ui, "置信区间", |ui| {
                     let mut cv = d.confidence as f64;
@@ -25088,7 +25108,7 @@ fn clear_selection(&mut self) {
                 });
                 ui.label(
                     egui::RichText::new("采用 Holt-Winters 指数平滑（ETS）模型，自动估计水平/趋势/季节性并输出置信上下界与模型评估指标。")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 if !d.msg.is_empty() {
@@ -25172,7 +25192,7 @@ fn clear_selection(&mut self) {
                 ui.checkbox(&mut d.page_break_between_groups, "每组数据分页（自动在组间插入打印分页符）");
                 ui.label(
                     egui::RichText::new("同值必须相邻（先按分组列排序）；汇总标签写入分组列，明细自动分级")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 if !d.msg.is_empty() {
@@ -25242,7 +25262,7 @@ fn clear_selection(&mut self) {
                 });
                 ui.label(
                     egui::RichText::new("先在目标列写一个示例；推不出规则会直接报错，不猜")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 if !d.msg.is_empty() {
@@ -25314,7 +25334,7 @@ fn clear_selection(&mut self) {
                 });
                 ui.label(
                     egui::RichText::new(format!("结果写在当前选中格 {}", cell_name(self.sel.0, self.sel.1)))
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 if !d.msg.is_empty() {
@@ -25425,10 +25445,11 @@ fn clear_selection(&mut self) {
             .order(egui::Order::Middle)
             .fixed_pos(pos)
             .show(ctx, |ui| {
+                let s_pal = theme::palette();
                 egui::Frame::window(&ctx.style())
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0, ui_kit::BORDER))
-                    .corner_radius(4.0)
+                    .fill(s_pal.dialog_bg)
+                    .stroke(Stroke::new(1.0, s_pal.card_border))
+                    .corner_radius(6.0)
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
                         ui.set_width(210.0);
@@ -25436,14 +25457,13 @@ fn clear_selection(&mut self) {
                             egui::vec2(210.0, 26.0),
                             egui::Sense::click_and_drag(),
                         );
-                        ui.painter()
-                            .rect_filled(trect, 0.0, Color32::from_rgb(243, 242, 241));
+                        ui.painter().rect_filled(trect, 0.0, s_pal.header_bg);
                         ui.painter().text(
                             egui::pos2(trect.left() + 8.0, trect.center().y),
                             egui::Align2::LEFT_CENTER,
                             format!("切片器：{}", s.field),
                             FontId::proportional(12.0),
-                            ui_kit::TEXT,
+                            s_pal.text,
                         );
                         let crect = Rect::from_min_size(
                             egui::pos2(trect.right() - 22.0, trect.top() + 4.0),
@@ -25451,7 +25471,7 @@ fn clear_selection(&mut self) {
                         );
                         let cresp = ui.interact(crect, id.with("close"), egui::Sense::click());
                         let k = 4.0;
-                        let st = Stroke::new(1.1, ui_kit::TEXT);
+                        let st = Stroke::new(1.1, s_pal.text);
                         ui.painter().line_segment(
                             [crect.center() + egui::vec2(-k, -k), crect.center() + egui::vec2(k, k)],
                             st,
@@ -25911,14 +25931,14 @@ fn clear_selection(&mut self) {
                             ui.painter().rect_stroke(
                                 r,
                                 2.0,
-                                egui::Stroke::new(1.0, ui_kit::BORDER),
+                                egui::Stroke::new(1.0, theme::palette().card_border),
                                 egui::StrokeKind::Inside,
                             );
                             if *cur == Some(c) {
                                 ui.painter().rect_stroke(
                                     r.expand(1.0),
                                     2.0,
-                                    egui::Stroke::new(2.0, ui_kit::ACCENT),
+                                    egui::Stroke::new(2.0, theme::palette().accent),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -26251,6 +26271,7 @@ fn clear_selection(&mut self) {
                     ("关闭", 6),
                 ];
                 let mut y = nav.top() + 56.0;
+                let bs_hc = bs_pal.theme == theme::AppTheme::HighContrast;
                 let (selected_fill, selected_ink) = ui_kit::active_tab_colors(bs_pal);
                 for (label, page) in items {
                     let r = Rect::from_min_size(
@@ -26261,7 +26282,26 @@ fn clear_selection(&mut self) {
                     let active = self.backstage_page == page;
                     ui_kit::a11y_name(&resp, label, true, Some(active));
                     if active {
-                        ui.painter().rect_filled(r, 6.0, selected_fill);
+                        if bs_hc {
+                            ui.painter().rect_filled(r, 6.0, selected_fill);
+                        } else {
+                            ui.painter().rect(
+                                r,
+                                6.0,
+                                selected_fill,
+                                Stroke::new(1.0, bs_pal.chrome_separator()),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        let pill = Rect::from_center_size(
+                            r.left_center() + Vec2::new(4.0, 0.0),
+                            Vec2::new(2.5, 16.0),
+                        );
+                        ui.painter().rect_filled(
+                            pill,
+                            1.25,
+                            if bs_hc { selected_ink } else { bs_pal.accent },
+                        );
                     } else if resp.hovered() {
                         ui.painter().rect_filled(r, 6.0, bs_pal.hover_on_page);
                     }
@@ -26277,7 +26317,7 @@ fn clear_selection(&mut self) {
                             egui::pos2(r.left() + 36.0, r.center().y),
                             Align2::LEFT_CENTER,
                             label,
-                            12.5,
+                            12.0,
                             if active { selected_ink } else { bs_home_col },
                         );
                     } else {
@@ -26285,7 +26325,7 @@ fn clear_selection(&mut self) {
                             egui::pos2(r.left() + 16.0, r.center().y),
                             Align2::LEFT_CENTER,
                             label,
-                            if active { ui_kit::medium_in(ctx, 12.5) } else { FontId::proportional(12.5) },
+                            if active { ui_kit::medium_in(ctx, 12.0) } else { FontId::proportional(12.0) },
                             if active { selected_ink } else { bs_pal.text },
                         );
                     }
@@ -26379,7 +26419,7 @@ fn clear_selection(&mut self) {
                                 if self.wb.encryption.is_some() {
                                     ui.label(
                                         egui::RichText::new("已设置打开密码（保存后为加密文件）")
-                                            .size(12.5)
+                                            .size(12.0)
                                             .color(bs_pal.accent),
                                     );
                                     if ui.button("取消打开密码").clicked() {
@@ -26478,7 +26518,7 @@ fn clear_selection(&mut self) {
                                 ui.add_space(6.0);
                                 ui.label(
                                     egui::RichText::new("对外干净副本会剥离所有内嵌防篡改审计记录与历史痕迹，适合发给外部客户、甲方或供应商。")
-                                        .size(11.5)
+                                        .size(11.0)
                                         .weak(),
                                 );
                             }
@@ -26523,7 +26563,7 @@ fn clear_selection(&mut self) {
                                             ui.label(
                                                 egui::RichText::new(format!("协作地址：{addr}"))
                                                     .monospace()
-                                                    .size(12.5)
+                                                    .size(12.0)
                                                     .color(bs_pal.text),
                                             );
                                             if ui_kit::secondary_button(ui, "复制地址").clicked() {
@@ -26720,7 +26760,7 @@ fn clear_selection(&mut self) {
                         }
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("恢复草稿单独保存。关闭有修改的工作簿时会询问是否保存。")
-                            .size(11.5).color(pal.text_weak));
+                            .size(11.0).color(pal.text_weak));
                         if ui_kit::secondary_button(ui, "查看恢复草稿…").clicked() {
                             do_open_recovery = true;
                         }
@@ -26780,7 +26820,7 @@ fn clear_selection(&mut self) {
                                         "已暂缓提醒版本 v{}",
                                         self.prefs.update_snoozed_version
                                     ))
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(pal.text_weak),
                                 );
                                 if ui.small_button("恢复提醒").clicked() {
@@ -27575,12 +27615,12 @@ fn clear_selection(&mut self) {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Ctrl+Enter 保存 · Ctrl+; 时间戳 · Esc 取消")
-                            .size(10.5)
+                            .size(11.0)
                             .weak(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(egui::RichText::new("面板").size(10.5)).frame(false))
+                            .add(egui::Button::new(egui::RichText::new("面板").size(11.0)).frame(false))
                             .on_hover_text("打开右侧批注管理面板")
                             .clicked()
                         {
@@ -27644,7 +27684,7 @@ fn clear_selection(&mut self) {
                     };
                     if ui
                         .add(
-                            egui::Button::new(egui::RichText::new(mgr_lbl).size(10.5).weak())
+                            egui::Button::new(egui::RichText::new(mgr_lbl).size(11.0).weak())
                                 .frame(false),
                         )
                         .clicked()
@@ -27714,7 +27754,7 @@ fn clear_selection(&mut self) {
                                 tc.entries.len(),
                                 if tc.resolved { " · 已解决" } else { "" }
                             ))
-                            .size(11.5)
+                            .size(11.0)
                             .strong(),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -27731,7 +27771,7 @@ fn clear_selection(&mut self) {
                             } else {
                                 format!("{} · {}", entry.author, entry.timestamp)
                             };
-                            ui.label(egui::RichText::new(hdr).size(10.5).weak());
+                            ui.label(egui::RichText::new(hdr).size(11.0).weak());
                             ui.add(
                                 egui::Label::new(egui::RichText::new(&entry.text).size(12.0))
                                     .selectable(true)
@@ -30434,7 +30474,7 @@ impl SheetApp {
                 );
                 ui.label(
                     egui::RichText::new("本应用不内置宏引擎，只把宏名转交本机 Excel 在隔离副本中后台执行（60 秒超时保护）。")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 ui.label("填宏名，例如 Module1.MyMacro");
@@ -30713,7 +30753,7 @@ impl SheetApp {
                 ui.checkbox(&mut d.unique_only, "选择不重复的记录");
                 ui.label(
                     egui::RichText::new("条件区域支持 >、>=、<、<=、<>、= 以及 * / ? 通配符；同行条件为「且」，多行条件为「或」。")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 if !d.msg.is_empty() {
@@ -31184,7 +31224,7 @@ impl SheetApp {
                                                 sw.center(),
                                                 Align2::CENTER_CENTER,
                                                 "A",
-                                                FontId::proportional(11.5),
+                                                FontId::proportional(11.0),
                                                 Color32::from_rgb(fc[0], fc[1], fc[2]),
                                             );
                                             ui.painter().rect_stroke(
@@ -31691,7 +31731,7 @@ impl SheetApp {
                 }
                 ui.label(
                     egui::RichText::new("提示：使用 ? 代表单个字符，* 代表任意字符序列，~* 匹配字面星号。")
-                        .size(10.5)
+                        .size(11.0)
                         .weak(),
                 );
                 ui_kit::footer(ui, |ui| {
@@ -32877,7 +32917,7 @@ impl SheetApp {
                         ui.label(
                             egui::RichText::new(fn_formula_from_args(&w.name, &w.args))
                                 .monospace()
-                                .color(ui_kit::ACCENT),
+                                .color(theme::palette().accent),
                         );
                     });
                 });
@@ -33712,7 +33752,7 @@ impl SheetApp {
                     });
                     if let Some(count) = self.current_find_count() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(format!("命中 {count} 处")).size(11.5).color(pal.text_weak));
+                            ui.label(egui::RichText::new(format!("命中 {count} 处")).size(11.0).color(pal.text_weak));
                         });
                     }
                 });
@@ -33792,7 +33832,7 @@ impl SheetApp {
                     let (header, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
                     ui.painter().rect_filled(header, 3.0, pal.header_bg);
                     for (rect, title) in columns(header).into_iter().zip(["工作表", "单元格", "内容"]) {
-                        paint_fitted_label(ui.painter(), rect, title, ui_kit::medium_in(ctx, 11.5), pal.text_weak);
+                        paint_fitted_label(ui.painter(), rect, title, ui_kit::medium_in(ctx, 11.0), pal.text_weak);
                     }
                     ui.spacing_mut().item_spacing.y = 1.0;
                     egui::ScrollArea::vertical().id_salt("find_result_rows").max_height(320.0)
@@ -35178,7 +35218,7 @@ impl SheetApp {
             let measured = ctx.fonts(|f| {
                 buf.split('\n')
                     .map(|line| {
-                        f.layout_no_wrap(line.to_string(), font.clone(), ui_kit::TEXT)
+                        f.layout_no_wrap(line.to_string(), font.clone(), theme::palette().text)
                             .size()
                             .x
                     })
@@ -36851,7 +36891,7 @@ impl SheetApp {
                         let (hdr_tpl, ftr_tpl) = sh.page.header_footer_for_page(p_idx_1);
                         let hctx = print_studio::make_header_ctx(&self.wb, self.sheet_idx);
                         let hf_col = Color32::from_rgb(100, 116, 139);
-                        let hf_font = FontId::proportional(9.5);
+                        let hf_font = FontId::proportional(11.0);
                         if !hdr_tpl.is_empty() {
                             let (hl, hc, hr) = sheetcore::print::header_parts_with_ctx(
                                 hdr_tpl,
@@ -37127,7 +37167,7 @@ impl SheetApp {
         // 左上角：分级显示的级别按钮（Excel 那里是 1/2/3），横向排行级别、竖向排列级别
         if self.show_headings && (row_depth > 0.0 || col_depth > 0.0) {
             let corner = Rect::from_min_size(origin, Vec2::new(head_w, hh));
-            painter.rect_filled(corner, 0.0, ui_kit::HEADER_BG);
+            painter.rect_filled(corner, 0.0, head_bg);
             let bs = 12.0;
             let mut hit: Option<(bool, u8)> = None;
             let mut draw_btn = |rect: Rect, n: u8, key: (&'static str, bool, u8)| {
@@ -37145,7 +37185,7 @@ impl SheetApp {
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     n.to_string(),
-                    egui::FontId::proportional(9.5),
+                    egui::FontId::proportional(11.0),
                     head_fg,
                 );
                 if resp.clicked() {
@@ -38799,7 +38839,7 @@ impl SheetApp {
                     p2.rect_stroke(
                         rect,
                         2.0,
-                        Stroke::new(1.0, ui_kit::CARD_BORDER),
+                        Stroke::new(1.0, theme::palette().card_border),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -38958,7 +38998,7 @@ impl SheetApp {
                         painter.rect_stroke(
                             rect,
                             4.0,
-                            Stroke::new(1.5, ui_kit::ACCENT),
+                            Stroke::new(1.5, theme::palette().accent),
                             egui::StrokeKind::Inside,
                         );
                         for p in [
@@ -38979,7 +39019,7 @@ impl SheetApp {
                             painter.rect_stroke(
                                 Rect::from_center_size(p, Vec2::splat(6.0)),
                                 1.0,
-                                Stroke::new(1.0, ui_kit::ACCENT),
+                                Stroke::new(1.0, theme::palette().accent),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -39467,7 +39507,7 @@ impl SheetApp {
                             tag.center(),
                             Align2::CENTER_CENTER,
                             "AI 预览",
-                            FontId::proportional(10.5),
+                            FontId::proportional(11.0),
                             Color32::WHITE,
                         );
                     }
@@ -39497,7 +39537,7 @@ impl SheetApp {
                                         .show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new(tip_txt)
-                                                    .size(11.5)
+                                                    .size(11.0)
                                                     .color(Color32::from_rgb(120, 53, 15)),
                                             );
                                         });
@@ -39930,7 +39970,7 @@ impl SheetApp {
                             painter.rect_stroke(
                                 pv,
                                 0.0,
-                                Stroke::new(1.5, if is_clear { Color32::from_rgb(100, 116, 139) } else { ui_kit::ACCENT }),
+                                Stroke::new(1.5, if is_clear { Color32::from_rgb(100, 116, 139) } else { theme::palette().accent }),
                                 egui::StrokeKind::Inside,
                             );
                         }
@@ -42199,7 +42239,7 @@ impl SheetApp {
                 );
                 let hdr_g = measure_p.layout_no_wrap(
                     hdr.clone(),
-                    ui_kit::bold_in(ctx, 11.5),
+                    ui_kit::bold_in(ctx, 12.0),
                     Color32::from_rgb(92, 64, 18),
                 );
                 let toolbar_extra = if edit_blocked_now { 46.0 } else { 116.0 };
@@ -42302,7 +42342,7 @@ impl SheetApp {
                                                 .add(
                                                     egui::Label::new(
                                                         egui::RichText::new(&hdr)
-                                                            .font(ui_kit::bold_in(ctx, 11.5))
+                                                            .font(ui_kit::bold_in(ctx, 12.0))
                                                             .color(hdr_color),
                                                     )
                                                     .truncate()
@@ -42323,7 +42363,7 @@ impl SheetApp {
                                                 ui.spacing_mut().item_spacing.x = 2.0;
                                                 let mini_btn = |ui: &mut egui::Ui, lbl: &str, col: Color32, tip: &str| {
                                                     ui.add(
-                                                        egui::Button::new(egui::RichText::new(lbl).size(10.5).color(col))
+                                                        egui::Button::new(egui::RichText::new(lbl).size(11.0).color(col))
                                                             .frame(false)
                                                             .min_size(Vec2::new(22.0, 18.0)),
                                                     )
@@ -44946,6 +44986,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         let mut open_ai_from_home = false;
         let mut open_members_from_home = false;
         let mut y = rail.top() + 14.0;
+        let is_hc = pal.theme == theme::AppTheme::HighContrast;
         let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
         for (label, kind) in items {
             let row = Rect::from_min_size(
@@ -44956,7 +44997,22 @@ fn elide(s: &str, max_chars: usize) -> String {
             let active = kind == 0;
             ui_kit::a11y_name(&r, label, true, Some(active));
             if active {
-                p.rect_filled(row, 8.0, selected_fill);
+                if is_hc {
+                    p.rect_filled(row, 8.0, selected_fill);
+                } else {
+                    p.rect(
+                        row,
+                        8.0,
+                        selected_fill,
+                        egui::Stroke::new(1.0, pal.chrome_separator()),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let pill = Rect::from_center_size(
+                    row.left_center() + Vec2::new(4.0, 0.0),
+                    Vec2::new(2.5, 16.0),
+                );
+                p.rect_filled(pill, 1.25, if is_hc { selected_ink } else { pal.accent });
             } else if r.hovered() {
                 p.rect_filled(row, 8.0, pal.hover_on_page);
             }
@@ -44968,7 +45024,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 Vec2::splat(16.0),
             );
             let ic_col = if active {
-                selected_ink
+                if is_hc { selected_ink } else { pal.accent }
             } else if r.hovered() {
                 pal.text
             } else {
@@ -44987,7 +45043,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     egui::pos2(row.left() + 38.0, row.center().y),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    12.5,
+                    12.0,
                     selected_ink,
                 );
             } else {
@@ -44995,7 +45051,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     egui::pos2(row.left() + 38.0, row.center().y),
                     egui::Align2::LEFT_CENTER,
                     label,
-                    FontId::proportional(12.5),
+                    FontId::proportional(12.0),
                     pal.text,
                 );
             }
@@ -45052,7 +45108,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 rb.clone().on_hover_text("返回当前表格");
             } else {
                 ui_kit::paint_medium(&p, back_card.left_center() + Vec2::new(34.0, 0.0),
-                    Align2::LEFT_CENTER, "返回当前表格", 12.5, pal.accent);
+                    Align2::LEFT_CENTER, "返回当前表格", 12.0, pal.accent);
             }
             ui_kit::focus_ring(ui, &rb, back_card, 8.0);
             if rb.clicked() {
@@ -45092,7 +45148,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             rf.clone().on_hover_text(&version);
         } else {
             ui_kit::paint_medium(&p, foot_card.left_center() + Vec2::new(36.0, 0.0),
-                Align2::LEFT_CENTER, &version, 12.5, pal.text);
+                Align2::LEFT_CENTER, &version, 12.0, pal.text);
         }
         ui_kit::focus_ring(ui, &rf, foot_card, 8.0);
         if rf.clicked() {
@@ -45379,7 +45435,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 egui::pos2(content_area.center().x, cy + 44.0),
                 egui::Align2::CENTER_CENTER,
                 title,
-                13.5,
+                14.0,
                 pal.text,
             );
             let eb = Rect::from_center_size(
@@ -45443,7 +45499,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 egui::pos2(list_card.left() + 18.0, head_r.center().y),
                 egui::Align2::LEFT_CENTER,
                 "文件名称",
-                FontId::proportional(11.5),
+                FontId::proportional(11.0),
                 pal.text_weak,
             );
             if show_dir_col {
@@ -45451,7 +45507,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     egui::pos2(dir_col_x, head_r.center().y),
                     egui::Align2::LEFT_CENTER,
                     "所在位置",
-                    FontId::proportional(11.5),
+                    FontId::proportional(11.0),
                     pal.text_weak,
                 );
             }
@@ -45460,7 +45516,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     egui::pos2(size_col_x, head_r.center().y),
                     egui::Align2::RIGHT_CENTER,
                     "大小",
-                    FontId::proportional(11.5),
+                    FontId::proportional(11.0),
                     pal.text_weak,
                 );
             }
@@ -45468,7 +45524,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 egui::pos2(list_card.right() - 62.0, head_r.center().y),
                 egui::Align2::RIGHT_CENTER,
                 "修改时间",
-                FontId::proportional(11.5),
+                FontId::proportional(11.0),
                 pal.text_weak,
             );
 
@@ -45609,11 +45665,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                 let cell = |left, right| Rect::from_min_max(
                     egui::pos2(left, row.top()), egui::pos2(right - 8.0, row.bottom()));
                 paint_fitted_label(&bp, cell(row.left() + 68.0, name_right), name,
-                    ui_kit::medium_in(ui.ctx(), 12.5), pal.text);
+                    ui_kit::medium_in(ui.ctx(), 12.0), pal.text);
                 if show_dir_col {
                     let dir_right = if show_size_col { size_col_x - 54.0 } else { time_col_left };
                     let dir_cell = cell(dir_col_x, dir_right);
-                    let dir_font = FontId::proportional(11.5);
+                    let dir_font = FontId::proportional(11.0);
                     let full_fits = bp.layout_no_wrap(full_dir.clone(), dir_font.clone(), pal.text_weak)
                         .size().x <= dir_cell.width();
                     paint_fitted_label(&bp, dir_cell, if full_fits { &full_dir } else { &ent.short_dir },
@@ -45626,7 +45682,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         egui::pos2(size_col_x, row.center().y),
                         egui::Align2::RIGHT_CENTER,
                         &ent.size_txt,
-                        FontId::proportional(11.5),
+                        FontId::proportional(11.0),
                         pal.text_weak,
                     );
                 }
@@ -45691,7 +45747,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                         egui::pos2(row.right() - 62.0, row.center().y),
                         egui::Align2::RIGHT_CENTER,
                         &ent.mtime_txt,
-                        FontId::proportional(11.5),
+                        FontId::proportional(11.0),
                         pal.text_weak,
                     );
                 }
@@ -45975,7 +46031,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             egui::pos2(draw_card.left() + 14.0, label_y),
             egui::Align2::LEFT_CENTER,
             title,
-            13.5,
+            14.0,
             pal.text,
         );
     }
@@ -46394,7 +46450,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("更新内容")
-                            .font(ui_kit::medium_in(ctx, 12.5))
+                            .font(ui_kit::medium_in(ctx, 13.0))
                             .color(theme::palette().text),
                     );
                     ui.add_space(3.0);
@@ -46408,7 +46464,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&avail.manifest.notes)
-                                        .size(12.5)
+                                        .size(12.0)
                                         .color(theme::palette().text),
                                 )
                                 .wrap(),
@@ -46463,7 +46519,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     } else {
                         ui.label(
                             egui::RichText::new("更新过程中仍可继续编辑当前表格，完成后将提醒应用")
-                                .size(11.5)
+                                .size(11.0)
                                 .color(theme::palette().text_weak),
                         );
                     }
@@ -48594,7 +48650,10 @@ impl eframe::App for SheetApp {
             let app_theme = theme::AppTheme::from_u8(self.prefs.theme);
             theme::apply_app_theme(ctx, app_theme);
             #[cfg(windows)]
-            win_chrome::apply_frame_theme(app_theme.is_dark());
+            win_chrome::apply_frame_theme(
+                app_theme.is_dark(),
+                theme::palette_for(app_theme).card_border,
+            );
             self.theme_applied = Some(self.prefs.theme);
             if switched {
                 self.cf_inputs.grid.cells.clear();
@@ -49865,7 +49924,7 @@ impl eframe::App for SheetApp {
                         if self.wb.has_vba {
                             ui.label(
                                 egui::RichText::new("含宏（保留不执行）")
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(ribbon_pal.warn_fg),
                             );
                         }
@@ -49887,10 +49946,21 @@ impl eframe::App for SheetApp {
                     egui::Sense::hover(),
                 );
                 if !self.ribbon_collapsed {
+                    let ribbon_shadow = if ribbon_pal.theme == theme::AppTheme::HighContrast {
+                        egui::epaint::Shadow::NONE
+                    } else {
+                        egui::epaint::Shadow {
+                            offset: [0, 2],
+                            blur: 8,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if ribbon_dark { 42 } else { 14 }),
+                        }
+                    };
                     egui::Frame::NONE
                         .fill(ribbon_pal.ribbon_bg)
                         .stroke(egui::Stroke::new(1.0, ribbon_pal.chrome_separator()))
-                        .corner_radius(6.0)
+                        .corner_radius(8.0)
+                        .shadow(ribbon_shadow)
                         .outer_margin(egui::Margin {
                             left: 8,
                             right: 8,
@@ -49968,7 +50038,7 @@ impl eframe::App for SheetApp {
             }
         }
 
-        // ---- 编辑栏：名称框 + ×/✓/fx + 输入行（34px WPS 通栏条） ----
+        // ---- 编辑栏：名称框 + ×/✓/fx + 输入行（34px 全宽通栏，与下方工作表画布无缝对齐） ----
         if self.show_formula_bar && !self.show_start {
         let fx_pal = theme::palette();
         let fx_dark = fx_pal.theme.is_dark();
@@ -49976,11 +50046,21 @@ impl eframe::App for SheetApp {
         egui::TopBottomPanel::top("formula")
             .show_separator_line(false)
             .exact_height(fx_card_h)
-            .frame(egui::Frame::NONE.fill(fx_pal.ribbon_bg))
+            .frame(egui::Frame::NONE.fill(fx_pal.grid_bg))
             .show(ctx, |ui| {
                 let avail = ui.max_rect();
                 let rect = Rect::from_min_size(avail.min, Vec2::new(avail.width(), fx_card_h));
                 let painter = ui.painter().clone();
+                let fx_hairline = if fx_pal.theme == theme::AppTheme::HighContrast {
+                    1.0
+                } else {
+                    (1.0 / ctx.pixels_per_point()).min(1.0)
+                };
+                painter.hline(
+                    rect.x_range(),
+                    rect.top() + fx_hairline * 0.5,
+                    Stroke::new(fx_hairline, fx_pal.chrome_separator()),
+                );
                 let (r, c) = self.sel;
                 if !self.name_edit {
                     if let Some(def_name) = self.matching_defined_name_for_sel() {
@@ -50073,7 +50153,7 @@ impl eframe::App for SheetApp {
                                 ui.set_min_width(190.0);
                                 if self.wb.names.is_empty() {
                                     ui.label(
-                                        egui::RichText::new("尚未定义名称").size(11.5).color(fx_pal.text_weak),
+                                        egui::RichText::new("尚未定义名称").size(11.0).color(fx_pal.text_weak),
                                     );
                                 }
                                 for (n, _, body) in &self.wb.names {
@@ -50103,8 +50183,12 @@ impl eframe::App for SheetApp {
                     }
                 }
 
-                // × ✓ fx（常驻三键，居中对齐 34px 通栏）
+                // 名称框与 × ✓ fx 之间、按钮与输入行之间的 1px 细分隔线
+                let div_stroke = Stroke::new(1.0, fx_pal.chrome_separator());
                 let fx_left = rect.left() + 118.0;
+                painter.vline(nb.right() + 7.0, (rect.top() + 8.0)..=(rect.top() + 26.0), div_stroke);
+                painter.vline(fx_left + 81.0, (rect.top() + 8.0)..=(rect.top() + 26.0), div_stroke);
+                // × ✓ fx（常驻三键，居中对齐 34px 通栏）
                 let mut commit = false;
                 let mut commit_adv: Option<(i32, i32)> = Some((1, 0));
                 let mut commit_fill_sel = false;
@@ -50220,7 +50304,7 @@ impl eframe::App for SheetApp {
                     let badge_txt = format!("{holder} 正在编辑 · 此格已锁定禁用");
                     let bg = painter.layout_no_wrap(
                         badge_txt.clone(),
-                        FontId::proportional(11.5),
+                        FontId::proportional(11.0),
                         fx_pal.warn_fg,
                     );
                     let pill_w = bg.size().x + 28.0;
@@ -50264,7 +50348,7 @@ impl eframe::App for SheetApp {
                         egui::pos2(pill_rect.left() + 21.0, pill_rect.center().y),
                         Align2::LEFT_CENTER,
                         &badge_txt,
-                        11.5,
+                        11.0,
                         fx_pal.warn_fg,
                     );
                     let lresp = ui.interact(ed_rect, egui::Id::new("fx_locked_row"), Sense::click());
@@ -50657,9 +50741,16 @@ impl eframe::App for SheetApp {
                     return;
                 }
                 let bar = ui.max_rect();
-                if status_pal.theme == theme::AppTheme::HighContrast {
-                    ui.painter().hline(bar.x_range(), bar.top(), Stroke::new(1.0, status_pal.card_border));
-                }
+                let sb_hairline = if status_pal.theme == theme::AppTheme::HighContrast {
+                    1.0
+                } else {
+                    (1.0 / ctx.pixels_per_point()).min(1.0)
+                };
+                ui.painter().hline(
+                    bar.x_range(),
+                    bar.top() + sb_hairline * 0.5,
+                    Stroke::new(sb_hairline, status_pal.chrome_separator()),
+                );
                 let rects = self.sel_rects();
                 let area: u64 = rects
                     .iter()
@@ -51113,7 +51204,7 @@ impl eframe::App for SheetApp {
             .frame(if self.show_start {
                 egui::Frame::NONE
             } else {
-                egui::Frame::NONE.fill(center_pal.page_bg)
+                egui::Frame::NONE.fill(center_pal.grid_bg)
             })
             .show(ctx, |ui| {
                 let cmd_consumed = if !self.backstage {
@@ -51133,14 +51224,18 @@ impl eframe::App for SheetApp {
                         // 否则 Ctrl+Z/Y/S 会二次触发，或焦点在关闭按钮上按 Enter 推进选区。
                         self.handle_keys(ctx);
                     }
-                    // 网格也是一张悬浮卡片：左右各 8px 与功能区、编辑栏三张白卡严丝合缝对齐，
-                    // 上方紧接编辑栏下边距，下方留 2px 给工作表标签条。
+                    // 网格画布采用全宽通栏布局，与上方编辑栏及下方工作表标签条严丝合缝，
+                    // 仅在顶边绘制 1 物理像素细分隔线，去除旧版左右 8px 夹缝与四角遮罩。
                     let avail = ui.available_rect_before_wrap();
-                    let card = Rect::from_min_max(
-                        egui::pos2(avail.left() + 8.0, avail.top()),
-                        egui::pos2(avail.right() - 8.0, avail.bottom() - 2.0),
+                    let hairline = if center_pal.theme == theme::AppTheme::HighContrast {
+                        1.0
+                    } else {
+                        (1.0 / ctx.pixels_per_point()).min(1.0)
+                    };
+                    let inner = Rect::from_min_max(
+                        egui::pos2(avail.left(), avail.top() + hairline),
+                        avail.max,
                     );
-                    let inner = card.shrink(1.0);
                     let mut grid_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(inner)
@@ -51148,12 +51243,10 @@ impl eframe::App for SheetApp {
                     );
                     grid_ui.set_clip_rect(inner.intersect(ui.clip_rect()));
                     self.draw_grid(&mut grid_ui, ctx);
-                    ui_kit::card_outline(
-                        ui.painter(),
-                        card,
-                        ui_kit::CARD_R as f32,
-                        center_pal.page_bg,
-                        center_pal.card_border,
+                    ui.painter().hline(
+                        avail.x_range(),
+                        avail.top() + hairline * 0.5,
+                        Stroke::new(hairline, center_pal.chrome_separator()),
                     );
                     // 父 ui 只占位、不注册控件：Sense::hover 的整块矩形会盖在网格上面抢 hover
                     ui.advance_cursor_after_rect(avail);
@@ -51271,11 +51364,12 @@ impl eframe::App for SheetApp {
                     Color32::from_gray(110),
                 );
                 for si in 0..5 {
+                    let st_pal = theme::palette();
                     let x = 80.0 + si as f32 * 90.0;
                     let bg = match si {
-                        1 => crate::ui_kit::HOVER,
-                        2 => crate::ui_kit::PRESSED,
-                        3 => crate::ui_kit::PRESSED,
+                        1 => st_pal.hover,
+                        2 => st_pal.pressed,
+                        3 => st_pal.pressed,
                         _ => Color32::TRANSPARENT,
                     };
                     if bg != Color32::TRANSPARENT {
@@ -51287,9 +51381,9 @@ impl eframe::App for SheetApp {
                     }
                     let enabled = si != 4;
                     let col = if enabled {
-                        crate::ui_kit::TEXT
+                        st_pal.text
                     } else {
-                        crate::ui_kit::DISABLED
+                        st_pal.text_muted
                     };
                     crate::ui_icons::draw_excel(
                         &p,
@@ -51991,7 +52085,7 @@ fn dlg_section(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(text)
-            .size(11.5)
+            .size(12.0)
             .strong()
             .color(theme::palette().text),
     );
@@ -52004,7 +52098,7 @@ fn dlg_cell_label(ui: &mut egui::Ui, text: &str) {
         egui::Vec2::new(42.0, 22.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.label(egui::RichText::new(text).size(11.5).color(theme::palette().text_weak));
+            ui.label(egui::RichText::new(text).size(11.0).color(theme::palette().text_weak));
         },
     );
 }
