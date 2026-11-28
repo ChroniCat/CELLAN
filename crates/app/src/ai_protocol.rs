@@ -55,7 +55,17 @@ fn text_tool_messages(messages: Vec<JsonValue>, tools: Vec<JsonValue>) -> Vec<Js
             result.push(json!({"role":"user","content":"请根据执行记录继续完成我先前的请求。"}));
         } else {
             // Canonical turns contain ordinary messages plus paired call/result batches.
-            result.push(json!({"role":message["role"],"content":message["content"]}));
+            // Merge adjacent user messages (e.g. tool continuation + loop nudge) so strict
+            // text-only chat templates keep clean user/assistant alternation.
+            if message["role"] == "user"
+                && let Some(prev) = result.last_mut()
+                && prev["role"] == "user"
+                && let (Some(a), Some(b)) = (prev["content"].as_str(), message["content"].as_str())
+            {
+                prev["content"] = json!(format!("{a}\n\n{b}"));
+            } else {
+                result.push(json!({"role":message["role"],"content":message["content"]}));
+            }
         }
     }
     result

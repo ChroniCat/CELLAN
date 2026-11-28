@@ -8,6 +8,476 @@ const HISTORY_BYTES: usize = 48 * 1024;
 const OBSERVATION_BYTES: usize = 16 * 1024;
 const DISPLAY_TURNS: usize = 50;
 
+// Unbounded-round harness guardrails (inspired by Claude Code / Codex CLI / Gemini CLI / OpenHands):
+// No fixed ceiling on productive rounds; protect against stuck loops & context overflow instead.
+const MAX_CONSECUTIVE_PARSE_ERRORS: usize = 4;
+const TOOL_ERROR_NUDGE_STREAK: usize = 3;
+const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 6;
+const EXACT_LOOP_NUDGE_REPEATS: usize = 4;
+const EXACT_LOOP_STOP_AFTER_NUDGE: usize = 2;
+const PING_PONG_WINDOW: usize = 6;
+const RECENT_ROUNDS_CAP: usize = 12;
+
+// Proactive & reactive in-turn context compaction budgets.
+const TURN_CONTEXT_BUDGET_BYTES: usize = 160 * 1024;
+const KEEP_RECENT_TOOL_ROUNDS: usize = 8;
+const COMPACTED_TOOL_BYTES: usize = 320;
+const COMPACTED_ASSISTANT_BYTES: usize = 400;
+const MAX_OVERFLOW_COMPACTIONS: usize = 3;
+const FOLD_SUMMARY_MARKER: &str = "[较早推理轮次已自动折叠摘要]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RoundFingerprint {
+    batch_sig: u64,
+    obs_sig: u64,
+    mutated: bool,
+    all_failed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LoopVerdict {
+    Continue,
+    Nudge(&'static str),
+    Break(String),
+}
+
+#[derive(Default)]
+struct TurnGuard {
+    consecutive_parse_errors: usize,
+    consecutive_tool_errors: usize,
+    recent_rounds: VecDeque<RoundFingerprint>,
+    loop_nudged: bool,
+    rounds_since_loop_nudge: usize,
+    cur_batch_hash: u64,
+    cur_obs_hash: u64,
+    cur_tool_count: usize,
+    cur_success_count: usize,
+    cur_error_count: usize,
+    cur_start_doc_gen: u64,
+}
+
+fn hash_canonical_json(value: &JsonValue, hasher: &mut DefaultHasher) {
+    match value {
+        JsonValue::Null => 0u8.hash(hasher),
+        JsonValue::Bool(b) => {
+            1u8.hash(hasher);
+            b.hash(hasher);
+        }
+        JsonValue::Number(n) => {
+            2u8.hash(hasher);
+            n.to_string().hash(hasher);
+        }
+        JsonValue::String(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        JsonValue::Array(items) => {
+            4u8.hash(hasher);
+            items.len().hash(hasher);
+            for item in items {
+                hash_canonical_json(item, hasher);
+            }
+        }
+        JsonValue::Object(map) => {
+            5u8.hash(hasher);
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            keys.len().hash(hasher);
+            for key in keys {
+                key.hash(hasher);
+                hash_canonical_json(&map[key], hasher);
+            }
+        }
+    }
+}
+
+impl TurnGuard {
+    fn note_parse_error(&mut self) -> Result<(), String> {
+        self.consecutive_parse_errors += 1;
+        if self.consecutive_parse_errors >= MAX_CONSECUTIVE_PARSE_ERRORS {
+            Err(format!(
+                "连续 {MAX_CONSECUTIVE_PARSE_ERRORS} 轮工具调用格式解析失败，已自动中止以防死循环。"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn begin_batch(&mut self, calls: &[WireToolCall], doc_gen: u64) {
+        self.consecutive_parse_errors = 0;
+        let mut h = DefaultHasher::new();
+        calls.len().hash(&mut h);
+        for call in calls {
+            call.spec.name.hash(&mut h);
+            hash_canonical_json(&call.spec.arguments, &mut h);
+        }
+        self.cur_batch_hash = h.finish();
+        self.cur_obs_hash = 0;
+        self.cur_tool_count = 0;
+        self.cur_success_count = 0;
+        self.cur_error_count = 0;
+        self.cur_start_doc_gen = doc_gen;
+    }
+
+    fn note_observation(&mut self, is_err: bool, content: &str) {
+        let mut h = DefaultHasher::new();
+        self.cur_obs_hash.hash(&mut h);
+        self.cur_tool_count.hash(&mut h);
+        content.hash(&mut h);
+        self.cur_obs_hash = h.finish();
+        self.cur_tool_count += 1;
+        if is_err {
+            self.cur_error_count += 1;
+        } else {
+            self.cur_success_count += 1;
+        }
+    }
+
+    fn is_repeating_tail(&self, repeats: usize) -> bool {
+        let n = self.recent_rounds.len();
+        if n < repeats {
+            return false;
+        }
+        let last = self.recent_rounds[n - 1];
+        self.recent_rounds
+            .iter()
+            .skip(n - repeats)
+            .all(|r| r.batch_sig == last.batch_sig && r.obs_sig == last.obs_sig)
+    }
+
+    fn is_ping_pong_tail(&self) -> bool {
+        let n = self.recent_rounds.len();
+        if n < PING_PONG_WINDOW {
+            return false;
+        }
+        let slice_start = n - PING_PONG_WINDOW;
+        let a = self.recent_rounds[slice_start];
+        let b = self.recent_rounds[slice_start + 1];
+        if a.batch_sig == b.batch_sig && a.obs_sig == b.obs_sig {
+            return false;
+        }
+        for offset in 0..PING_PONG_WINDOW {
+            let r = self.recent_rounds[slice_start + offset];
+            if r.mutated {
+                return false;
+            }
+            let expected = if offset % 2 == 0 { a } else { b };
+            if r.batch_sig != expected.batch_sig || r.obs_sig != expected.obs_sig {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish_batch(&mut self, doc_gen: u64) -> LoopVerdict {
+        let mutated = doc_gen != self.cur_start_doc_gen;
+        let all_failed =
+            self.cur_tool_count > 0 && self.cur_success_count == 0 && self.cur_error_count > 0;
+        let fp = RoundFingerprint {
+            batch_sig: self.cur_batch_hash,
+            obs_sig: self.cur_obs_hash,
+            mutated,
+            all_failed,
+        };
+        if all_failed {
+            self.consecutive_tool_errors += 1;
+        } else {
+            self.consecutive_tool_errors = 0;
+        }
+        if self.consecutive_tool_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+            return LoopVerdict::Break(format!(
+                "连续 {MAX_CONSECUTIVE_TOOL_ERRORS} 轮工具执行均报错且未恢复，已自动中止以防死循环。"
+            ));
+        }
+        let prev = self.recent_rounds.back().copied();
+        self.recent_rounds.push_back(fp);
+        while self.recent_rounds.len() > RECENT_ROUNDS_CAP {
+            self.recent_rounds.pop_front();
+        }
+
+        if self.loop_nudged {
+            self.rounds_since_loop_nudge += 1;
+            let same_as_prev =
+                prev.is_some_and(|p| p.batch_sig == fp.batch_sig && p.obs_sig == fp.obs_sig);
+            if mutated && !same_as_prev {
+                // Model broke out of the loop and made genuine workbook progress.
+                self.loop_nudged = false;
+                self.rounds_since_loop_nudge = 0;
+                return LoopVerdict::Continue;
+            }
+            let still_repeating =
+                self.is_repeating_tail(EXACT_LOOP_STOP_AFTER_NUDGE) || self.is_ping_pong_tail();
+            if self.rounds_since_loop_nudge >= EXACT_LOOP_STOP_AFTER_NUDGE && still_repeating {
+                return LoopVerdict::Break(
+                    "检测到 AI 在纠偏后仍连续重复相同无进展操作，已自动中止以防死循环。".into(),
+                );
+            }
+            if self.rounds_since_loop_nudge >= 2 && !same_as_prev && !still_repeating && !all_failed
+            {
+                self.loop_nudged = false;
+                self.rounds_since_loop_nudge = 0;
+            }
+            return LoopVerdict::Continue;
+        }
+
+        if self.is_repeating_tail(EXACT_LOOP_NUDGE_REPEATS) || self.is_ping_pong_tail() {
+            self.loop_nudged = true;
+            self.rounds_since_loop_nudge = 0;
+            return LoopVerdict::Nudge(
+                "[程序提示] 检测到最近多轮在重复相同工具调用且没有新的结果变化。请勿继续重复查询，直接基于已有信息执行下一步修改或汇总回复用户。",
+            );
+        }
+
+        if self.consecutive_tool_errors == TOOL_ERROR_NUDGE_STREAK {
+            return LoopVerdict::Nudge(
+                "[程序提示] 已连续多轮工具执行报错，请先核对工作表名、单元格坐标或参数格式后再试；若确实受阻，请直接向用户说明原因。",
+            );
+        }
+
+        LoopVerdict::Continue
+    }
+}
+
+fn messages_byte_len(messages: &[JsonValue]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            let mut n = 24usize;
+            if let Some(s) = m["content"].as_str() {
+                n += s.len();
+            }
+            if let Some(s) = m.get("reasoning_content").and_then(|v| v.as_str()) {
+                n += s.len();
+            }
+            if let Some(calls) = m.get("tool_calls") {
+                n += calls.to_string().len();
+            }
+            n
+        })
+        .sum()
+}
+
+fn partition_turn_groups(messages: &[JsonValue], start: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut i = start.min(messages.len());
+    while i < messages.len() {
+        let g_start = i;
+        if messages[i]["role"] == "assistant" && messages[i].get("tool_calls").is_some() {
+            i += 1;
+            while i < messages.len() && messages[i]["role"] == "tool" {
+                i += 1;
+            }
+            if i < messages.len()
+                && messages[i]["role"] == "user"
+                && messages[i]["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("[程序提示]"))
+            {
+                i += 1;
+            }
+        } else if messages[i]["role"] == "assistant"
+            && i + 1 < messages.len()
+            && messages[i + 1]["role"] == "user"
+        {
+            i += 2;
+        } else {
+            i += 1;
+        }
+        groups.push(g_start..i);
+    }
+    groups
+}
+
+fn compact_tool_observation_content(raw: &str) -> Option<String> {
+    if raw.len() <= COMPACTED_TOOL_BYTES {
+        return None;
+    }
+    let compacted = match serde_json::from_str::<JsonValue>(raw) {
+        Ok(JsonValue::Object(map)) => {
+            let mut stub = serde_json::Map::new();
+            stub.insert("compacted".into(), json!(true));
+            for key in ["ok", "sheet", "range", "status", "error", "written", "count", "has_more"] {
+                if let Some(v) = map.get(key) {
+                    let s = v.to_string();
+                    if s.len() <= 140 {
+                        stub.insert(key.into(), v.clone());
+                    } else if let Some(text) = v.as_str() {
+                        stub.insert(key.into(), json!(bounded(text.to_owned(), 120)));
+                    }
+                }
+            }
+            if stub.len() <= 1 {
+                stub.insert("preview".into(), json!(bounded(raw.to_owned(), 200)));
+            }
+            JsonValue::Object(stub).to_string()
+        }
+        _ => json!({"compacted": true, "preview": bounded(raw.to_owned(), 200)}).to_string(),
+    };
+    (compacted.len() < raw.len()).then_some(compacted)
+}
+
+fn is_fold_checkpoint_group(messages: &[JsonValue], range: &std::ops::Range<usize>) -> bool {
+    range.len() == 2
+        && messages[range.start]["role"] == "assistant"
+        && messages[range.start]["content"]
+            .as_str()
+            .is_some_and(|s| s.starts_with(FOLD_SUMMARY_MARKER))
+}
+
+fn compact_turn_messages(
+    messages: &mut Vec<JsonValue>,
+    turn_start_idx: &mut usize,
+    folded_rounds: &mut usize,
+    folded_tool_counts: &mut std::collections::BTreeMap<String, usize>,
+    budget_bytes: usize,
+    keep_recent_groups: usize,
+    tool_logs: &[String],
+    allow_drop_history: bool,
+) -> bool {
+    let before = messages_byte_len(messages);
+    if before <= budget_bytes {
+        return false;
+    }
+
+    // Tier 0 (emergency overflow only): drop oldest cross-turn wire_history pairs before
+    // folding the active turn's own working steps.
+    if allow_drop_history {
+        while messages_byte_len(messages) > budget_bytes && *turn_start_idx > 2 {
+            // messages[0] is system; messages[turn_start_idx - 1] is the active turn's user prompt.
+            if messages.len() >= 3
+                && messages[1]["role"] == "user"
+                && messages[2]["role"] == "assistant"
+            {
+                messages.drain(1..3);
+                *turn_start_idx -= 2;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let groups = partition_turn_groups(messages, *turn_start_idx);
+    let protected = keep_recent_groups.min(groups.len());
+    let compactable_end = groups.len().saturating_sub(protected);
+
+    // Tier 1: strip bulky `reasoning_content` from older assistant tool-call turns.
+    for group in &groups[..compactable_end] {
+        if messages_byte_len(messages) <= budget_bytes {
+            break;
+        }
+        for msg in &mut messages[group.clone()] {
+            if msg["role"] == "assistant"
+                && let Some(obj) = msg.as_object_mut()
+            {
+                obj.remove("reasoning_content");
+            }
+        }
+    }
+
+    // Tier 2: micro-compact bulky tool observations & verbose assistant preambles in older groups
+    // while keeping every assistant(tool_calls) <-> tool(tool_call_id) pair 100% intact.
+    for group in &groups[..compactable_end] {
+        if messages_byte_len(messages) <= budget_bytes {
+            break;
+        }
+        if is_fold_checkpoint_group(messages, group) {
+            continue;
+        }
+        for msg in &mut messages[group.clone()] {
+            if msg["role"] == "tool"
+                && let Some(raw) = msg["content"].as_str()
+                && let Some(stub) = compact_tool_observation_content(raw)
+            {
+                msg["content"] = json!(stub);
+            } else if msg["role"] == "assistant"
+                && msg.get("tool_calls").is_some()
+                && let Some(raw) = msg["content"].as_str()
+                && raw.len() > COMPACTED_ASSISTANT_BYTES
+            {
+                msg["content"] = json!(bounded(raw.to_owned(), 280));
+            }
+        }
+    }
+
+    // Tier 3: if still above budget (e.g. 100+ rounds or small-window model overflow),
+    // fold the oldest groups into a single strict-alternation checkpoint pair.
+    if messages_byte_len(messages) > budget_bytes && compactable_end >= 1 {
+        let mut fold_end = 0usize;
+        let mut removed_bytes = 0usize;
+        let excess = messages_byte_len(messages).saturating_sub(budget_bytes);
+        let target_cut = excess + (budget_bytes / 6).max(2048);
+        for (idx, group) in groups[..compactable_end].iter().enumerate() {
+            let group_bytes = messages_byte_len(&messages[group.clone()]);
+            fold_end = idx + 1;
+            if !is_fold_checkpoint_group(messages, group) {
+                removed_bytes += group_bytes;
+                if removed_bytes >= target_cut {
+                    break;
+                }
+            }
+        }
+        // Only fold if at least one non-checkpoint group is included.
+        let has_real_group = groups[..fold_end]
+            .iter()
+            .any(|g| !is_fold_checkpoint_group(messages, g));
+        if has_real_group {
+            for group in &groups[..fold_end] {
+                if is_fold_checkpoint_group(messages, group) {
+                    continue;
+                }
+                *folded_rounds += 1;
+                for msg in &messages[group.clone()] {
+                    if let Some(calls) = msg["tool_calls"].as_array() {
+                        for call in calls {
+                            if let Some(name) = call["function"]["name"].as_str() {
+                                *folded_tool_counts.entry(name.to_owned()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let summary_tools = folded_tool_counts
+                .iter()
+                .map(|(name, count)| format!("{name}×{count}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            let mut summary = format!(
+                "{FOLD_SUMMARY_MARKER}\n已自动折叠本任务较早的 {} 轮交互以保留上下文空间。",
+                *folded_rounds
+            );
+            if !summary_tools.is_empty() {
+                summary.push_str(&format!("\n累计工具调用：{summary_tools}。"));
+            }
+            let recent_log_tail: Vec<&str> = tool_logs
+                .iter()
+                .rev()
+                .skip(keep_recent_groups)
+                .take(8)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !recent_log_tail.is_empty() {
+                summary.push_str("\n部分较早操作记录：\n- ");
+                summary.push_str(&recent_log_tail.join("\n- "));
+            }
+            let splice_start = groups[0].start;
+            let splice_end = groups[fold_end - 1].end;
+            let checkpoint = [
+                json!({"role": "assistant", "content": bounded(summary, 2048)}),
+                json!({
+                    "role": "user",
+                    "content": "[程序提示] 上文已自动折叠较早的工具交互以节省上下文空间，已完成的工作簿修改全部保留。请基于当前工作簿状态与后续工具记录继续完成任务。"
+                }),
+            ];
+            messages.splice(splice_start..splice_end, checkpoint);
+        }
+    }
+
+    messages_byte_len(messages) < before
+}
+
 type Rect = (u32, u32, u32, u32);
 
 /// The sheet and selection the model was told about. Omitted tool targets resolve here,
@@ -130,6 +600,11 @@ pub(super) struct ActiveTurn {
     prompt: String,
     cfg: AiConfig,
     messages: Vec<JsonValue>,
+    turn_start_idx: usize,
+    folded_rounds: usize,
+    folded_tool_counts: std::collections::BTreeMap<String, usize>,
+    overflow_compactions: usize,
+    guard: TurnGuard,
     pending_calls: VecDeque<WireToolCall>,
     calculation: Option<PendingCalculation>,
     view: AiView,
@@ -418,10 +893,16 @@ impl SheetApp {
         self.ai.bound_doc_uid = Some(self.doc_uid);
         self.ai.calc_base = None;
         let messages = self.ai_prompt_messages(&prompt);
+        let turn_start_idx = messages.len();
         self.ai.active_round = Some(ActiveTurn {
             prompt: prompt.clone(),
             cfg: self.ai.cfg.clone(),
             messages,
+            turn_start_idx,
+            folded_rounds: 0,
+            folded_tool_counts: std::collections::BTreeMap::new(),
+            overflow_compactions: 0,
+            guard: TurnGuard::default(),
             pending_calls: VecDeque::new(),
             calculation: None,
             view: self.ai_view_now(),
@@ -483,6 +964,18 @@ impl SheetApp {
         let Some(last) = self.ai.messages.last_mut() else {
             return;
         };
+        // Proactively keep long multi-step turns within a healthy context budget
+        // without altering short turns or breaking tool_call/tool pairing.
+        compact_turn_messages(
+            &mut turn.messages,
+            &mut turn.turn_start_idx,
+            &mut turn.folded_rounds,
+            &mut turn.folded_tool_counts,
+            TURN_CONTEXT_BUDGET_BYTES,
+            KEEP_RECENT_TOOL_ROUNDS,
+            &last.tool_logs,
+            false,
+        );
         turn.content_start = last.content.len();
         turn.reasoning_start = last.reasoning.len();
         turn.revision = revision;
@@ -497,6 +990,60 @@ impl SheetApp {
         self.ai.busy = true;
         self.ai.cancel = Some(cancel);
         self.ai.rx = Some(rx);
+    }
+
+    fn handle_ai_context_overflow(&mut self, error: String) {
+        let can_compact = self
+            .ai
+            .active_round
+            .as_ref()
+            .is_some_and(|t| t.overflow_compactions < MAX_OVERFLOW_COMPACTIONS);
+        if !can_compact {
+            self.fail_ai_round(error, true);
+            return;
+        }
+        let shrank = {
+            let Some(turn) = self.ai.active_round.as_mut() else {
+                return;
+            };
+            let tool_logs = self
+                .ai
+                .messages
+                .last()
+                .map(|m| m.tool_logs.as_slice())
+                .unwrap_or(&[]);
+            turn.overflow_compactions += 1;
+            let cur_bytes = messages_byte_len(&turn.messages);
+            let target_budget = (cur_bytes / 2).max(12 * 1024);
+            let keep_recent = match turn.overflow_compactions {
+                1 => 4,
+                2 => 2,
+                _ => 1,
+            };
+            compact_turn_messages(
+                &mut turn.messages,
+                &mut turn.turn_start_idx,
+                &mut turn.folded_rounds,
+                &mut turn.folded_tool_counts,
+                target_budget,
+                keep_recent,
+                tool_logs,
+                true,
+            )
+        };
+        if !shrank {
+            self.fail_ai_round(error, true);
+            return;
+        }
+        if let Some(turn) = self.ai.active_round.as_ref()
+            && let Some(last) = self.ai.messages.last_mut()
+        {
+            last.error = None;
+            last.content.truncate(turn.content_start);
+            last.reasoning.truncate(turn.reasoning_start);
+        }
+        self.ai.status_hint = "上下文接近模型上限，正在自动压缩较早步骤并继续…".into();
+        self.launch_ai_round();
     }
 
     pub(super) fn can_retry_ai_round(&self) -> bool {
@@ -787,6 +1334,12 @@ impl SheetApp {
                     self.finish_ai_round(visible_content, native_reasoning, tool_calls, ctx);
                     break; // A follow-up round can already own a new receiver.
                 }
+                Ok(StreamMsg::ContextOverflow(error)) => {
+                    self.ai.rx = None;
+                    self.ai.cancel = None;
+                    self.handle_ai_context_overflow(error);
+                    break;
+                }
                 Ok(StreamMsg::Failed(error)) => {
                     self.fail_ai_round(error, true);
                     break;
@@ -865,18 +1418,19 @@ impl SheetApp {
             self.ai.status_hint = "已完成".into();
             return;
         }
-        if self.ai.round >= MAX_TOOL_ROUNDS {
-            self.fail_ai_round(
-                format!("已达到 {MAX_TOOL_ROUNDS} 轮上限，最后一轮的工具调用未执行。"),
-                false,
-            );
-            return;
-        }
+        let doc_gen = self.doc_gen;
         let Some(turn) = self.ai.active_round.as_mut() else {
             return;
         };
         match calls {
             Err(error) => {
+                if let Err(limit_err) = turn.guard.note_parse_error() {
+                    if let Some(last) = self.ai.messages.last_mut() {
+                        last.tool_logs.push(error);
+                    }
+                    self.fail_ai_round(limit_err, false);
+                    return;
+                }
                 // A malformed batch performs no edits. Tell the model how to repair its next call.
                 // Some chat templates only accept a system message at the start.
                 turn.messages
@@ -898,6 +1452,7 @@ impl SheetApp {
                         call.id = id;
                     }
                 }
+                turn.guard.begin_batch(&calls, doc_gen);
                 let wire_calls: Vec<_> = calls.iter().map(WireToolCall::as_json).collect();
                 let mut message =
                     json!({"role":"assistant","content":visible,"tool_calls":wire_calls});
@@ -936,7 +1491,17 @@ impl SheetApp {
             };
             let view = turn.view;
             let Some(mut call) = turn.pending_calls.pop_front() else {
-                self.next_ai_round();
+                let verdict = turn.guard.finish_batch(self.doc_gen);
+                match verdict {
+                    LoopVerdict::Continue => self.next_ai_round(),
+                    LoopVerdict::Nudge(hint) => {
+                        turn.messages.push(json!({"role": "user", "content": hint}));
+                        self.next_ai_round();
+                    }
+                    LoopVerdict::Break(reason) => {
+                        self.fail_ai_round(reason, false);
+                    }
+                }
                 return;
             };
             if !std::mem::take(&mut approved) {
@@ -1860,12 +2425,15 @@ impl SheetApp {
         if let Some(last) = self.ai.messages.last_mut() {
             last.tool_logs.push(label);
         }
+        let is_err =
+            result.get("ok") == Some(&JsonValue::Bool(false)) || result.get("error").is_some();
         if let Some(turn) = self.ai.active_round.as_mut() {
             let mut content = result.to_string();
             if content.len() > OBSERVATION_BYTES {
                 content = json!({"truncated":true,"preview":bounded(content, OBSERVATION_BYTES)})
                     .to_string();
             }
+            turn.guard.note_observation(is_err, &content);
             turn.messages
                 .push(json!({"role":"tool","tool_call_id":id,"content":content}));
         }
@@ -1873,7 +2441,7 @@ impl SheetApp {
 
     fn next_ai_round(&mut self) {
         self.ai.round += 1;
-        self.ai.status_hint = format!("第 {} / {MAX_TOOL_ROUNDS} 轮推理中…", self.ai.round);
+        self.ai.status_hint = format!("第 {} 轮推理中…", self.ai.round);
         self.launch_ai_round();
     }
 }
@@ -1903,6 +2471,11 @@ mod tests {
             prompt: "读取选区".into(),
             cfg: app.ai.cfg.clone(),
             messages: Vec::new(),
+            turn_start_idx: 0,
+            folded_rounds: 0,
+            folded_tool_counts: std::collections::BTreeMap::new(),
+            overflow_compactions: 0,
+            guard: TurnGuard::default(),
             pending_calls: VecDeque::new(),
             calculation: None,
             view: app.ai_view_now(),
@@ -2373,20 +2946,169 @@ mod tests {
     }
 
     #[test]
-    fn ai_last_round_reports_unexecuted_tools() {
+    fn ai_unbounded_rounds_execute_beyond_64_without_arbitrary_cap() {
         let ctx = egui::Context::default();
         let mut app = pending_app(&ctx);
-        app.ai.round = MAX_TOOL_ROUNDS;
+        app.ai.round = 64;
         app.finish_ai_round(
-            "还需读取一个单元格".into(),
+            "继续执行第 65 轮读取".into(),
             None,
-            Ok(vec![call("read", "inspect_sheet", json!({}))]),
+            Ok(vec![call("read_65", "inspect_sheet", json!({"range":"A1"}))]),
             &ctx,
         );
-        assert!(!app.ai.busy);
-        assert!(app.ai.status_hint.contains("上限"));
-        assert!(app.ai.messages.last().unwrap().tool_logs.is_empty());
-        assert!(app.ai.wire_history.is_empty());
+        assert!(app.ai.busy, "round 64 must no longer hit a fixed cap");
+        assert_eq!(app.ai.round, 65);
+        assert_eq!(app.ai.messages.last().unwrap().tool_logs.len(), 1);
+        assert!(app.ai.messages.last().unwrap().error.is_none());
+        app.stop_ai_generation();
+    }
+
+    #[test]
+    fn ai_turn_guard_nudges_and_breaks_exact_ping_pong_and_error_loops() {
+        // 1. Consecutive parse failures trip cleanly at MAX_CONSECUTIVE_PARSE_ERRORS.
+        let mut g = TurnGuard::default();
+        for _ in 0..(MAX_CONSECUTIVE_PARSE_ERRORS - 1) {
+            assert!(g.note_parse_error().is_ok());
+        }
+        assert!(g.note_parse_error().is_err());
+
+        // 2. Exact no-progress repeat: 4th repeat nudges; obeying with novel write resets;
+        //    ignoring nudge for 2 more repeats breaks.
+        let mut g = TurnGuard::default();
+        let read_a = [call("c1", "inspect_sheet", json!({"range": "A1"}))];
+        for i in 0..3 {
+            g.begin_batch(&read_a, 10);
+            g.note_observation(false, r#"{"ok":true,"v":1}"#);
+            assert_eq!(g.finish_batch(10), LoopVerdict::Continue, "round {i}");
+        }
+        g.begin_batch(&read_a, 10);
+        g.note_observation(false, r#"{"ok":true,"v":1}"#);
+        assert!(matches!(g.finish_batch(10), LoopVerdict::Nudge(_)));
+
+        // Obey nudge with a real mutation -> clears loop state cleanly.
+        let write_b = [call("c2", "set_cells", json!({"edits":[{"cell":"A1","value":42}]}))];
+        g.begin_batch(&write_b, 10);
+        g.note_observation(false, r#"{"ok":true}"#);
+        assert_eq!(g.finish_batch(11), LoopVerdict::Continue);
+        assert!(!g.loop_nudged);
+
+        // Repeat again after reset, then ignore nudge -> trips Break.
+        for _ in 0..3 {
+            g.begin_batch(&read_a, 11);
+            g.note_observation(false, r#"{"ok":true,"v":42}"#);
+            assert_eq!(g.finish_batch(11), LoopVerdict::Continue);
+        }
+        g.begin_batch(&read_a, 11);
+        g.note_observation(false, r#"{"ok":true,"v":42}"#);
+        assert!(matches!(g.finish_batch(11), LoopVerdict::Nudge(_)));
+        g.begin_batch(&read_a, 11);
+        g.note_observation(false, r#"{"ok":true,"v":42}"#);
+        assert_eq!(g.finish_batch(11), LoopVerdict::Continue);
+        g.begin_batch(&read_a, 11);
+        g.note_observation(false, r#"{"ok":true,"v":42}"#);
+        assert!(matches!(g.finish_batch(11), LoopVerdict::Break(_)));
+
+        // 3. Period-2 ping-pong loop (A -> B -> A -> B -> A -> B) without mutation nudges then breaks.
+        let mut g = TurnGuard::default();
+        let read_b = [call("c3", "inspect_workbook", json!({}))];
+        for i in 0..5 {
+            let batch = if i % 2 == 0 { &read_a } else { &read_b };
+            g.begin_batch(batch, 1);
+            g.note_observation(false, if i % 2 == 0 { "obsA" } else { "obsB" });
+            assert_eq!(g.finish_batch(1), LoopVerdict::Continue);
+        }
+        g.begin_batch(&read_b, 1);
+        g.note_observation(false, "obsB");
+        assert!(matches!(g.finish_batch(1), LoopVerdict::Nudge(_)));
+        g.begin_batch(&read_a, 1);
+        g.note_observation(false, "obsA");
+        assert_eq!(g.finish_batch(1), LoopVerdict::Continue);
+        g.begin_batch(&read_b, 1);
+        g.note_observation(false, "obsB");
+        assert!(matches!(g.finish_batch(1), LoopVerdict::Break(_)));
+
+        // 4. Consecutive all-failed tool rounds nudge at 3 and break at 6.
+        let mut g = TurnGuard::default();
+        for i in 1..=6 {
+            let bad = [call("e", "set_cells", json!({"edits":[{"cell": format!("Z{i}"), "value": i}]}))];
+            g.begin_batch(&bad, 1);
+            g.note_observation(true, r#"{"ok":false,"error":"protected"}"#);
+            let v = g.finish_batch(1);
+            match i {
+                3 => assert!(matches!(v, LoopVerdict::Nudge(_))),
+                6 => assert!(matches!(v, LoopVerdict::Break(_))),
+                _ => assert_eq!(v, LoopVerdict::Continue),
+            }
+        }
+    }
+
+    #[test]
+    fn ai_in_turn_compaction_preserves_tool_pairing_and_shrinks_budget() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "old q"}),
+            json!({"role": "assistant", "content": "old a"}),
+            json!({"role": "user", "content": "current prompt"}),
+        ];
+        let mut turn_start_idx = messages.len();
+        let mut folded_rounds = 0usize;
+        let mut folded_counts = std::collections::BTreeMap::new();
+        let mut tool_logs = Vec::new();
+        for i in 0..16usize {
+            let id = format!("call_{i}");
+            messages.push(json!({
+                "role": "assistant",
+                "content": format!("step {i}"),
+                "reasoning_content": "思".repeat(800),
+                "tool_calls": [{"id": id, "type": "function", "function": {"name": "inspect_sheet", "arguments": "{\"range\":\"A1\"}"}}]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": json!({"ok": true, "sheet": "Sheet1", "range": "A1:Z20", "cells": "x".repeat(4000)}).to_string()
+            }));
+            tool_logs.push(format!("读取 Sheet1!A{}", i + 1));
+        }
+
+        let before = messages_byte_len(&messages);
+        let shrank = compact_turn_messages(
+            &mut messages,
+            &mut turn_start_idx,
+            &mut folded_rounds,
+            &mut folded_counts,
+            32 * 1024,
+            4,
+            &tool_logs,
+            false,
+        );
+        assert!(shrank);
+        assert!(messages_byte_len(&messages) < before);
+        // System + active prompt untouched; no orphaned tool messages anywhere.
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[turn_start_idx - 1]["content"], "current prompt");
+        for (idx, msg) in messages.iter().enumerate() {
+            if msg["role"] == "tool" {
+                assert!(idx > 0 && messages[idx - 1]["role"] == "assistant" || messages[idx - 1]["role"] == "tool");
+            }
+        }
+
+        // Aggressive emergency overflow compaction drops cross-turn history & folds older rounds cleanly.
+        let before_em = messages_byte_len(&messages);
+        let shrank_em = compact_turn_messages(
+            &mut messages,
+            &mut turn_start_idx,
+            &mut folded_rounds,
+            &mut folded_counts,
+            4 * 1024,
+            2,
+            &tool_logs,
+            true,
+        );
+        assert!(shrank_em);
+        assert!(messages_byte_len(&messages) < before_em);
+        assert!(folded_rounds >= 1);
+        assert_eq!(turn_start_idx, 2, "old wire_history pair should drop first on emergency overflow");
+        assert!(messages[turn_start_idx]["content"].as_str().unwrap().starts_with(FOLD_SUMMARY_MARKER));
     }
 
     #[test]
@@ -2589,6 +3311,11 @@ impl SheetApp {
             prompt: "bench".into(),
             cfg: self.ai.cfg.clone(),
             messages: Vec::new(),
+            turn_start_idx: 0,
+            folded_rounds: 0,
+            folded_tool_counts: std::collections::BTreeMap::new(),
+            overflow_compactions: 0,
+            guard: TurnGuard::default(),
             pending_calls: VecDeque::new(),
             calculation: None,
             view: self.ai_view_now(),

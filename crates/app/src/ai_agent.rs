@@ -1,7 +1,8 @@
 //! 内置 AI 表格助手与轻量化表格微内核（Micro-Harness）。
 //!
 //! 预设对接企业内网 OpenAI 兼容推理服务（默认 DeepSeek Local H200），
-//! 支持流式 SSE 对话、思考链折叠展示、最多 64 轮自动工具调用与自检修复，
+//! 支持流式 SSE 对话、思考链折叠展示、无固定轮数上限的自动工具调用与自检修复
+//! （内置死循环/连续报错熔断与轮内上下文自动折叠），
 //! 且所有写操作统一接入工作簿撤销栈、保护检查与协同编辑锁。
 
 mod confirmation;
@@ -24,7 +25,7 @@ const DEFAULT_PROVIDER_ID: &str = "deepseek-local";
 const DEFAULT_DISPLAY_NAME: &str = "DeepSeek Local H200";
 const DEFAULT_BASE_URL: &str = "https://deepseek.hollantex.net/v1";
 const DEFAULT_MODEL: &str = "deepseek-v4.1-flash";
-const MAX_TOOL_ROUNDS: usize = 64;
+const CONTEXT_OVERFLOW_PREFIX: &str = "上下文超出模型窗口上限";
 
 const AI_KEY_DPAPI_ENTROPY: &[u8] = b"CELLAN-AI-CONFIG-V1";
 const AI_KEY_DPAPI_PREFIX: &str = "dpapi:";
@@ -223,6 +224,7 @@ enum StreamMsg {
         native_reasoning: Option<String>,
         tool_calls: Result<Vec<WireToolCall>, String>,
     },
+    ContextOverflow(String),
     Failed(String),
 }
 
@@ -452,8 +454,41 @@ fn is_loopback_host(host: &str) -> bool {
     h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
+fn is_context_length_http_error(status: u32, body: &str) -> bool {
+    if !matches!(status, 400 | 413 | 422) {
+        return false;
+    }
+    let msg = body.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "maximum context",
+        "context length",
+        "context window",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "exceeds the context",
+        "token limit",
+        "tokens exceed",
+        "request too large",
+        "payload too large",
+        "上下文长度",
+        "超出最大上下文",
+        "上下文超长",
+    ]
+    .iter()
+    .any(|term| msg.contains(term))
+}
+
 fn format_http_status_error(status: u32, body: &str) -> String {
     let preview: String = body.trim().chars().take(180).collect();
+    if is_context_length_http_error(status, body) {
+        return if preview.is_empty() {
+            format!("{CONTEXT_OVERFLOW_PREFIX}（HTTP {status}）")
+        } else {
+            format!("{CONTEXT_OVERFLOW_PREFIX}（HTTP {status}）：{preview}")
+        };
+    }
     if matches!(status, 400 | 422) {
         let message = body.to_ascii_lowercase();
         let mentions_tools = ["tools", "tool calling", "tool use", "function calling", "工具调用"]
@@ -523,7 +558,12 @@ fn spawn_completion_round(
             cfg.allow_unframed_text,
         );
         if let Err(e) = res {
-            send_wake(&tx, StreamMsg::Failed(e), wake_ctx.as_ref());
+            let msg = if e.starts_with(CONTEXT_OVERFLOW_PREFIX) {
+                StreamMsg::ContextOverflow(e)
+            } else {
+                StreamMsg::Failed(e)
+            };
+            send_wake(&tx, msg, wake_ctx.as_ref());
         }
     });
     rx
@@ -2048,8 +2088,7 @@ impl SheetApp {
                     pal.text,
                 );
                 if self.ai.busy {
-                    let round_txt =
-                        format!("第 {}/{} 轮", self.ai.round.max(1), MAX_TOOL_ROUNDS);
+                    let round_txt = format!("第 {} 轮", self.ai.round.max(1));
                     let rg = hdr_ui.painter().layout_no_wrap(
                         round_txt.clone(),
                         FontId::proportional(11.0),
@@ -2663,9 +2702,9 @@ impl SheetApp {
                                         );
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(format!(
-                                                    "分析数据结构、编写公式与自动排版，支持连续 {MAX_TOOL_ROUNDS} 轮推理与一键撤销"
-                                                ))
+                                                egui::RichText::new(
+                                                    "分析数据结构、编写公式与自动排版，支持连续多轮工具推理与一键撤销",
+                                                )
                                                 .size(12.0)
                                                 .color(pal.text_weak),
                                             )

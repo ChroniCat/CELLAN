@@ -319,7 +319,7 @@ fn ai_rejected_or_stale_approval_preserves_cells() {
 }
 
 #[test]
-fn ai_reports_invalid_call_to_model_and_refuses_edits_at_round_limit() {
+fn ai_reports_invalid_call_to_model_and_breaks_no_progress_loop() {
     let mut chat = Conversation::new();
     chat.app.start_ai_prompt("读取 A1".into());
     let (first, _) = chat.request();
@@ -327,7 +327,10 @@ fn ai_reports_invalid_call_to_model_and_refuses_edits_at_round_limit() {
     invalid["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] = json!("{");
     respond(first, invalid);
 
-    for round in 2..=MAX_TOOL_ROUNDS {
+    // Rounds 2..=5 repeat identical inspect_sheet("A1") 4 times -> nudge injected before round 6.
+    // Rounds 6..=7 ignore the nudge and repeat again -> loop circuit breaker trips cleanly.
+    let mut saw_nudge = false;
+    for round in 2..=7usize {
         let (stream, request) = chat.request();
         let messages = request["messages"].as_array().unwrap();
         if round == 2 {
@@ -336,28 +339,21 @@ fn ai_reports_invalid_call_to_model_and_refuses_edits_at_round_limit() {
             // Some chat templates reject a system message anywhere but first.
             assert_eq!(repair["role"], "user");
             assert!(messages.iter().skip(1).all(|m| m["role"] != "system"));
+        } else if round == 6 {
+            let nudge = messages.last().unwrap();
+            assert_eq!(nudge["role"], "user");
+            assert!(nudge["content"].as_str().unwrap().contains("重复"));
+            assert!(messages.iter().skip(1).all(|m| m["role"] != "system"));
+            saw_nudge = true;
         } else {
             assert_eq!(messages.last().unwrap()["role"], "tool");
         }
-        let next = if round == MAX_TOOL_ROUNDS {
-            tool_event("set_cells", json!({"edits":[{"cell":"A1","value":8}]}))
-        } else {
-            tool_event("inspect_sheet", json!({"range":"A1"}))
-        };
-        respond(stream, next);
+        respond(stream, tool_event("inspect_sheet", json!({"range":"A1"})));
     }
     chat.poll_until(|app| !app.ai.busy);
-    assert!(
-        chat.app
-            .ai
-            .messages
-            .last()
-            .unwrap()
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("上限")
-    );
+    assert!(saw_nudge, "loop detector should nudge before breaking");
+    let err = chat.app.ai.messages.last().unwrap().error.as_deref().unwrap();
+    assert!(err.contains("死循环") || err.contains("重复"), "{err}");
     assert_eq!(chat.app.wb.sheet(0).value(0, 0), Value::Empty);
     assert!(!chat.app.can_retry_ai_round());
 }
@@ -431,11 +427,10 @@ fn ai_text_only_gateway_can_resume_an_existing_tool_round() {
 }
 
 #[test]
-fn ai_executes_multi_step_workflow_beyond_eight_rounds() {
-    assert_eq!(MAX_TOOL_ROUNDS, 64);
+fn ai_executes_multi_step_workflow_beyond_sixty_four_rounds() {
     let mut chat = Conversation::new();
-    chat.app.start_ai_prompt("分 12 步依次写入单元格".into());
-    for step in 0..12u32 {
+    chat.app.start_ai_prompt("分 70 步依次写入单元格".into());
+    for step in 0..70u32 {
         let (stream, _) = chat.request();
         let addr = cell_name(step, 0);
         respond(
@@ -446,23 +441,80 @@ fn ai_executes_multi_step_workflow_beyond_eight_rounds() {
     let (final_stream, _) = chat.request();
     respond(
         final_stream,
-        json!({"choices":[{"delta":{"content":"12 步全部完成"}}]}),
+        json!({"choices":[{"delta":{"content":"70 步全部完成"}}]}),
     );
     chat.poll_until(|app| !app.ai.busy);
     let last = chat.app.ai.messages.last().unwrap();
     assert!(last.error.is_none(), "error: {:?}", last.error);
-    assert_eq!(last.content, "12 步全部完成");
-    assert_eq!(last.tool_logs.len(), 12);
-    for step in 0..12u32 {
+    assert_eq!(last.content, "70 步全部完成");
+    assert_eq!(last.tool_logs.len(), 70);
+    for step in 0..70u32 {
         assert_eq!(
             chat.app.wb.sheet(0).value(step, 0),
             Value::Number(f64::from(step + 1))
         );
     }
     chat.app.undo_last_ai_change();
-    for step in 0..12u32 {
+    for step in 0..70u32 {
         assert_eq!(chat.app.wb.sheet(0).value(step, 0), Value::Empty);
     }
+}
+
+#[test]
+fn ai_context_overflow_400_triggers_automatic_compaction_and_recovers() {
+    let mut chat = Conversation::new();
+    // Seed large text cells so tool observations carry substantial payload.
+    let big = "财报明细数据".repeat(250);
+    for r in 0..6u32 {
+        chat.app.wb.sheet_mut(0).set(
+            r,
+            0,
+            Cell {
+                value: Value::Text(format!("R{r}:{big}").into()),
+                formula: None,
+            },
+        );
+    }
+    chat.app.start_ai_prompt("依次检查各行并在 B1 写入完成".into());
+    for r in 0..6u32 {
+        let (stream, _) = chat.request();
+        let range = format!("A{}:A{}", r + 1, r + 1);
+        respond(stream, tool_event("inspect_sheet", json!({"range": range})));
+    }
+
+    // Round 7 hits HTTP 400 context_length_exceeded from a smaller-window server.
+    let (mut overflow_stream, before_req) = chat.request();
+    let before_len = before_req.to_string().len();
+    let err_body = r#"{"error":{"message":"This model's maximum context length is 32768 tokens. context_length_exceeded"}}"#;
+    write!(
+        overflow_stream,
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{err_body}",
+        err_body.len()
+    )
+    .unwrap();
+    drop(overflow_stream);
+
+    // Harness automatically compacts older observations and retries the same round seamlessly.
+    let (retry_stream, after_req) = chat.request();
+    let after_len = after_req.to_string().len();
+    assert!(
+        after_len < before_len,
+        "auto-compacted retry request should shrink: before={before_len}, after={after_len}"
+    );
+    respond(
+        retry_stream,
+        tool_event("set_cells", json!({"edits":[{"cell":"B1","value":"ok"}]})),
+    );
+    let (final_stream, _) = chat.request();
+    respond(
+        final_stream,
+        json!({"choices":[{"delta":{"content":"已自动压缩上下文并完成写入"}}]}),
+    );
+    chat.poll_until(|app| !app.ai.busy);
+    let last = chat.app.ai.messages.last().unwrap();
+    assert!(last.error.is_none(), "error: {:?}", last.error);
+    assert_eq!(last.content, "已自动压缩上下文并完成写入");
+    assert_eq!(chat.app.wb.sheet(0).value(0, 1), Value::Text("ok".into()));
 }
 
 #[test]
