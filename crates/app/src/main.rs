@@ -11044,15 +11044,99 @@ impl SheetApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         let mut folder_opts_open = ctx.data(|d| d.get_temp::<bool>(folder_opts_id).unwrap_or(false));
+        let join_err_id = egui::Id::new("members_join_err");
+        let join_err = ctx.data(|d| d.get_temp::<String>(join_err_id)).unwrap_or_default();
+        let mut clear_join_err = false;
 
-        ui_kit::window(ctx, "共享与局域网协作", 436.0)
+        let from_home_join_only = self.show_start || !self.has_open_workbook;
+        let win_title = if !connected && from_home_join_only {
+            "加入局域网协作"
+        } else {
+            "共享与局域网协作"
+        };
+
+        ui_kit::window(ctx, win_title, 436.0)
             .block_background(false)
             .open(&mut open)
             .default_width(436.0)
             .show(ctx, |ui| {
                 let pal = theme::palette();
 
-                if !connected {
+                if !connected && from_home_join_only {
+                    // 首页入口：不新建空白工作簿，直接展示精简的「加入局域网协作」卡片
+                    egui::Frame::NONE
+                        .fill(pal.accent_tint)
+                        .stroke(Stroke::new(1.0, pal.accent.gamma_multiply(0.38)))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (drect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                                ui.painter().circle_filled(drect.center(), 4.2, pal.accent);
+                                ui_kit::paint_medium(
+                                    ui.painter(),
+                                    egui::pos2(drect.right() + 6.0, drect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    "加入其他用户共享的表格",
+                                    13.0,
+                                    pal.text,
+                                );
+                            });
+                            ui.add_space(5.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "直接粘贴其他用户发来的邀请消息、cellan:// 邀请码，或 IP:端口即可进入实时协作。",
+                                )
+                                .size(11.5)
+                                .color(pal.text_weak),
+                            );
+                            ui.add_space(8.0);
+                            let w = ui.available_width().max(200.0);
+                            ui.allocate_ui_with_layout(
+                                Vec2::new(w, 34.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let r = ui_kit::text_input(
+                                        ui,
+                                        &mut self.join_addr,
+                                        "粘贴邀请消息 / cellan:// 邀请码 / IP:端口",
+                                    );
+                                    if r.changed() {
+                                        clear_join_err = true;
+                                    }
+                                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                        do_join = true;
+                                    }
+                                },
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui_kit::primary_button(ui, "粘贴并加入").clicked() {
+                                    do_paste_join = true;
+                                }
+                                ui.add_enabled_ui(!self.join_addr.trim().is_empty(), |ui| {
+                                    if ui_kit::secondary_button(ui, "加入").clicked() {
+                                        do_join = true;
+                                    }
+                                });
+                            });
+                            if !join_err.is_empty() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(&join_err)
+                                        .size(11.0)
+                                        .color(pal.warn_fg),
+                                );
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("如需共享本机表格，请先打开对应文件，再点击右上角「共享」。")
+                            .size(11.0)
+                            .color(pal.text_weak),
+                    );
+                } else if !connected {
                     // 1. 主推卡片：仅共享当前这一个表格（不共享文件夹）
                     egui::Frame::NONE
                         .fill(pal.accent_tint)
@@ -11093,7 +11177,7 @@ impl SheetApp {
                             ui.add_space(5.0);
                             ui.label(
                                 egui::RichText::new(
-                                    "文件留在你本机原位置，不共享文件夹，同目录其他文件对同事不可见；关闭标签页或停止共享即结束。",
+                                    "文件留在你本机原位置，不共享文件夹，同目录其他文件对其他用户不可见；关闭标签页或停止共享即结束。",
                                 )
                                 .size(11.5)
                                 .color(pal.text_weak),
@@ -11124,7 +11208,7 @@ impl SheetApp {
                                     do_host = true;
                                 }
                                 if ui_kit::secondary_button(ui, "放行防火墙")
-                                    .on_hover_text("若同事连不上，点此放行局域网协作端口 7878-7898")
+                                    .on_hover_text("若其他用户无法连接，点此放行局域网协作端口 7878-7898")
                                     .clicked()
                                 {
                                     do_fw = true;
@@ -11134,10 +11218,10 @@ impl SheetApp {
 
                     ui.add_space(10.0);
 
-                    // 2. 加入同事共享的表格（支持粘贴整段微信/钉钉邀请消息或 cellan:// 邀请码）
-                    dlg_section(ui, "加入同事共享的表格");
+                    // 2. 加入其他用户共享的表格（支持粘贴整段邀请消息或 cellan:// 邀请码）
+                    dlg_section(ui, "加入其他用户共享的表格");
                     ui.label(
-                        egui::RichText::new("直接粘贴同事发来的整段邀请消息、cellan:// 邀请码，或 IP:端口（将在新标签页打开，不覆盖你当前表格）")
+                        egui::RichText::new("直接粘贴其他用户发来的邀请消息、cellan:// 邀请码，或 IP:端口（将在新标签页打开，不覆盖当前表格）")
                             .size(11.0)
                             .color(pal.text_weak),
                     );
@@ -11152,6 +11236,9 @@ impl SheetApp {
                                 &mut self.join_addr,
                                 "粘贴邀请消息 / cellan:// 邀请码 / IP:端口",
                             );
+                            if r.changed() {
+                                clear_join_err = true;
+                            }
                             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 do_join = true;
                             }
@@ -11171,6 +11258,14 @@ impl SheetApp {
                             }
                         });
                     });
+                    if !join_err.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(&join_err)
+                                .size(11.0)
+                                .color(pal.warn_fg),
+                        );
+                    }
 
                     // 3. 共享盘 / 同步盘目录设置（仅作辅助，默认折叠以免与单文件共享混淆）
                     if self.wb.path.is_some() {
@@ -11339,7 +11434,7 @@ impl SheetApp {
                                 ui.add_space(7.0);
                                 ui.horizontal(|ui| {
                                     let copy_label = if copied_recently {
-                                        "已复制，发给同事即可"
+                                        "已复制，发给其他用户即可"
                                     } else {
                                         "复制邀请"
                                     };
@@ -11356,7 +11451,7 @@ impl SheetApp {
                                         );
                                         ctx.copy_text(msg);
                                         ctx.data_mut(|d| d.insert_temp(copied_id, now));
-                                        self.status = "已复制邀请消息，发给同事后点「粘贴并加入」即可实时协作".into();
+                                        self.status = "已复制邀请消息，其他用户点击「粘贴并加入」即可实时协作".into();
                                     }
                                 });
                             }
@@ -11551,6 +11646,9 @@ impl SheetApp {
                 }
             }
         }
+        if clear_join_err || !open || do_host {
+            ctx.data_mut(|d| d.remove::<String>(join_err_id));
+        }
         if do_host {
             self.start_host();
         }
@@ -11560,14 +11658,25 @@ impl SheetApp {
                 .and_then(|mut cb| cb.get_text().ok())
                 .unwrap_or_default();
             if clip.trim().is_empty() {
-                self.status = "剪贴板为空，请先复制同事发来的邀请消息或邀请码".into();
+                let msg = "剪贴板为空，请先复制其他用户发来的邀请消息或邀请码".to_string();
+                self.status = msg.clone();
+                ctx.data_mut(|d| d.insert_temp(join_err_id, msg));
             } else {
                 self.join_addr = clip;
                 do_join = true;
             }
         }
+        if !open {
+            self.members_open = false;
+        }
         if do_join {
             self.join_shared();
+            if self.net.is_none() {
+                let msg = self.status.clone();
+                ctx.data_mut(|d| d.insert_temp(join_err_id, msg));
+            } else {
+                ctx.data_mut(|d| d.remove::<String>(join_err_id));
+            }
         }
         if do_leave {
             self.leave_session();
@@ -11584,7 +11693,6 @@ impl SheetApp {
             self.ensure_visible();
             self.status = format!("已定位到 {}", cell_name(r, c));
         }
-        self.members_open = open;
     }
 
 
@@ -26756,7 +26864,7 @@ fn clear_selection(&mut self) {
                                 ui.label(egui::RichText::new("共享当前表格（局域网）").size(26.0).color(bs_pal.text));
                                 ui.add_space(6.0);
                                 ui.label(
-                                    egui::RichText::new("仅共享当前这一个打开的表格，不共享所在文件夹，同目录其他文件对同事不可见；关闭标签页或停止共享即结束。")
+                                    egui::RichText::new("仅共享当前这一个打开的表格，不共享所在文件夹，同目录其他文件对其他用户不可见；关闭标签页或停止共享即结束。")
                                         .size(12.0)
                                         .color(bs_pal.text_weak),
                                 );
@@ -26768,7 +26876,7 @@ fn clear_selection(&mut self) {
                                             self.members_open = true;
                                             close = true;
                                         }
-                                        if ui_kit::secondary_button(ui, "加入同事共享的表格…").clicked() {
+                                        if ui_kit::secondary_button(ui, "加入其他用户共享的表格…").clicked() {
                                             self.members_open = true;
                                             close = true;
                                         }
@@ -26803,7 +26911,7 @@ fn clear_selection(&mut self) {
                                                     &sec,
                                                 );
                                                 ctx.copy_text(msg);
-                                                self.status = "已复制邀请消息，发给同事粘贴即可加入".into();
+                                                self.status = "已复制邀请消息，其他用户粘贴即可加入".into();
                                             }
                                         });
                                     }
@@ -44327,7 +44435,7 @@ impl SheetApp {
                 if !allow_auto_join {
                     let doc_label = self.tab_title(self.active_tab);
                     self.status = format!(
-                        "已开启单文件共享「{doc_label}」（不共享本地文件夹），点「一键复制邀请」发给同事即可加入"
+                        "已开启单文件共享「{doc_label}」（不共享本地文件夹），点「复制邀请」发给其他用户即可加入"
                     );
                 }
                 eprintln!("[net] 已开启共享 {primary_addr}");
@@ -46084,11 +46192,6 @@ fn elide(s: &str, max_chars: usize) -> String {
             }
             self.toggle_ai_assistant(Some(true));
         } else if open_members_from_home {
-            if !self.has_open_workbook {
-                self.new_document();
-            } else {
-                self.show_start = false;
-            }
             self.members_open = true;
         } else if return_to_wb {
             self.show_start = false;
@@ -47328,12 +47431,13 @@ fn elide(s: &str, max_chars: usize) -> String {
     fn join_shared(&mut self) {
         let raw_input = self.join_addr.trim().to_string();
         let Some((addr, invite_secret)) = session_lock::parse_share_invite(&raw_input) else {
-            self.status = "请粘贴同事发来的邀请消息 / cellan:// 邀请码，或填写宿主地址（如 192.168.1.20:7878）".into();
+            self.status = "请粘贴其他用户发来的邀请消息 / cellan:// 邀请码，或填写宿主地址（如 192.168.1.20:7878）".into();
             return;
         };
         if self.editing.is_some() && !self.finish_pending_edit() {
             return;
         }
+        let started_from_home = self.show_start || !self.has_open_workbook;
         let is_invite_link =
             invite_secret.is_some() || raw_input.to_ascii_lowercase().contains("cellan://");
         let current_lock = self.wb.path.as_ref().and_then(|p| session_lock::read(p));
@@ -47345,7 +47449,11 @@ fn elide(s: &str, max_chars: usize) -> String {
                 && !self.wb.dirty
                 && self.net.is_none()
                 && self.wb.sheets.iter().all(|s| s.used_bounds().is_none()));
-        if is_invite_link && !same_shared_doc && !current_is_empty_blank {
+        if !self.has_open_workbook {
+            let typed_pw = self.room_password.clone();
+            self.new_document();
+            self.room_password = typed_pw;
+        } else if (is_invite_link || self.show_start) && !same_shared_doc && !current_is_empty_blank {
             let typed_pw = self.room_password.clone();
             self.open_in_new_tab(PathBuf::new());
             self.room_password = typed_pw;
@@ -47374,6 +47482,9 @@ fn elide(s: &str, max_chars: usize) -> String {
             base_hash,
         ) {
             Ok(n) => {
+                if started_from_home {
+                    self.members_open = false;
+                }
                 self.shared_client_source = self.wb.path.clone().filter(|_| {
                     lock.as_ref().is_some_and(|info| info.matches_addr(&n.addr))
                 }).map(|path| (self.doc_uid, path));
@@ -50217,7 +50328,7 @@ impl eframe::App for SheetApp {
                             "共享",
                             64.0,
                             ribbon_pal.accent,
-                            "仅共享当前这一个表格到局域网（不共享文件夹，一键发邀请给同事实时协作）",
+                            "仅共享当前这一个表格到局域网（不共享文件夹，一键发邀请给其他用户实时协作）",
                         )
                         .clicked()
                         {

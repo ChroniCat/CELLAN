@@ -1302,7 +1302,7 @@ pub fn probe_all_sources() -> Result<Option<AvailableUpdate>, String> {
     let urls = candidate_http_urls();
     let raw_shared = dir();
     if urls.is_empty() && raw_shared.is_none() {
-        return Err("尚未配置更新源（将在与新版同事协作时自动同步）".into());
+        return Err("尚未配置更新源（将在与新版其他用户协作时自动同步）".into());
     }
     let pk = active_pubkey_hex();
     let mut last_err: Option<String> = None;

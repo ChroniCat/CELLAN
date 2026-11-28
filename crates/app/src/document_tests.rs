@@ -2534,3 +2534,78 @@ fn local_single_file_share_invite_joins_in_new_tab_with_remote_title_and_works_f
     assert!(blank_addr.is_some() && blank_secret.len() == 12);
     blank_host.leave_session();
 }
+
+#[test]
+fn home_page_collab_join_does_not_create_blank_workbook_until_joining() {
+    let env = crate::test_env::TestEnv::new("home-collab-join");
+    env.sc("SC_HOST_ADDR", "127.0.0.1");
+
+    // 1. 宿主在本地目录单文件共享「报价表.xlsx」
+    let local_dir = env.path("host_local");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let quote_path = local_dir.join("报价表.xlsx");
+    sheetcore::xlsx::save_atomic(&quote_path, &book(512.0)).unwrap();
+
+    let mut host = app();
+    host.has_open_workbook = true;
+    host.wb = sheetcore::xlsx::load(&quote_path).unwrap();
+    host.start_host();
+    let (host_addr, share_secret) = host.active_share_addr_and_secret();
+    let host_addr = host_addr.expect("host should have active share address");
+    let invite_msg =
+        session_lock::format_share_invite_message("报价表.xlsx", &host_addr, &share_secret);
+    assert!(
+        !invite_msg.contains("同事"),
+        "user-facing invite copy should not contain '同事'"
+    );
+    assert!(invite_msg.contains("局域网协作"));
+
+    // 2. 访客处于首页冷启动状态（尚未打开任何工作簿）：点首页「局域网协作」仅开弹窗，不新建空白表
+    let mut guest = app();
+    guest.show_start = true;
+    guest.has_open_workbook = false;
+    guest.members_open = true;
+    assert!(guest.show_start && !guest.has_open_workbook);
+
+    // 粘贴无效内容时也不会误建空白表
+    guest.join_addr = "不是合法邀请".into();
+    guest.join_shared();
+    assert!(guest.show_start, "invalid invite on home must stay on home");
+    assert!(
+        !guest.has_open_workbook,
+        "invalid invite on home must not create blank workbook"
+    );
+    assert!(guest.members_open, "invalid invite should keep join modal open");
+
+    // 3. 粘贴有效邀请消息后，自动离开首页、关闭加入弹窗并接入共享表格
+    guest.join_addr = invite_msg;
+    guest.join_shared();
+    assert!(
+        !guest.show_start,
+        "successful join from home should leave start screen"
+    );
+    assert!(
+        guest.has_open_workbook,
+        "successful join from home should open workbook"
+    );
+    assert!(
+        !guest.members_open,
+        "successful join from home should auto-close join modal"
+    );
+    assert_eq!(guest.tabs.len(), 1, "should not leave an extra blank tab behind");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while (!guest.joined_doc || guest.wb.sheet(0).value(0, 0) != Value::Number(512.0))
+        && Instant::now() < deadline
+    {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(guest.joined_doc);
+    assert_eq!(guest.wb.sheet(0).value(0, 0), Value::Number(512.0));
+    assert_eq!(guest.tab_title(0), "报价表.xlsx（共享）");
+
+    guest.leave_session();
+    host.leave_session();
+}

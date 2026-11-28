@@ -40,7 +40,7 @@ pub fn new_room_secret() -> std::io::Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
-/// 生成单文件手动共享用的 12 位清晰随机邀请口令（60 位 CSPRNG 熵，排除 0/O/1/I/L 易混字符；配合 20 万轮 PBKDF2 加密通道）。
+/// 生成单文件手动共享用的 12 位清晰随机邀请口令（60 位 CSPRNG 熵，排除 0/O/1/I 易混字符；配合 20 万轮 PBKDF2 加密通道）。
 pub fn new_invite_code() -> std::io::Result<String> {
     const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let mut raw = [0u8; 12];
@@ -63,7 +63,7 @@ pub fn format_share_link(addr: &str, secret: &str) -> String {
     }
 }
 
-/// 组装面向微信/钉钉/飞书转发的单文件协作邀请文案（含可直接一键粘贴识别的 `cellan://` 邀请码）。
+/// 组装对外转发的单文件协作邀请文案（含可直接一键粘贴识别的 `cellan://` 邀请码）。
 pub fn format_share_invite_message(doc_title: &str, addr: &str, secret: &str) -> String {
     let title = if doc_title.trim().is_empty() {
         "未命名表格"
@@ -72,11 +72,11 @@ pub fn format_share_invite_message(doc_title: &str, addr: &str, secret: &str) ->
     };
     let link = format_share_link(addr, secret);
     format!(
-        "邀请你实时协作「{title}」（仅共享此文件，不共享本地文件夹）\n在 CELLAN「共享」里点「粘贴并加入」即可：{link}"
+        "邀请你实时协作「{title}」（仅共享此文件，不共享本地文件夹）\n在 CELLAN「共享」或首页「局域网协作」里点「粘贴并加入」即可：{link}"
     )
 }
 
-/// 智能解析同事发来的邀请内容：
+/// 智能解析其他用户发来的邀请内容：
 /// - 含 `cellan://IP:端口#口令`（或 `?k=口令`）的整段聊天消息；
 /// - 裸 `cellan://IP:端口#口令`、`IP:端口#口令`、`IP#口令`；
 /// - 普通 `IP:端口` 或 `IP`。
@@ -117,8 +117,33 @@ pub fn parse_share_invite(raw: &str) -> Option<(String, Option<String>)> {
     } else {
         (candidate, None)
     };
+    fn is_valid_single_addr(s: &str) -> bool {
+        if s.is_empty() || !s.is_ascii() || s.contains("://") {
+            return false;
+        }
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'-' | b'[' | b']'))
+        {
+            return false;
+        }
+        if s.parse::<std::net::SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok() {
+            return true;
+        }
+        if let Some((host, port)) = s.rsplit_once(':') {
+            return !host.is_empty()
+                && !host.contains(':')
+                && port.parse::<u16>().is_ok_and(|p| p > 0)
+                && host.bytes().any(|b| b.is_ascii_alphanumeric());
+        }
+        s.eq_ignore_ascii_case("localhost")
+            || (s.contains('.')
+                && !s.starts_with('.')
+                && !s.ends_with('.')
+                && s.split('.').all(|part| !part.is_empty()))
+    }
     let addr = addr_raw.trim().trim_end_matches('/');
-    if addr.is_empty() {
+    if addr.is_empty() || !addr.split(',').all(|part| is_valid_single_addr(part.trim())) {
         return None;
     }
     let secret = sec_raw
@@ -1448,16 +1473,17 @@ beat={}
     fn share_invite_code_format_and_smart_parser_handle_chat_messages_and_plain_ips() {
         let code = new_invite_code().unwrap();
         assert_eq!(code.len(), 12);
-        assert!(code.chars().all(|c| !"0O1IL".contains(c) && c.is_ascii_alphanumeric()));
+        assert!(code.chars().all(|c| !"0O1I".contains(c) && c.is_ascii_alphanumeric()));
 
         let msg = format_share_invite_message("报价表.xlsx", "192.168.3.232:7878", &code);
         assert!(msg.contains("报价表.xlsx"));
         assert!(msg.contains("不共享本地文件夹"));
+        assert!(!msg.contains("同事"));
         let parsed = parse_share_invite(&msg).expect("should extract invite from full Chinese chat message");
         assert_eq!(parsed, ("192.168.3.232:7878".to_string(), Some(code.clone())));
 
         assert_eq!(
-            parse_share_invite("同事发来：CELLAN://192.168.1.9:7880#ABC987。"),
+            parse_share_invite("邀请链接：CELLAN://192.168.1.9:7880#ABC987。"),
             Some(("192.168.1.9:7880".to_string(), Some("ABC987".to_string())))
         );
         assert_eq!(
@@ -1473,5 +1499,8 @@ beat={}
             Some(("192.168.3.232:7878".to_string(), None))
         );
         assert_eq!(parse_share_invite("   "), None);
+        assert_eq!(parse_share_invite("不是合法邀请"), None);
+        assert_eq!(parse_share_invite("hello world"), None);
+        assert_eq!(parse_share_invite("https://example.com"), None);
     }
 }
