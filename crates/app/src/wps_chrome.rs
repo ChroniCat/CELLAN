@@ -254,7 +254,7 @@ fn scrollable_file_menu(ui: &mut egui::Ui, width: f32, max_height: f32, content:
 }
 
 const DOC_TAB_MIN: f32 = 84.0;
-const DOC_TAB_GAP: f32 = 3.0;
+const DOC_TAB_GAP: f32 = 4.0;
 const DOC_ACTION_SLOT: f32 = 28.0;
 
 struct SheetTabDrag {
@@ -487,22 +487,13 @@ mod sheet_tab_tests {
                 assert!(!has_face("三月", active_fill) && !has_face("三月", pal.accent_tint));
                 assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
                     if t.galley.job.text == "一月" && t.override_text_color == Some(active_ink))));
-                let expected_bar = active_custom
-                    .map(|[r, g, b]| Color32::from_rgb(r, g, b))
-                    .unwrap_or(pal.accent);
                 let t1 = tab("一月");
-                assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                    if r.fill == expected_bar
-                        && r.rect.width() >= 14.0
-                        && r.rect.height() <= 2.5
-                        && r.rect.x_range().contains(t1.center().x))));
-                // Grouped inactive member must not get the active bottom bar.
                 let t2 = tab("二月");
                 assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                    if r.fill == pal.accent
+                    if (r.fill == pal.accent || active_custom.map(|[cr, cg, cb]| Color32::from_rgb(cr, cg, cb)) == Some(r.fill))
                         && r.rect.width() >= 14.0
                         && r.rect.height() <= 2.5
-                        && r.rect.x_range().contains(t2.center().x))));
+                        && (r.rect.x_range().contains(t1.center().x) || r.rect.x_range().contains(t2.center().x)))));
                 for color in active_custom
                     .into_iter()
                     .map(|[r, g, b]| Color32::from_rgb(r, g, b))
@@ -1049,9 +1040,27 @@ impl SheetApp {
     /// WPS 38px 第 1 排顶栏：Logo + 单一「⌂ 主页」胶囊 + 文档标签条（+ 新建）+ 命令搜索 + 账户 + 窗口按钮
     pub(crate) fn draw_wps_title_bar(&mut self, ctx: &egui::Context) {
         let pal = crate::theme::palette();
+        let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
         let bg = pal.title_bg;
         let fg = pal.text;
-        let hover = pal.hover_on_page;
+        let hover = match pal.theme {
+            crate::theme::AppTheme::Light => Color32::from_rgb(208, 216, 228),
+            crate::theme::AppTheme::EyeCare => Color32::from_rgb(190, 211, 193),
+            crate::theme::AppTheme::Dark => Color32::from_rgb(31, 36, 46),
+            crate::theme::AppTheme::HighContrast => pal.hover_on_page,
+        };
+        let tab_hover_fill = if is_hc {
+            pal.hover_on_page
+        } else {
+            ui_kit::lerp_color(pal.title_bg, pal.page_bg, 0.62)
+        };
+        let tab_divider_col = match pal.theme {
+            crate::theme::AppTheme::Light => Color32::from_rgb(186, 195, 208),
+            crate::theme::AppTheme::EyeCare => Color32::from_rgb(165, 189, 169),
+            crate::theme::AppTheme::Dark => Color32::from_rgb(48, 55, 68),
+            crate::theme::AppTheme::HighContrast => pal.card_border,
+        };
+        let chrome_tab_stroke = is_hc.then(|| Stroke::new(1.25, pal.card_border));
 
         let mut tab_metas: Vec<(String, bool, bool)> = Vec::new();
         if self.has_open_workbook {
@@ -1102,26 +1111,28 @@ impl SheetApp {
                 let ir = Rect::from_center_size(egui::pos2(logo_cx, rect.center().y), Vec2::splat(20.0));
                 ui_kit::draw_brand_logo(&painter, ir);
 
-                let mut left_end = rect.left() + 46.0;
+                let mut left_end = rect.left() + 48.0;
                 if self.has_open_workbook {
                     let home_active = self.show_start;
-                    let hb = if home_active {
-                        Rect::from_min_size(egui::pos2(rect.left() + 38.0, rect.top() + 6.0), Vec2::new(62.0, rect.height() - 6.0))
-                    } else {
-                        Rect::from_min_size(egui::pos2(rect.left() + 38.0, rect.center().y - 12.0), Vec2::new(58.0, 24.0))
-                    };
+                    let hb = Rect::from_min_size(
+                        egui::pos2(rect.left() + 38.0, rect.center().y - 13.0),
+                        Vec2::new(60.0, 26.0),
+                    );
                     let hresp = ui.interact(hb, egui::Id::new("title_home_btn"), Sense::click());
                     ui_kit::a11y_role(&hresp, "主页", egui::accesskit::Role::Tab, Some(home_active));
                     let home_hov = ui_kit::anim_hover(ctx, hresp.id.with("hov"), !home_active && hresp.hovered());
                     if home_active {
-                        let rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
-                        painter.rect(
-                            hb,
-                            rad,
-                            pal.card_bg,
-                            Stroke::new(1.0, pal.card_border),
-                            egui::StrokeKind::Inside,
-                        );
+                        if is_hc {
+                            painter.rect(
+                                hb,
+                                7.0,
+                                pal.text,
+                                Stroke::new(1.0, pal.card_border),
+                                egui::StrokeKind::Inside,
+                            );
+                        } else {
+                            painter.rect_filled(hb, 7.0, pal.page_bg);
+                        }
                     } else {
                         let hbg = if hresp.is_pointer_button_down_on() {
                             pal.pressed
@@ -1129,11 +1140,11 @@ impl SheetApp {
                             ui_kit::lerp_color(Color32::TRANSPARENT, hover, home_hov)
                         };
                         if hbg != Color32::TRANSPARENT {
-                            painter.rect_filled(hb, 4.0, hbg);
+                            painter.rect_filled(hb, 7.0, hbg);
                         }
                     }
                     let hic = if home_active {
-                        fg
+                        if is_hc { pal.page_bg } else { fg }
                     } else {
                         ui_kit::lerp_color(pal.text_weak, fg, home_hov)
                     };
@@ -1144,7 +1155,7 @@ impl SheetApp {
                         hic,
                     );
                     ui_kit::paint_medium(&painter, egui::pos2(hb.left() + 25.0, hb.center().y), Align2::LEFT_CENTER, "主页", ui_kit::T_BODY, hic);
-                    ui_kit::focus_ring(ui, &hresp, hb, 5.0);
+                    ui_kit::focus_ring(ui, &hresp, hb, 7.0);
                     let tip = if home_active {
                         "返回当前已打开的工作簿"
                     } else {
@@ -1157,7 +1168,7 @@ impl SheetApp {
                             self.show_start = true;
                         }
                     }
-                    left_end = hb.right() + 6.0;
+                    left_end = hb.right() + 10.0;
                 }
 
                 // 2. 右侧控件尺寸预计算：窗口三键 + 账户 + 搜索框
@@ -1176,58 +1187,66 @@ impl SheetApp {
                 let sx = acc.left() - search_w - 10.0;
                 let right_limit = if show_search { sx - 10.0 } else { acc.left() - 10.0 };
 
-                // 3. 文档标签直接融入第 1 排（WPS 风格：即使切换到主页也始终保留全部已打开文档标签 + `+`）
+                // 3. Chrome 风格文档标签直接融入第 1 排（活动页签顶部圆角 + 底部外撇凹圆角平滑汇入下方功能区）
                 let mut cur_x = left_end;
                 if self.has_open_workbook {
                     let (visible, width_limit) = document_tab_layout(tab_metas.len(), self.active_tab, right_limit - cur_x);
                     let overflow = visible.len() < tab_metas.len();
+                    let mut prev_inactive_quiet = false;
                     for i in visible {
                         let (title, dirty, active) = &tab_metas[i];
                         let font = if *active { ui_kit::medium_in(ctx, ui_kit::T_BODY) } else { FontId::proportional(ui_kit::T_BODY) };
                         let tc = if *active { pal.text } else { pal.text_weak };
                         let mut job = egui::text::LayoutJob::simple_singleline(title.clone(), font, tc);
-                        let padding = if *dirty { 42.0 } else { 34.0 };
+                        let padding = if *dirty { 44.0 } else { 36.0 };
                         job.wrap = egui::text::TextWrapping::truncate_at_width(width_limit - padding);
                         let galley = painter.layout_job(job);
                         let tw = (galley.size().x + padding).clamp(DOC_TAB_MIN, width_limit);
-                        let tab = Rect::from_min_size(egui::pos2(cur_x, rect.top() + 6.0), Vec2::new(tw, rect.height() - 6.0));
-                        let close = Rect::from_center_size(egui::pos2(tab.right() - 12.0, tab.center().y), Vec2::splat(22.0));
+                        let tab = Rect::from_min_size(egui::pos2(cur_x, rect.top() + 5.0), Vec2::new(tw, rect.height() - 5.0));
+                        let inactive_pill = Rect::from_min_max(
+                            egui::pos2(tab.left() + 1.0, rect.top() + 6.0),
+                            egui::pos2(tab.right() - 1.0, rect.bottom() - 5.0),
+                        );
+                        let tab_cy = if *active { tab.center().y + 0.5 } else { inactive_pill.center().y };
+                        let close = Rect::from_center_size(egui::pos2(tab.right() - 13.0, tab_cy), Vec2::splat(20.0));
                         let tab_hit = Rect::from_min_max(tab.min, egui::pos2(close.left() - 2.0, tab.bottom()));
                         let tr = ui.interact(tab_hit, egui::Id::new(("wps_doctab", i)), Sense::click());
                         let cr = ui.interact(close, egui::Id::new(("wps_doctabx", i)), Sense::click());
-                        let rad = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+                        let hovered = tr.hovered() || cr.hovered();
                         let tab_hov = ui_kit::anim_hover(
                             ctx,
                             tr.id.with("hov"),
-                            !*active && (tr.hovered() || cr.hovered()),
+                            !*active && hovered,
                         );
-                        if *active {
-                            painter.rect(
-                                tab,
-                                rad,
-                                pal.card_bg,
-                                Stroke::new(1.0, pal.card_border),
-                                egui::StrokeKind::Inside,
+                        if prev_inactive_quiet && !*active && tab_hov < 0.05 {
+                            let div_x = cur_x - DOC_TAB_GAP * 0.5;
+                            painter.vline(
+                                div_x,
+                                (inactive_pill.center().y - 7.0)..=(inactive_pill.center().y + 7.0),
+                                Stroke::new(1.0, tab_divider_col),
                             );
+                        }
+                        if *active {
+                            ui_kit::paint_chrome_tab(&painter, tab, 8.0, 8.0, pal.page_bg, chrome_tab_stroke);
                         } else {
-                            let bg = ui_kit::lerp_color(Color32::TRANSPARENT, hover, tab_hov);
+                            let bg = ui_kit::lerp_color(Color32::TRANSPARENT, tab_hover_fill, tab_hov);
                             if bg != Color32::TRANSPARENT {
-                                painter.rect_filled(tab, rad, bg);
+                                painter.rect_filled(inactive_pill, 7.0, bg);
                             }
                         }
-                        let text_pos = egui::pos2(tab.left() + 10.0, tab.center().y - galley.size().y / 2.0);
+                        let text_pos = egui::pos2(tab.left() + 12.0, tab_cy - galley.size().y / 2.0);
                         painter.galley(text_pos, galley, tc);
                         if *dirty {
-                            painter.circle_filled(egui::pos2(tab.right() - 26.0, tab.center().y), 3.0, pal.warn_fg);
+                            painter.circle_filled(egui::pos2(tab.right() - 27.0, tab_cy), 3.0, pal.warn_fg);
                         }
                         let close_hov = ui_kit::anim_hover(ctx, cr.id.with("hov"), cr.hovered());
                         let close_fill = if cr.is_pointer_button_down_on() {
                             pal.pressed
                         } else {
-                            ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover, close_hov)
+                            ui_kit::lerp_color(Color32::TRANSPARENT, hover, close_hov)
                         };
                         if close_fill != Color32::TRANSPARENT {
-                            painter.rect_filled(close.shrink(2.0), 4.0, close_fill);
+                            painter.rect_filled(close.shrink(1.5), 9.0, close_fill);
                         }
                         let cc = ui_kit::lerp_color(pal.text_weak, pal.text, close_hov);
                         let cc0 = close.center();
@@ -1242,13 +1261,14 @@ impl SheetApp {
                         if ui_kit::is_accesskit_active(ctx) {
                             ui_kit::a11y_name(&cr, &format!("关闭 {title}"), true, None);
                         }
-                        ui_kit::focus_ring(ui, &tr, tab_hit, 5.0);
-                        ui_kit::focus_ring(ui, &cr, close, 4.0);
+                        ui_kit::focus_ring(ui, &tr, if *active { tab_hit } else { inactive_pill }, 7.0);
+                        ui_kit::focus_ring(ui, &cr, close, 9.0);
                         if cr.on_hover_text("关闭此文档 (Ctrl+W)").clicked() {
                             do_close = Some(i);
                         } else if tr.on_hover_text(tab_tip).clicked() {
                             do_switch = Some(i);
                         }
+                        prev_inactive_quiet = !*active && tab_hov < 0.05;
                         cur_x += tw + DOC_TAB_GAP;
                     }
                     let switcher_id = egui::Id::new("title_document_switcher");
@@ -1288,7 +1308,7 @@ impl SheetApp {
                     } else if ui.memory(|m| m.is_popup_open(switcher_id)) {
                         ui.memory_mut(|m| m.close_popup());
                     }
-                    let plus = Rect::from_min_size(egui::pos2(cur_x + 2.0, rect.center().y - 11.0), Vec2::new(24.0, 22.0));
+                    let plus = Rect::from_min_size(egui::pos2(cur_x + 4.0, rect.center().y - 12.0), Vec2::splat(24.0));
                     if plus.right() <= right_limit {
                         let pr = ui.interact(plus, egui::Id::new("wps_tab_plus"), Sense::click());
                         ui_kit::a11y_name(&pr, "新建空白工作簿", true, None);
@@ -1299,13 +1319,13 @@ impl SheetApp {
                             ui_kit::lerp_color(Color32::TRANSPARENT, hover, plus_hov)
                         };
                         if plus_bg != Color32::TRANSPARENT {
-                            painter.rect_filled(plus, 5.0, plus_bg);
+                            painter.rect_filled(plus, 12.0, plus_bg);
                         }
                         let pc = plus.center();
                         let plus_col = ui_kit::lerp_color(pal.text_weak, pal.text, plus_hov);
                         painter.line_segment([egui::pos2(pc.x - 4.5, pc.y), egui::pos2(pc.x + 4.5, pc.y)], Stroke::new(1.3, plus_col));
                         painter.line_segment([egui::pos2(pc.x, pc.y - 4.5), egui::pos2(pc.x, pc.y + 4.5)], Stroke::new(1.3, plus_col));
-                        ui_kit::focus_ring(ui, &pr, plus, 5.0);
+                        ui_kit::focus_ring(ui, &pr, plus, 12.0);
                         if pr.on_hover_text("新建空白标签页 (Ctrl+N)").clicked() {
                             new_tab = true;
                         }

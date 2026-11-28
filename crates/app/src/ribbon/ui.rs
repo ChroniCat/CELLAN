@@ -167,32 +167,13 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         ui.memory_mut(|m| m.toggle_popup(menu_id));
     }
     let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
-    let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
     let ov_hov = ui_kit::anim_hover(
         ui.ctx(),
         resp.id.with("ov_hov"),
         active_hidden.is_none() && (resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id))),
     );
-    let ov_act = ui_kit::anim_toggle(ui.ctx(), resp.id.with("ov_act"), active_hidden.is_some());
     if active_hidden.is_some() {
-        if is_hc {
-            ui.painter().rect_filled(rect, 4.0, selected_fill);
-        } else {
-            ui.painter().rect(
-                rect,
-                4.0,
-                selected_fill,
-                egui::Stroke::new(1.0, pal.chrome_separator()),
-                egui::StrokeKind::Inside,
-            );
-        }
-        let bar_y = if is_hc { rect.bottom() + 1.0 } else { rect.bottom() - 1.5 };
-        let bar_w = egui::lerp(8.0_f32..=16.0_f32, ov_act);
-        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(bar_w, 2.0));
-        let bar_col = ui_kit::lerp_color(Color32::TRANSPARENT, pal.accent, ov_act);
-        if bar_col != Color32::TRANSPARENT {
-            ui.painter().rect_filled(bar, 1.0, bar_col);
-        }
+        ui.painter().rect_filled(rect, 4.0, selected_fill);
     } else {
         let bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, ov_hov);
         if bg != Color32::TRANSPARENT {
@@ -3058,7 +3039,7 @@ mod compact_tests {
                     assert!(out.platform_output.accesskit_update.unwrap().nodes.iter()
                         .any(|(_, node)| node.label() == Some(overflow_name.as_str())));
                 }
-                assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
                     if r.fill == pal.accent && r.rect.width() >= 14.0 && r.rect.height() <= 2.5)));
             }
         }

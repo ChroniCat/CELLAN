@@ -9704,17 +9704,6 @@ impl SheetApp {
                                     if row_bg != Color32::TRANSPARENT {
                                         ui.painter().rect_filled(rect, 5.0, row_bg);
                                     }
-                                    if selected {
-                                        let pill = Rect::from_center_size(
-                                            rect.left_center() + Vec2::new(3.0, 0.0),
-                                            Vec2::new(2.5, 16.0),
-                                        );
-                                        ui.painter().rect_filled(
-                                            pill,
-                                            1.25,
-                                            if is_hc { selected_ink } else { pal.accent },
-                                        );
-                                    }
                                     let path_font = FontId::proportional(11.0);
                                     let path_width = ui
                                         .painter()
@@ -24091,7 +24080,6 @@ fn clear_selection(&mut self) {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         ui.spacing_mut().interact_size.y = tokens::size::BTN_H;
                         let pal = theme::palette();
-                        let is_hc = pal.theme == theme::AppTheme::HighContrast;
                         let (fill, ink) = ui_kit::active_dialog_tab_colors(pal);
                         ui.visuals_mut().selection.bg_fill = fill;
                         ui.visuals_mut().selection.stroke.color = ink;
@@ -24103,17 +24091,6 @@ fn clear_selection(&mut self) {
                                 label = label.font(ui_kit::medium_in(ctx, 12.0)).color(ink);
                             }
                             let row = ui.selectable_label(active, label).on_hover_text(name);
-                            if active {
-                                let pill = Rect::from_center_size(
-                                    row.rect.left_center() + Vec2::new(2.0, 0.0),
-                                    Vec2::new(2.5, 14.0),
-                                );
-                                ui.painter().rect_filled(
-                                    pill,
-                                    1.25,
-                                    if is_hc { ink } else { pal.accent },
-                                );
-                            }
                             if row.clicked() {
                                 pick = Some(i);
                             }
@@ -26282,7 +26259,6 @@ fn clear_selection(&mut self) {
                     ("关闭", 6),
                 ];
                 let mut y = nav.top() + 56.0;
-                let bs_hc = bs_pal.theme == theme::AppTheme::HighContrast;
                 let (selected_fill, selected_ink) = ui_kit::active_tab_colors(bs_pal);
                 for (label, page) in items {
                     let r = Rect::from_min_size(
@@ -26293,26 +26269,7 @@ fn clear_selection(&mut self) {
                     let active = self.backstage_page == page;
                     ui_kit::a11y_name(&resp, label, true, Some(active));
                     if active {
-                        if bs_hc {
-                            ui.painter().rect_filled(r, 6.0, selected_fill);
-                        } else {
-                            ui.painter().rect(
-                                r,
-                                6.0,
-                                selected_fill,
-                                Stroke::new(1.0, bs_pal.chrome_separator()),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
-                        let pill = Rect::from_center_size(
-                            r.left_center() + Vec2::new(4.0, 0.0),
-                            Vec2::new(2.5, 16.0),
-                        );
-                        ui.painter().rect_filled(
-                            pill,
-                            1.25,
-                            if bs_hc { selected_ink } else { bs_pal.accent },
-                        );
+                        ui.painter().rect_filled(r, 6.0, selected_fill);
                     } else if resp.hovered() {
                         ui.painter().rect_filled(r, 6.0, bs_pal.hover_on_page);
                     }
@@ -44998,7 +44955,16 @@ fn elide(s: &str, max_chars: usize) -> String {
         let mut open_members_from_home = false;
         let mut y = rail.top() + 14.0;
         let is_hc = pal.theme == theme::AppTheme::HighContrast;
-        let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
+        let (selected_fill, selected_ink) = if is_hc {
+            (pal.text, pal.page_bg)
+        } else {
+            (pal.page_bg, pal.text)
+        };
+        let rail_hover = if is_hc {
+            pal.hover_on_page
+        } else {
+            ui_kit::lerp_color(pal.title_bg, pal.page_bg, 0.55)
+        };
         for (label, kind) in items {
             let row = Rect::from_min_size(
                 egui::pos2(rail.left() + 12.0, y),
@@ -45009,24 +44975,9 @@ fn elide(s: &str, max_chars: usize) -> String {
             ui_kit::a11y_name(&r, label, true, Some(active));
             let nav_hov = ui_kit::anim_hover(ui.ctx(), r.id.with("hov"), !active && r.hovered());
             if active {
-                if is_hc {
-                    p.rect_filled(row, 8.0, selected_fill);
-                } else {
-                    p.rect(
-                        row,
-                        8.0,
-                        selected_fill,
-                        egui::Stroke::new(1.0, pal.chrome_separator()),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                let pill = Rect::from_center_size(
-                    row.left_center() + Vec2::new(4.0, 0.0),
-                    Vec2::new(2.5, 16.0),
-                );
-                p.rect_filled(pill, 1.25, if is_hc { selected_ink } else { pal.accent });
+                p.rect_filled(row, 8.0, selected_fill);
             } else {
-                let bg = ui_kit::lerp_color(Color32::TRANSPARENT, pal.hover_on_page, nav_hov);
+                let bg = ui_kit::lerp_color(Color32::TRANSPARENT, rail_hover, nav_hov);
                 if bg != Color32::TRANSPARENT {
                     p.rect_filled(row, 8.0, bg);
                 }
@@ -45039,7 +44990,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 Vec2::splat(16.0),
             );
             let ic_col = if active {
-                if is_hc { selected_ink } else { pal.accent }
+                selected_ink
             } else {
                 ui_kit::lerp_color(pal.text_weak, pal.text, nav_hov)
             };
@@ -53913,8 +53864,8 @@ mod wave5_ui_tests {
         );
         assert!(sub_r <= 2, "full red subpixel mask must ink red channel to ~0, got {sub_r}");
         assert!(
-            (105..=125).contains(&sub_g),
-            "half green subpixel mask with enhanced contrast must blend to ~115, got {sub_g}"
+            (148..=164).contains(&sub_g),
+            "half green subpixel mask with linear-light gamma must blend to ~156, got {sub_g}"
         );
         assert!(sub_b >= 253, "zero blue subpixel mask must leave white bg untouched, got {sub_b}");
 
@@ -54169,7 +54120,7 @@ mod wave5_ui_tests {
                 );
                 assert!(sub.r() <= 2, "GL full red subpixel mismatch: {}", sub.r());
                 assert!(
-                    (105..=125).contains(&sub.g()),
+                    (148..=164).contains(&sub.g()),
                     "GL half green subpixel mismatch: {}",
                     sub.g()
                 );

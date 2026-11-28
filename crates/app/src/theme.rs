@@ -228,7 +228,7 @@ pub fn palette_for(theme: AppTheme) -> ThemePalette {
             page_bg: Color32::from_rgb(243, 245, 248),
             card_bg: Color32::WHITE,
             card_border: Color32::from_rgb(218, 223, 231),
-            title_bg: Color32::from_rgb(243, 245, 248),
+            title_bg: Color32::from_rgb(223, 229, 238),
             status_bg: Color32::from_rgb(245, 247, 250),
             hover: Color32::from_rgb(238, 242, 247),
             hover_on_page: Color32::from_rgb(231, 236, 243),
@@ -260,7 +260,7 @@ pub fn palette_for(theme: AppTheme) -> ThemePalette {
             page_bg: Color32::from_rgb(224, 237, 225),
             card_bg: Color32::from_rgb(239, 247, 239),
             card_border: Color32::from_rgb(189, 212, 192),
-            title_bg: Color32::from_rgb(224, 237, 225),
+            title_bg: Color32::from_rgb(205, 223, 207),
             status_bg: Color32::from_rgb(226, 238, 227),
             hover: Color32::from_rgb(212, 230, 214),
             hover_on_page: Color32::from_rgb(205, 225, 207),
@@ -289,10 +289,10 @@ pub fn palette_for(theme: AppTheme) -> ThemePalette {
         AppTheme::Dark => ThemePalette {
             theme,
             ribbon_bg: Color32::from_rgb(31, 35, 43),
-            page_bg: Color32::from_rgb(22, 25, 31),
+            page_bg: Color32::from_rgb(24, 28, 35),
             card_bg: Color32::from_rgb(33, 37, 46),
             card_border: Color32::from_rgb(55, 62, 76),
-            title_bg: Color32::from_rgb(22, 25, 31),
+            title_bg: Color32::from_rgb(13, 15, 20),
             status_bg: Color32::from_rgb(25, 28, 35),
             hover: Color32::from_rgb(46, 52, 64),
             hover_on_page: Color32::from_rgb(39, 44, 55),
@@ -477,6 +477,14 @@ mod tests {
             assert!(
                 contrast(p.text_weak, p.card_bg) >= 4.5,
                 "{theme:?} text_weak/card_bg contrast too low"
+            );
+            assert!(
+                contrast(p.text, p.title_bg) >= 7.0,
+                "{theme:?} text/title_bg contrast too low"
+            );
+            assert!(
+                contrast(p.text_weak, p.title_bg) >= 4.5,
+                "{theme:?} text_weak/title_bg contrast too low"
             );
             assert!(
                 contrast(p.on_accent(), p.accent) >= 4.5,

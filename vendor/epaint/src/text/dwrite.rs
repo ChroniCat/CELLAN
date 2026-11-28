@@ -1161,10 +1161,11 @@ mod win_impl {
             }
 
             let em_size_px = em_size_dips * pixels_per_point;
-            if pixels_per_point <= 1.25 && em_size_px <= 22.0 {
-                // At 100%–125% DPI for UI/body sizes, match Excel/WPS:
-                // - Honor GDI Classic / Aliased when the font's GASP/embedded-bitmap table asks for it (e.g. SimSun 12px)
-                // - Otherwise use CLEARTYPE_NATURAL (strictly Y-grid-fitted horizontal stems + 3x horizontal RGB subpixels)
+            if pixels_per_point <= 1.25 && em_size_px <= 20.0 {
+                // At 100%–125% DPI for UI & spreadsheet grid sizes, prefer GDI_NATURAL:
+                // snaps both horizontal AND vertical stems (crucial for crisp currency digits 0-9 & '.')
+                // onto whole integer pixels without splitting 1px vertical stems into red/blue fringes,
+                // while preserving natural proportional advance widths.
                 match rec_mode {
                     DWRITE_RENDERING_MODE_ALIASED => {
                         (DWRITE_RENDERING_MODE_ALIASED, DWRITE_MEASURING_MODE_GDI_CLASSIC)
@@ -1173,11 +1174,10 @@ mod win_impl {
                         DWRITE_RENDERING_MODE_GDI_CLASSIC,
                         DWRITE_MEASURING_MODE_GDI_CLASSIC,
                     ),
-                    DWRITE_RENDERING_MODE_GDI_NATURAL => (
+                    _ => (
                         DWRITE_RENDERING_MODE_GDI_NATURAL,
                         DWRITE_MEASURING_MODE_GDI_NATURAL,
                     ),
-                    _ => (DWRITE_RENDERING_MODE_NATURAL, DWRITE_MEASURING_MODE_NATURAL),
                 }
             } else {
                 // At HiDPI (>125%) or display sizes (>22px), honor symmetric 2D AA when recommended,
@@ -1506,15 +1506,27 @@ mod win_impl {
                     x1 -= 1;
                 }
 
-                // 2. For non-overhanging glyphs (design leftSideBearing >= -0.25px), DirectWrite's
+                // 2. At HiDPI (>= 135% scaling, e.g. 150%/175%/200%), emit pure neutral luminance
+                //    [l, l, l] inside the ClearType pipeline: keeps DirectWrite hinting, 1:1 physical
+                //    pixel NEAREST placement, and luminance-aware linear-light GPU gamma with ZERO
+                //    RGB color fringing (matching WinUI 3 / Edge / VS Code at HiDPI).
+                //    At 100%–125% DPI, apply luminance-preserving chroma damping so whole-pixel stems
+                //    stay 100% solid ink while fractional subpixel edges keep horizontal precision
+                //    without glaring red/blue color fringes on dense currency columns.
+                const HIDPI_NEUTRAL_THRESHOLD: f32 = 1.35;
+                const SUBPIXEL_CHROMA_DAMP: f32 = 0.35;
+                let neutral_hidpi = subpixel && pixels_per_point >= HIDPI_NEUTRAL_THRESHOLD;
+                let use_neutral_fold = !subpixel || neutral_hidpi;
+
+                // 3. For non-overhanging glyphs (design leftSideBearing >= -0.25px), DirectWrite's
                 //    3-tap ClearType filter can spill a faint 1px apron into x = -1 (`bounds.left + x0 < 0`),
                 //    which pushes `visual_bounding_rect().min.x` 1px outside tight widget clip rects.
-                //    - In grayscale mode: trim x < 0 columns and fold their residual luma into x = 0.
+                //    - In grayscale / neutral HiDPI mode: trim x < 0 columns and fold residual luma into x = 0.
                 //    - In ClearType subpixel mode: trim a pure filter-tail column at x < 0 whose outer
                 //      subpixel (R on RGB / B on BGR) is zero (not a real glyph stem).
                 let mut folded_left_gray: Option<Vec<f32>> = None;
                 if lsb_px >= -0.25 {
-                    if !subpixel {
+                    if use_neutral_fold {
                         let mut fold = vec![0.0_f32; y1.saturating_sub(y0)];
                         let mut trimmed_any = false;
                         while x0 + 1 < x1 && bounds.left + x0 as i32 <= -1 {
@@ -1561,9 +1573,43 @@ mod win_impl {
 
                 let pixels = if subpixel {
                     let mut rgb = Vec::with_capacity(tw * th);
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            rgb.push(px_rgb(x, y));
+                    if neutral_hidpi {
+                        for (ry, y) in (y0..y1).enumerate() {
+                            for (rx, x) in (x0..x1).enumerate() {
+                                let [r, g, b] = px_rgb(x, y);
+                                let mut cov = (0.299 * r as f32
+                                    + 0.587 * g as f32
+                                    + 0.114 * b as f32)
+                                    / 255.0;
+                                if rx == 0 {
+                                    if let Some(fold) = &folded_left_gray {
+                                        cov += fold[ry];
+                                    }
+                                }
+                                let l = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
+                                rgb.push([l, l, l]);
+                            }
+                        }
+                    } else {
+                        let chroma =
+                            SUBPIXEL_CHROMA_DAMP * sys.params.clear_type_level.clamp(0.0, 1.0);
+                        for y in y0..y1 {
+                            for x in x0..x1 {
+                                let [r, g, b] = px_rgb(x, y);
+                                let l = 0.299 * (r as f32)
+                                    + 0.587 * (g as f32)
+                                    + 0.114 * (b as f32);
+                                let dr = (l + (r as f32 - l) * chroma)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8;
+                                let dg = (l + (g as f32 - l) * chroma)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8;
+                                let db = (l + (b as f32 - l) * chroma)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8;
+                                rgb.push([dr, dg, db]);
+                            }
                         }
                     }
                     GlyphPixels::SubpixelRgb(rgb)
@@ -1731,6 +1777,68 @@ mod win_impl {
                 }
                 GlyphPixels::Grayscale(_) => panic!("expected SubpixelRgb"),
             }
+        }
+
+        #[test]
+        fn dwrite_hidpi_150_emits_pure_neutral_grayscale_without_color_fringing() {
+            let Some(msyh) = load_font_file(r"C:\Windows\Fonts\msyh.ttc", 0) else {
+                return;
+            };
+            let face = DWriteFace::from_font_data(&msyh).expect("msyh.ttc DWriteFace");
+            for ch in ['数', '据', '验', '证', '1', '8', '.'] {
+                let gid = face.glyph_index_for_char(ch).expect("glyph index");
+                assert_ne!(gid, 0);
+                let rast = face
+                    .rasterize_glyph(gid, 13.0, 1.5, true)
+                    .expect("rasterize at 150% DPI");
+                match rast.pixels.expect("non-empty pixels") {
+                    GlyphPixels::SubpixelRgb(rgb) => {
+                        assert!(rgb.iter().any(|&[r, g, b]| r > 64 || g > 64 || b > 64));
+                        assert!(
+                            rgb.iter().all(|&[r, g, b]| r == g && g == b),
+                            "150% HiDPI '{ch}' must have zero RGB color fringing"
+                        );
+                    }
+                    GlyphPixels::Grayscale(_) => panic!("expected SubpixelRgb"),
+                }
+            }
+        }
+
+        #[test]
+        fn dwrite_100dpi_bounds_subpixel_chroma_while_preserving_refinement() {
+            let Some(segoe) = load_font_file(r"C:\Windows\Fonts\segoeui.ttf", 0) else {
+                return;
+            };
+            let face = DWriteFace::from_font_data(&segoe).expect("Segoe UI DWriteFace");
+            let mut max_spread = 0u8;
+            let mut saw_subpixel = false;
+            for ch in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', 'A', '¥'] {
+                let Some(gid) = face.glyph_index_for_char(ch) else {
+                    continue;
+                };
+                if gid == 0 {
+                    continue;
+                }
+                let rast = face
+                    .rasterize_glyph(gid, 12.0, 1.0, true)
+                    .expect("rasterize at 100% DPI");
+                if let Some(GlyphPixels::SubpixelRgb(rgb)) = rast.pixels {
+                    for &[r, g, b] in &rgb {
+                        let hi = r.max(g).max(b);
+                        let lo = r.min(g).min(b);
+                        let spread = hi - lo;
+                        max_spread = max_spread.max(spread);
+                        if spread > 0 {
+                            saw_subpixel = true;
+                        }
+                    }
+                }
+            }
+            assert!(saw_subpixel, "100% DPI should retain subtle RGB subpixel precision");
+            assert!(
+                max_spread <= 105,
+                "100% DPI subpixel chroma spread too high (fringing risk): max_spread={max_spread}"
+            );
         }
 
         #[test]

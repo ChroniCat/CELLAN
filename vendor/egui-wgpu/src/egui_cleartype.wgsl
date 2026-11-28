@@ -97,10 +97,19 @@ fn compute_cleartype_eff(v: vec4<f32>, tex_rgb: vec3<f32>) -> vec3<f32> {
     let fg = clamp(v.rgb / max(v.a, 1e-5), vec3<f32>(0.0), vec3<f32>(1.0));
     let lum = dot(fg, vec3<f32>(0.299, 0.587, 0.114));
 
-    let eff_dark = clamp(
-        tex_rgb + (enhanced_contrast * 0.4) * tex_rgb * (vec3<f32>(1.0) - tex_rgb),
+    // Direct2D / DirectWrite linear-light dark-on-light contrast + sRGB transmittance gamma:
+    // preserves 0->0 and 1->1 exactly while preventing subpixel edge fringes from bloating.
+    let k_dark = enhanced_contrast * 0.85;
+    let a_ec = clamp(
+        tex_rgb * (k_dark + 1.0) / (tex_rgb * k_dark + vec3<f32>(1.0)),
         vec3<f32>(0.0),
         vec3<f32>(1.0),
+    );
+    let inv_a = max(vec3<f32>(1.0) - a_ec, vec3<f32>(1e-6));
+    let eff_dark = select(
+        vec3<f32>(1.0) - pow(inv_a, vec3<f32>(1.0 / gamma)),
+        vec3<f32>(1.0),
+        a_ec >= vec3<f32>(1.0),
     );
     let safe_tex = max(tex_rgb, vec3<f32>(1e-6));
     let eff_light = select(
@@ -139,8 +148,9 @@ fn fs_cleartype_linear_framebuffer(in: VertexOutput) -> ClearTypeOutput {
     let v = in.color;
 
     let enhanced_contrast = max(r_locals.cleartype_contrast, 0.0);
+    let k_lin = enhanced_contrast * 0.5;
     let eff = clamp(
-        tex.rgb + (enhanced_contrast * 0.25) * tex.rgb * (vec3<f32>(1.0) - tex.rgb),
+        tex.rgb * (k_lin + 1.0) / (tex.rgb * k_lin + vec3<f32>(1.0)),
         vec3<f32>(0.0),
         vec3<f32>(1.0),
     );

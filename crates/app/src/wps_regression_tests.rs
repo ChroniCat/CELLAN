@@ -3612,16 +3612,25 @@ fn shell_geometry_and_focus_anchors_align_across_themes_and_sizes() {
                 }),
                 "ribbon body floating card missing at {w}x{h} ({theme:?})"
             );
-            // Both active Ribbon tab and active Sheet tab paint a refined 2px accent indicator bar.
+            // Active Ribbon tab and active Sheet tab use clean neutral selected pills with NO green accent bars.
+            let (selected_fill, _) = ui_kit::active_tab_colors(pal);
+            let selected_tabs = rects
+                .iter()
+                .filter(|r| r.fill == selected_fill && r.rect.height() >= 18.0 && r.rect.height() <= 32.0)
+                .count();
+            assert!(
+                selected_tabs >= 2,
+                "expected active Ribbon tab + active Sheet tab selected surfaces at {w}x{h} ({theme:?}), got {selected_tabs}"
+            );
             let accent_bars = rects
                 .iter()
                 .filter(|r| {
                     r.fill == pal.accent && r.rect.width() >= 14.0 && r.rect.height() <= 2.5
                 })
                 .count();
-            assert!(
-                accent_bars >= 2,
-                "expected active Ribbon tab + active Sheet tab accent indicators at {w}x{h} ({theme:?}), got {accent_bars}"
+            assert_eq!(
+                accent_bars, 0,
+                "expected NO green selection indicator bars at {w}x{h} ({theme:?}), got {accent_bars}"
             );
         }
     }

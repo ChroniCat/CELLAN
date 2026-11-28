@@ -2858,8 +2858,20 @@ impl SheetApp {
                                         }
                                         AiRole::Assistant => {
                                             let open_id = egui::Id::new(("ai_tools_open", idx));
+                                            let default_tools_open = {
+                                                let msg = &self.ai.messages[idx];
+                                                let any_err = msg
+                                                    .tool_logs
+                                                    .iter()
+                                                    .any(|l| classify_tool_log(l).1);
+                                                (self.ai.busy
+                                                    && is_last
+                                                    && msg.content.is_empty())
+                                                    || any_err
+                                            };
                                             let tools_open = ui.ctx().data(|d| {
-                                                d.get_temp::<bool>(open_id).unwrap_or(true)
+                                                d.get_temp::<bool>(open_id)
+                                                    .unwrap_or(default_tools_open)
                                             });
                                             let can_retry = is_last && last_can_retry;
                                             let usteps = self.ai.messages[idx].undo_ids.len();
@@ -4181,6 +4193,84 @@ mod grouped_undo_tests {
             "user bubble should stay right-aligned in feed: text_left={}, panel_left={}",
             user_hit.2.left(),
             panel_left
+        );
+        drop(env);
+    }
+
+    #[test]
+    fn ai_demo_150dpi_1440x900_collapses_completed_tools_and_shows_answer_heading_above_fold() {
+        let env = crate::test_env::TestEnv::new("ai_demo_150dpi_fold");
+        env.sc("SC_AI_DEMO", "1");
+        env.sc("SC_SHOT", "1");
+        let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        assert!(app.ai.open);
+        let first_step_summary = "读取工作簿概览";
+
+        // 1440x900 物理窗口 @ 150% DPI = 960x600 逻辑像素；扣除顶栏+功能区+编辑栏+底栏(~196pt)后，AI 面板约 404pt 高
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(960.0, 404.0),
+            )),
+            ..Default::default()
+        };
+        let mut last_out = None;
+        for _ in 0..3 {
+            last_out = Some(ctx.run(raw.clone(), |ctx| app.draw_ai_panel(ctx)));
+        }
+        let out = last_out.unwrap();
+
+        fn walk_texts(
+            clip: egui::Rect,
+            s: &egui::Shape,
+            out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+        ) {
+            match s {
+                egui::Shape::Text(ts) => {
+                    out.push((ts.galley.text().to_owned(), ts.visual_bounding_rect(), clip));
+                }
+                egui::Shape::Vec(v) => {
+                    for x in v {
+                        walk_texts(clip, x, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut items = Vec::new();
+        for cs in &out.shapes {
+            walk_texts(cs.clip_rect, &cs.shape, &mut items);
+        }
+
+        // 1) 已完成的工具记录默认收成一行，不展开各步明细
+        assert!(
+            items.iter().any(|(t, ..)| t.contains("已完成 3 项表格操作")),
+            "collapsed tool summary row should be visible"
+        );
+        assert!(
+            !items.iter().any(|(t, ..)| t.contains(&first_step_summary)),
+            "completed tool step `{first_step_summary}` should be collapsed by default"
+        );
+
+        // 2) 回答标题与首段要点直接落在 150% 首屏（输入盒裁切线之上）
+        let send_top = items
+            .iter()
+            .find(|(t, ..)| t == "发送")
+            .map(|(_, vis, _)| vis.top())
+            .expect("composer 发送 button should render");
+        let composer_box_top = send_top - 48.0;
+        let heading = items
+            .iter()
+            .find(|(t, ..)| t.contains("Q1 部门营收与毛利率汇总"))
+            .expect("answer heading should render on first screen at 150% DPI");
+        assert!(
+            heading.1.bottom() <= heading.2.max.y.min(composer_box_top) + 1.0,
+            "answer heading pushed below fold at 150% DPI: bottom={}, clip_max_y={}, composer_top={}",
+            heading.1.bottom(),
+            heading.2.max.y,
+            composer_box_top
         );
         drop(env);
     }

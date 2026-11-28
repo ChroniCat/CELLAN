@@ -49,10 +49,17 @@ void main() {
     vec3 fg = clamp(v.rgb / max(v.a, 1e-5), vec3(0.0), vec3(1.0));
     float lum = dot(fg, vec3(0.299, 0.587, 0.114));
 
-    vec3 eff_dark = clamp(
-        tex.rgb + (enhanced_contrast * 0.4) * tex.rgb * (vec3(1.0) - tex.rgb),
+    float k_dark = enhanced_contrast * 0.85;
+    vec3 a_ec = clamp(
+        tex.rgb * (k_dark + 1.0) / (tex.rgb * k_dark + vec3(1.0)),
         vec3(0.0),
         vec3(1.0)
+    );
+    vec3 inv_a = max(vec3(1.0) - a_ec, vec3(1e-6));
+    vec3 eff_dark = mix(
+        vec3(1.0) - pow(inv_a, vec3(1.0 / gamma)),
+        vec3(1.0),
+        vec3(greaterThanEqual(a_ec, vec3(1.0)))
     );
     vec3 safe_tex = max(tex.rgb, vec3(1e-6));
     vec3 eff_light = mix(

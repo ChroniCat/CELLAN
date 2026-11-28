@@ -150,6 +150,102 @@ pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
     fill_rrect4(painter, tx(129.0), ty(129.0), ts(79.0), ts(79.0), [r_cell, 0.0, r_hi, 0.0], aqua_hi);
 }
 
+/// Chrome 风格标签页轮廓：顶部圆角 + 底部左右外撇凹圆角平滑过渡到底栏，避免“上圆下尖”。
+pub fn paint_chrome_tab(
+    painter: &egui::Painter,
+    rect: Rect,
+    top_r: f32,
+    flare_r: f32,
+    fill: Color32,
+    contour: Option<Stroke>,
+) {
+    let top_r = top_r.clamp(0.0, (rect.width() * 0.45).min(rect.height() * 0.48));
+    let r = flare_r.clamp(0.0, (rect.height() - top_r).max(0.0));
+    let top_u8 = top_r.round().clamp(0.0, 255.0) as u8;
+    let body = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() + 0.5));
+    painter.rect_filled(
+        body,
+        egui::CornerRadius { nw: top_u8, ne: top_u8, sw: 0, se: 0 },
+        fill,
+    );
+
+    const SEG: usize = 10;
+    let paint_flare = |corner: egui::Pos2, center: egui::Pos2, a0: f32, a1: f32| {
+        if r < 0.5 {
+            return;
+        }
+        let mut mesh = egui::epaint::Mesh::default();
+        mesh.colored_vertex(corner, fill);
+        for k in 0..=SEG {
+            let a = a0 + (a1 - a0) * (k as f32 / SEG as f32);
+            mesh.colored_vertex(egui::pos2(center.x + r * a.cos(), center.y + r * a.sin()), fill);
+        }
+        for k in 0..SEG as u32 {
+            mesh.add_triangle(0, 1 + k, 2 + k);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        let r_aa = r + 0.25;
+        let aa_pts: Vec<egui::Pos2> = (0..=SEG)
+            .map(|k| {
+                let a = a0 + (a1 - a0) * (k as f32 / SEG as f32);
+                egui::pos2(center.x + r_aa * a.cos(), center.y + r_aa * a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(aa_pts, Stroke::new(0.75, fill)));
+    };
+
+    let center_l = egui::pos2(rect.left() - r, rect.bottom() - r);
+    let center_r = egui::pos2(rect.right() + r, rect.bottom() - r);
+    paint_flare(
+        egui::pos2(rect.left() + 0.25, rect.bottom() + 0.5),
+        center_l,
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+    );
+    paint_flare(
+        egui::pos2(rect.right() - 0.25, rect.bottom() + 0.5),
+        center_r,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+    );
+
+    if let Some(stroke) = contour {
+        let mut pts = Vec::with_capacity(4 * (SEG + 1));
+        if r >= 0.5 {
+            for k in 0..=SEG {
+                let a = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / SEG as f32);
+                pts.push(egui::pos2(center_l.x + r * a.cos(), center_l.y + r * a.sin()));
+            }
+        } else {
+            pts.push(rect.left_bottom());
+        }
+        if top_r >= 0.5 {
+            let tl = egui::pos2(rect.left() + top_r, rect.top() + top_r);
+            for k in 0..=SEG {
+                let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                pts.push(egui::pos2(tl.x + top_r * a.cos(), tl.y + top_r * a.sin()));
+            }
+            let tr = egui::pos2(rect.right() - top_r, rect.top() + top_r);
+            for k in 0..=SEG {
+                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                pts.push(egui::pos2(tr.x + top_r * a.cos(), tr.y + top_r * a.sin()));
+            }
+        } else {
+            pts.push(rect.left_top());
+            pts.push(rect.right_top());
+        }
+        if r >= 0.5 {
+            for k in 0..=SEG {
+                let a = std::f32::consts::PI - std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                pts.push(egui::pos2(center_r.x + r * a.cos(), center_r.y + r * a.sin()));
+            }
+        } else {
+            pts.push(rect.right_bottom());
+        }
+        painter.add(egui::Shape::line(pts, stroke));
+    }
+}
+
 /// 把一块已经画满（直角）的区域收成圆角卡片：四角先用页面底色「抠」掉，再描 1px 边。
 /// egui 的裁切只有矩形，网格、表头、滚动条又各自直角铺色，只能事后盖住四个角。
 #[allow(dead_code)]
@@ -1422,22 +1518,22 @@ pub fn text_toggle(
 }
 
 /// 浮于页面底色（`page_bg` / `title_bg`）之上的当前页签底色和文字色：
-/// 浅色/护眼/深色使用精致抬升卡面 `card_bg` + 深/浅清晰墨色 `text`；高对比使用反白。
+/// 采用干净克制的柔和中性底面 `pressed` + 清晰墨色 `text`（无绿色指示条）；高对比使用反白。
 pub fn active_tab_colors(pal: crate::theme::ThemePalette) -> (Color32, Color32) {
     if pal.theme == crate::theme::AppTheme::HighContrast {
         (pal.text, pal.page_bg)
     } else {
-        (pal.card_bg, pal.text)
+        (pal.pressed, pal.text)
     }
 }
 
 /// 位于弹窗/浮层底面（`dialog_bg`）内部的选中项底色和文字色：
-/// 避免浅色模式下白底卡片与白底弹窗融为一体，改用柔和强调色底 `accent_tint` + 清晰墨色 `text`；高对比反白。
+/// 统一采用柔和中性胶囊底 `pressed` + 清晰墨色 `text`；高对比反白。
 pub fn active_dialog_tab_colors(pal: crate::theme::ThemePalette) -> (Color32, Color32) {
     if pal.theme == crate::theme::AppTheme::HighContrast {
         (pal.text, pal.page_bg)
     } else {
-        (pal.accent_tint, pal.text)
+        (pal.pressed, pal.text)
     }
 }
 
@@ -1470,7 +1566,6 @@ pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Gal
 
 pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool, green: bool) -> Response {
     let (galley, width) = layout;
-    let text_w = galley.size().x;
     let pal = crate::theme::palette();
     let dark = ui.visuals().dark_mode || pal.theme.is_dark();
     let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
@@ -1478,7 +1573,6 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
     let pill = rect.shrink2(Vec2::new(2.0, 3.0));
     let (selected_fill, selected_ink) = active_tab_colors(pal);
     let hov_t = anim_hover(ui.ctx(), resp.id.with("tab_hov"), resp.hovered());
-    let active_t = anim_toggle(ui.ctx(), resp.id.with("tab_act"), active && !green);
     if green {
         let hover_fill = if dark {
             pal.pressed
@@ -1500,30 +1594,7 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
             );
         }
     } else if active {
-        if is_hc {
-            ui.painter().rect_filled(pill, 5.0, selected_fill);
-        } else {
-            ui.painter().rect(
-                pill,
-                5.0,
-                selected_fill,
-                Stroke::new(1.0, pal.chrome_separator()),
-                egui::StrokeKind::Inside,
-            );
-        }
-        // 精致 2px 圆角底部强调指示条（切页时从中心平滑展开并淡入）
-        let full_w = text_w.clamp(16.0, (pill.width() - 8.0).max(16.0));
-        let bar_w = egui::lerp((full_w * 0.45)..=full_w, active_t);
-        let bar_y = if is_hc {
-            rect.bottom() - 1.0
-        } else {
-            pill.bottom() - 1.5
-        };
-        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(bar_w, 2.0));
-        let bar_col = lerp_color(Color32::TRANSPARENT, pal.accent, active_t);
-        if bar_col != Color32::TRANSPARENT {
-            ui.painter().rect_filled(bar, 1.0, bar_col);
-        }
+        ui.painter().rect_filled(pill, 5.0, selected_fill);
     } else {
         let bg = lerp_color(Color32::TRANSPARENT, pal.hover_on_page, hov_t);
         if bg != Color32::TRANSPARENT {
@@ -1537,13 +1608,8 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
     } else {
         lerp_color(pal.text_weak, pal.text, hov_t * 0.65)
     };
-    let text_center = if active && !green && !is_hc {
-        rect.center() - Vec2::new(0.0, 0.5)
-    } else {
-        rect.center()
-    };
     let pos = Align2::CENTER_CENTER
-        .anchor_size(text_center, galley.size())
+        .anchor_size(rect.center(), galley.size())
         .min;
     ui.painter().galley_with_override_text_color(pos, galley, col);
     resp
@@ -2152,17 +2218,8 @@ pub fn sheet_tab(
     let size = Vec2::new(galley.size().x + crate::tokens::size::SHEET_TAB_PAD, crate::tokens::size::SHEET_TAB_H);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
-    let chip = if active {
-        // 活动表页签顶部齐平衔接上方工作表画布底边，底部保留圆角与强调指示条。
-        Rect::from_min_max(
-            egui::pos2(rect.left() + 1.0, rect.top()),
-            egui::pos2(rect.right() - 1.0, rect.bottom() - 3.0),
-        )
-    } else {
-        rect.shrink2(Vec2::new(1.0, 3.0))
-    };
+    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
     let hov_t = anim_hover(ui.ctx(), resp.id.with("sheet_hov"), !active && !grouped && resp.hovered());
-    let act_t = anim_toggle(ui.ctx(), resp.id.with("sheet_act"), active);
     let (fill, text_color) = if active {
         active_tab_colors(pal)
     } else if grouped {
@@ -2173,49 +2230,11 @@ pub fn sheet_tab(
             lerp_color(pal.text_weak, pal.text, hov_t * 0.6),
         )
     };
-    if active {
-        let rad = egui::CornerRadius { nw: 0, ne: 0, sw: 5, se: 5 };
-        if is_hc {
-            ui.painter().rect_filled(chip, rad, fill);
-        } else {
-            ui.painter().rect(
-                chip,
-                rad,
-                fill,
-                Stroke::new(1.0, pal.chrome_separator()),
-                egui::StrokeKind::Inside,
-            );
-            // 抹去顶边细线，使活动表页签与上方网格画布浑然一体
-            ui.painter().hline(
-                (chip.left() + 1.0)..=(chip.right() - 1.0),
-                chip.top() + 0.5,
-                Stroke::new(1.0, fill),
-            );
-        }
-        // 精致 2px 圆角底部强调条（有自定义标签色时采用自定义色，否则采用主题强调色；切换时平滑展开）
-        let bar_col = color
-            .map(|[r, g, b]| Color32::from_rgb(r, g, b))
-            .unwrap_or(pal.accent);
-        let full_w = (chip.width() - 12.0).max(16.0).min((chip.width() - 4.0).max(8.0));
-        let bar_w = egui::lerp((full_w * 0.45)..=full_w, act_t);
-        let bar_y = if is_hc { rect.bottom() - 1.0 } else { chip.bottom() - 1.5 };
-        let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
-        let anim_bar_col = lerp_color(Color32::TRANSPARENT, bar_col, act_t);
-        if anim_bar_col != Color32::TRANSPARENT {
-            ui.painter().rect_filled(bar, 1.0, anim_bar_col);
-        }
-        if !is_hc && act_t >= 0.5 {
-            let lum = |c: Color32| egui::Rgba::from(c).intensity() + 0.05;
-            let (a, b) = (lum(bar_col), lum(fill));
-            if a.max(b) / a.min(b) < 1.8 {
-                ui.painter().rect_stroke(bar, 1.0, Stroke::new(1.0, pal.text_weak), egui::StrokeKind::Inside);
-            }
-        }
-    } else if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(chip, 4.0, fill);
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(chip, 5.0, fill);
     }
 
-    let center_y = if active { chip.center().y - 1.0 } else { rect.center().y };
+    let center_y = rect.center().y;
     let color_offset = if let Some([r, g, b]) = color {
         let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, center_y), Vec2::splat(8.0));
         let edge = if active && is_hc { text_color } else { pal.text_weak };
@@ -2229,7 +2248,7 @@ pub fn sheet_tab(
         .min;
     let elided = galley.elided;
     ui.painter().galley_with_override_text_color(text_pos, galley, text_color);
-    tab_focus_ring(ui, &resp, chip, 4.0, active);
+    tab_focus_ring(ui, &resp, chip, 5.0, active);
     if elided {
         resp.on_hover_text(name)
     } else {
@@ -2852,22 +2871,9 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 .min;
             let chip = rect.shrink2(Vec2::new(1.0, 3.0));
             let tab_hov = anim_hover(ui.ctx(), id.with(("dlgtab_hov", i)), !on && resp.hovered());
-            let tab_act = anim_toggle(ui.ctx(), id.with(("dlgtab_act", i)), on);
             if on {
                 let (fill, ink) = active_dialog_tab_colors(pal);
                 ui.painter().rect_filled(chip, 6.0, fill);
-                let full_w = galley.size().x.clamp(16.0, (chip.width() - 10.0).max(16.0));
-                let bar_w = egui::lerp((full_w * 0.45)..=full_w, tab_act);
-                let bar_y = if pal.theme == crate::theme::AppTheme::HighContrast {
-                    rect.bottom() - 1.0
-                } else {
-                    chip.bottom() - 1.5
-                };
-                let bar = Rect::from_center_size(egui::pos2(chip.center().x, bar_y), Vec2::new(bar_w, 2.0));
-                let bar_col = lerp_color(Color32::TRANSPARENT, pal.accent, tab_act);
-                if bar_col != Color32::TRANSPARENT {
-                    ui.painter().rect_filled(bar, 1.0, bar_col);
-                }
                 ui.painter().galley_with_override_text_color(pos, galley, ink);
             } else {
                 let bg = lerp_color(Color32::TRANSPARENT, pal.hover, tab_hov);

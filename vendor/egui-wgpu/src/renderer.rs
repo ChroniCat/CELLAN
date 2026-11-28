@@ -1210,10 +1210,16 @@ mod cleartype_tests {
         ];
         let lum = fg[0] * 0.299 + fg[1] * 0.587 + fg[2] * 0.114;
 
+        let k_dark = enhanced_contrast * 0.85;
         let mut eff = [0.0_f32; 3];
         for i in 0..3 {
             let t = tex_rgb[i];
-            let eff_dark = (t + (enhanced_contrast * 0.4) * t * (1.0 - t)).clamp(0.0, 1.0);
+            let a_ec = ((t * (k_dark + 1.0)) / (t * k_dark + 1.0)).clamp(0.0, 1.0);
+            let eff_dark = if a_ec >= 1.0 {
+                1.0
+            } else {
+                1.0 - (1.0 - a_ec).max(1e-6).powf(1.0 / gamma)
+            };
             let eff_light = if t <= 0.0 {
                 0.0
             } else {
@@ -1304,22 +1310,23 @@ mod cleartype_tests {
         assert!(mask0.iter().all(|m| *m == 0.0));
         assert_eq!(empty, dst);
 
-        // 5. Luminance-aware weighting: white text on dark lifts mid-coverage more than dark on light.
+        // 5. Luminance-aware weighting: dark-on-light applies linear-light transmittance gamma
+        //    (avoiding bloated midtone fringes) while light-on-dark lifts mid-coverage.
         let (_, mask_dark, _) =
             cpu_cleartype_gamma_blend([0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5], [1.0; 3], 1.8, 0.5);
         let (_, mask_light, _) =
             cpu_cleartype_gamma_blend([1.0, 1.0, 1.0, 1.0], [0.5, 0.5, 0.5], [0.0; 3], 1.8, 0.5);
-        assert!(mask_dark[0] > 0.54 && mask_dark[0] < 0.56);
-        assert!(mask_light[0] > mask_dark[0] + 0.1);
+        assert!(mask_dark[0] > 0.37 && mask_dark[0] < 0.41, "got {}", mask_dark[0]);
+        assert!(mask_light[0] > mask_dark[0] + 0.2);
 
         // 6. Asymmetric subpixel mask blends R, G, B channels independently.
         let (_, mask_sub, blended_sub) =
             cpu_cleartype_gamma_blend([0.0, 0.0, 0.0, 1.0], [1.0, 0.5, 0.0], [1.0; 3], 1.8, 0.5);
         assert!((mask_sub[0] - 1.0).abs() < 1e-6);
-        assert!(mask_sub[1] > 0.5 && mask_sub[1] < 0.6);
+        assert!(mask_sub[1] > 0.37 && mask_sub[1] < 0.41, "got {}", mask_sub[1]);
         assert!(mask_sub[2].abs() < 1e-6);
         assert!(blended_sub[0].abs() < 1e-6);
-        assert!(blended_sub[1] > 0.4 && blended_sub[1] < 0.5);
+        assert!(blended_sub[1] > 0.59 && blended_sub[1] < 0.63, "got {}", blended_sub[1]);
         assert!((blended_sub[2] - 1.0).abs() < 1e-6);
     }
 }
