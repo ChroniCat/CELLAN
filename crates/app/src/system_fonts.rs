@@ -362,7 +362,99 @@ fn revision_id() -> egui::Id {
     egui::Id::new("cellan_system_font_definitions")
 }
 
-pub fn install(ctx: &egui::Context, definitions: egui::FontDefinitions) {
+/// 真 500 Medium 中文字面（SIL OFL 1.1，由 Google Fonts `NotoSansSC-VF.ttf` 实例化 wght=500 后按 GB2312 + UI 字符裁子集）。
+/// 用于 16px 及以下标签、按钮、分区标题的 `ui-medium` 字族，让中文与西文一样具备清晰克制的 500 字重层次。
+pub(crate) const FONT_SANS_MEDIUM: &[u8] =
+    include_bytes!("../../../assets/fonts/subset/NotoSansSC-Medium.subset.ttf");
+
+fn embedded_cjk_medium() -> std::sync::Arc<FontData> {
+    static DATA: OnceLock<std::sync::Arc<FontData>> = OnceLock::new();
+    DATA.get_or_init(|| std::sync::Arc::new(FontData::from_static(FONT_SANS_MEDIUM)))
+        .clone()
+}
+
+fn ui_segoe_semibold() -> Option<std::sync::Arc<FontData>> {
+    static DATA: OnceLock<Option<std::sync::Arc<FontData>>> = OnceLock::new();
+    DATA.get_or_init(|| load_ttf_face("seguisb.ttf", 0)).clone()
+}
+
+fn ui_segoe_italic() -> Option<std::sync::Arc<FontData>> {
+    static DATA: OnceLock<Option<std::sync::Arc<FontData>>> = OnceLock::new();
+    DATA.get_or_init(|| load_ttf_face("segoeuii.ttf", 0)).clone()
+}
+
+/// 在 `install` 挂载字体前丰富 `ui-medium` 与 `ui-italic` 两个 UI 字族（零侵入 `main.rs`）：
+/// - `ui-medium`：拉丁走系统 `sys-ui-segoe-sb`（Segoe UI Semibold 600），中文走内嵌真 500 `noto-sans-medium`，
+///   末尾保留 `sys-ui-msyh` / `inter` / `noto-sans` 回退以覆盖生僻与繁体字；
+/// - `ui-italic`：拉丁零拷贝挂载 Windows 原生 `segoeuii.ttf`（`sys-ui-segoe-i`）并串接 `Proportional` 回退链，
+///   供 `I` 斜体按钮与斜体标签渲染真实斜体字形。
+pub(crate) fn enrich_ui_families(definitions: &mut egui::FontDefinitions) {
+    definitions
+        .font_data
+        .entry("noto-sans-medium".to_owned())
+        .or_insert_with(embedded_cjk_medium);
+
+    if !definitions.font_data.contains_key("sys-ui-segoe-sb") {
+        if let Some(sb) = ui_segoe_semibold() {
+            definitions
+                .font_data
+                .insert("sys-ui-segoe-sb".to_owned(), sb);
+        }
+    }
+    if !definitions.font_data.contains_key("sys-ui-segoe-i") {
+        if let Some(it) = ui_segoe_italic() {
+            definitions
+                .font_data
+                .insert("sys-ui-segoe-i".to_owned(), it);
+        }
+    }
+
+    let prop_chain: Vec<String> = definitions
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let push_if_present = |chain: &mut Vec<String>, key: &str, defs: &egui::FontDefinitions| {
+        if defs.font_data.contains_key(key) && !chain.iter().any(|k| k == key) {
+            chain.push(key.to_owned());
+        }
+    };
+
+    let ui_medium_key = egui::FontFamily::Name("ui-medium".into());
+    let existing_med = definitions
+        .families
+        .get(&ui_medium_key)
+        .cloned()
+        .unwrap_or_default();
+    let mut med = Vec::with_capacity(existing_med.len() + 4);
+    push_if_present(&mut med, "sys-ui-segoe-sb", definitions);
+    push_if_present(&mut med, "noto-sans-medium", definitions);
+    for k in &existing_med {
+        push_if_present(&mut med, k, definitions);
+    }
+    for fb in ["sys-ui-msyh", "inter", "noto-sans"] {
+        push_if_present(&mut med, fb, definitions);
+    }
+    for k in &prop_chain {
+        push_if_present(&mut med, k, definitions);
+    }
+    definitions.families.insert(ui_medium_key, med);
+
+    let ui_italic_key = egui::FontFamily::Name("ui-italic".into());
+    let mut italic = Vec::with_capacity(prop_chain.len() + 4);
+    push_if_present(&mut italic, "sys-ui-segoe-i", definitions);
+    for k in &prop_chain {
+        push_if_present(&mut italic, k, definitions);
+    }
+    for fb in ["sys-ui-segoe", "sys-ui-msyh", "inter", "noto-sans"] {
+        push_if_present(&mut italic, fb, definitions);
+    }
+    definitions.families.insert(ui_italic_key, italic);
+}
+
+pub fn install(ctx: &egui::Context, mut definitions: egui::FontDefinitions) {
+    enrich_ui_families(&mut definitions);
     ctx.set_fonts(definitions);
     ctx.data_mut(|data| data.insert_temp(revision_id(), next_generation()));
 }
@@ -642,5 +734,88 @@ mod tests {
                 "Windows 环境应能零拷贝映射系统宋体或 Georgia 衬线字体"
             );
         }
+    }
+
+    #[test]
+    fn embedded_medium_cjk_is_true_500_weight() {
+        let face = ttf_parser::Face::parse(FONT_SANS_MEDIUM, 0)
+            .expect("内嵌 NotoSansSC-Medium.subset.ttf 必须可解析");
+        assert_eq!(
+            face.weight(),
+            ttf_parser::Weight::Medium,
+            "内嵌 Medium 中文字体必须是真 500 字重"
+        );
+        for ch in ['开', '始', '文', '件', '表', '格', '设', '置', '助', '手', '审', '计'] {
+            assert!(
+                face.glyph_index(ch).is_some(),
+                "Medium CJK 子集应包含常用 UI 汉字 '{ch}'"
+            );
+        }
+    }
+
+    #[test]
+    fn install_enriches_ui_medium_and_registers_ui_italic() {
+        let mut defs = egui::FontDefinitions::default();
+        defs.font_data.insert(
+            "sys-ui-segoe-sb".to_owned(),
+            FontData::from_static(FONT_SANS_MEDIUM).into(),
+        );
+        defs.font_data.insert(
+            "sys-ui-msyh".to_owned(),
+            FontData::from_static(FONT_SANS_MEDIUM).into(),
+        );
+        defs.font_data.insert(
+            "noto-sans".to_owned(),
+            FontData::from_static(FONT_SANS_MEDIUM).into(),
+        );
+        defs.families.insert(
+            egui::FontFamily::Name("ui-medium".into()),
+            vec![
+                "sys-ui-segoe-sb".to_owned(),
+                "sys-ui-msyh".to_owned(),
+                "noto-sans".to_owned(),
+            ],
+        );
+
+        enrich_ui_families(&mut defs);
+
+        let med = defs
+            .families
+            .get(&egui::FontFamily::Name("ui-medium".into()))
+            .expect("ui-medium 必须存在");
+        assert!(defs.font_data.contains_key("noto-sans-medium"));
+        let pos_sb = med.iter().position(|k| k == "sys-ui-segoe-sb").unwrap();
+        let pos_med = med.iter().position(|k| k == "noto-sans-medium").unwrap();
+        let pos_msyh = med.iter().position(|k| k == "sys-ui-msyh").unwrap();
+        let pos_noto = med.iter().position(|k| k == "noto-sans").unwrap();
+        assert!(
+            pos_sb < pos_med && pos_med < pos_msyh && pos_msyh < pos_noto,
+            "ui-medium 回退链顺序错误: {med:?}"
+        );
+
+        let italic = defs
+            .families
+            .get(&egui::FontFamily::Name("ui-italic".into()))
+            .expect("ui-italic 必须已注册");
+        assert!(!italic.is_empty(), "ui-italic 不能为空");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                italic.first().map(String::as_str),
+                Some("sys-ui-segoe-i"),
+                "Windows 环境下 ui-italic 首位应为 segoeuii.ttf 映射"
+            );
+            let italic_bytes = file_bytes("segoeuii.ttf").expect("Windows 应存在 segoeuii.ttf");
+            let face = ttf_parser::Face::parse(italic_bytes, 0).expect("segoeuii.ttf 可解析");
+            assert!(face.is_italic(), "segoeuii.ttf 必须为真实斜体字面");
+        }
+
+        let ctx = egui::Context::default();
+        install(&ctx, egui::FontDefinitions::default());
+        let _ = ctx.run(Default::default(), |ctx| {
+            let fams = ctx.fonts(|f| f.families());
+            assert!(fams.contains(&egui::FontFamily::Name("ui-medium".into())));
+            assert!(fams.contains(&egui::FontFamily::Name("ui-italic".into())));
+        });
     }
 }

@@ -1297,7 +1297,7 @@ impl SheetApp {
                 ui.label(
                     egui::RichText::new("1. 数据源与放置位置")
                         .strong()
-                        .size(12.5)
+                        .size(13.0)
                         .color(pal.text),
                 );
                 ui.add_space(4.0);
@@ -1356,7 +1356,7 @@ impl SheetApp {
                     ui.label(
                         egui::RichText::new("2. 智能推荐视图（一键出表，创建后仍可随时拖拽调整）")
                             .strong()
-                            .size(12.5)
+                            .size(13.0)
                             .color(pal.text),
                     );
                 });
@@ -1391,16 +1391,16 @@ impl SheetApp {
                                     .show(ui, |ui| {
                                         ui.label(
                                             egui::RichText::new("推荐")
-                                                .color(if selected { Color32::WHITE } else { pal.accent })
+                                                .color(if selected { pal.on_accent() } else { pal.accent })
                                                 .strong()
-                                                .size(10.0),
+                                                .size(11.0),
                                         );
                                     });
                                 ui.vertical(|ui| {
                                     ui.label(
                                         egui::RichText::new(&preset.title)
                                             .strong()
-                                            .size(12.5)
+                                            .size(13.0)
                                             .color(pal.text),
                                     );
                                     ui.label(
@@ -1553,7 +1553,7 @@ impl SheetApp {
                             ui.label(
                                 egui::RichText::new("数据透视表字段")
                                     .strong()
-                                    .size(13.5)
+                                    .size(14.0)
                                     .color(pal.text),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1568,7 +1568,7 @@ impl SheetApp {
                                     .selectable_label(
                                         self.pivot_ui.sidebar_pinned,
                                         egui::RichText::new(if self.pivot_ui.sidebar_pinned { "已固定" } else { "固定" })
-                                            .size(10.5),
+                                            .size(11.0),
                                     )
                                     .on_hover_text("固定侧边栏（点选透视表外时不自动收起）")
                                     .clicked()
@@ -1600,7 +1600,7 @@ impl SheetApp {
                                 cell_name(edit_model.spec.source.2, edit_model.spec.source.3),
                                 edit_model.last_meta.matched_row_count
                             ))
-                            .size(10.5)
+                            .size(11.0)
                             .color(pal.text_weak),
                         );
                         ui.add_space(6.0);
@@ -1668,7 +1668,7 @@ impl SheetApp {
                                                 }
                                                 let badge_col = match prof.kind {
                                                     FieldKind::Numeric => pal.accent,
-                                                    FieldKind::Date => Color32::from_rgb(37, 99, 235),
+                                                    FieldKind::Date => pal.info_fg,
                                                     FieldKind::Text => pal.text_weak,
                                                 };
                                                 let drag_lbl = ui.add(
@@ -1678,7 +1678,7 @@ impl SheetApp {
                                                             prof.kind.badge(),
                                                             prof.name
                                                         ))
-                                                        .size(11.5)
+                                                        .size(12.0)
                                                         .color(if checked { pal.text } else { pal.text_weak })
                                                         .strong(),
                                                     )
@@ -1726,13 +1726,13 @@ impl SheetApp {
                                                                 prof.samples.join("、")
                                                             ))
                                                             .weak()
-                                                            .size(10.5),
+                                                            .size(11.0),
                                                         );
                                                     }
                                                     ui.label(
                                                         egui::RichText::new("拖动可放入下方 筛选 / 列 / 行 / 值")
                                                             .weak()
-                                                            .size(10.0),
+                                                            .size(11.0),
                                                     );
                                                 });
                                             });
@@ -1744,7 +1744,7 @@ impl SheetApp {
                         ui.add_space(6.0);
                         ui.label(
                             egui::RichText::new("在以下区域间拖动字段（点击芯片可设汇总/排序/分组/筛选）：")
-                                .size(10.5)
+                                .size(11.0)
                                 .color(pal.text_weak),
                         );
                         ui.add_space(4.0);
@@ -2029,9 +2029,9 @@ impl SheetApp {
                                             .show(ui, |ui| {
                                                 ui.label(
                                                     egui::RichText::new(&payload.label)
-                                                        .color(Color32::WHITE)
+                                                        .color(pal.on_accent())
                                                         .strong()
-                                                        .size(11.5),
+                                                        .size(12.0),
                                                 );
                                             });
                                     });
@@ -2524,7 +2524,7 @@ impl SheetApp {
                         ui.add_space(6.0);
                         ui.separator();
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("筛选项目").strong().size(11.5));
+                            ui.label(egui::RichText::new("筛选项目").strong().size(12.0));
                             ui.add(
                                 egui::TextEdit::singleline(search)
                                     .hint_text("搜索项目…")
@@ -2834,7 +2834,7 @@ impl SheetApp {
 
                 ui.add_space(6.0);
                 ui.separator();
-                ui.label(egui::RichText::new("计算字段（基于分组汇总值计算，如 毛利 = 收入 - 成本）").strong().size(11.5));
+                ui.label(egui::RichText::new("计算字段（基于分组汇总值计算，如 毛利 = 收入 - 成本）").strong().size(12.0));
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.pivot_ui.new_calc_field_name)
@@ -2872,7 +2872,7 @@ impl SheetApp {
                 }
 
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new("计算项（行项组合，如 华东华北 = 华东 + 华北）").strong().size(11.5));
+                ui.label(egui::RichText::new("计算项（行项组合，如 华东华北 = 华东 + 华北）").strong().size(12.0));
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.pivot_ui.new_calc_item_name)
@@ -3211,20 +3211,24 @@ impl SheetApp {
                         Sense::click(),
                     );
                     let pill_bg = if resp.hovered() {
-                        Color32::from_rgb(217, 119, 6)
+                        pal.warn_fg
                     } else {
-                        Color32::from_rgb(254, 243, 199)
+                        pal.warn_bg
                     };
                     let pill_fg = if resp.hovered() {
-                        Color32::WHITE
+                        if pal.theme.is_dark() {
+                            Color32::BLACK
+                        } else {
+                            Color32::WHITE
+                        }
                     } else {
-                        Color32::from_rgb(146, 64, 14)
+                        pal.warn_fg
                     };
                     painter.rect(
                         pill,
                         11.0,
                         pill_bg,
-                        Stroke::new(1.0, Color32::from_rgb(245, 158, 11)),
+                        Stroke::new(1.0, pal.warn_border()),
                         egui::StrokeKind::Inside,
                     );
                     painter.text(
@@ -3631,7 +3635,7 @@ impl SheetApp {
                                 offset: [0, 2],
                                 blur: 8,
                                 spread: 0,
-                                color: Color32::from_black_alpha(20),
+                                color: pal.shadow_color(),
                             })
                             .inner_margin(egui::Margin::same(0))
                             .show(ui, |ui| {
@@ -3688,7 +3692,7 @@ impl SheetApp {
                                         clr_rect.center(),
                                         Align2::CENTER_CENTER,
                                         "清除",
-                                        FontId::proportional(10.5),
+                                        FontId::proportional(11.0),
                                         pal.accent,
                                     );
                                 }
@@ -3729,7 +3733,7 @@ impl SheetApp {
                                                             };
                                                             let btn = egui::Button::new(
                                                                 egui::RichText::new(it)
-                                                                    .size(11.5)
+                                                                    .size(12.0)
                                                                     .color(fg),
                                                             )
                                                             .fill(fill)
@@ -3871,7 +3875,7 @@ fn draw_zone_chip(
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("×").size(10.5).color(pal.text_weak),
+                                egui::RichText::new("×").size(11.0).color(pal.text_weak),
                             )
                             .frame(false),
                         )

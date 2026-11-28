@@ -1603,6 +1603,7 @@ impl SheetApp {
         let edit_blocked = self.is_edit_blocked();
         let cur_sheet = self.sheet_idx;
         let cur_sel = self.sel;
+        let pal = crate::theme::palette();
 
         egui::SidePanel::right("comments_sidebar_panel")
             .resizable(true)
@@ -1611,7 +1612,7 @@ impl SheetApp {
             .width_range(288.0..=480.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(ui_kit::PAGE_BG)
+                    .fill(pal.page_bg)
                     .inner_margin(egui::Margin {
                         left: 0,
                         right: 8,
@@ -1621,14 +1622,14 @@ impl SheetApp {
             )
             .show(ctx, |ui| {
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                    .fill(pal.card_bg)
+                    .stroke(Stroke::new(1.0_f32, pal.card_border))
                     .corner_radius(ui_kit::CARD_R)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 2],
                         blur: 8,
                         spread: 0,
-                        color: Color32::from_black_alpha(14),
+                        color: pal.shadow_color(),
                     })
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
@@ -1638,7 +1639,7 @@ impl SheetApp {
 
                         // 顶部标题条
                         egui::Frame::NONE
-                            .fill(Color32::from_rgb(248, 250, 252))
+                            .fill(pal.surface_subtle())
                             .corner_radius(egui::CornerRadius {
                                 nw: 8,
                                 ne: 8,
@@ -1651,8 +1652,8 @@ impl SheetApp {
                                     ui.label(
                                         egui::RichText::new(format!("批注管理 ({total_count})"))
                                             .strong()
-                                            .size(13.5)
-                                            .color(ui_kit::TEXT),
+                                            .size(14.0)
+                                            .color(pal.text),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -1781,7 +1782,7 @@ impl SheetApp {
                                             resolved_threads
                                         ))
                                         .size(11.0)
-                                        .color(ui_kit::TEXT_WEAK),
+                                        .color(pal.text_weak),
                                     );
                                 });
 
@@ -1813,9 +1814,9 @@ impl SheetApp {
                                                         filtered.len()
                                                     ))
                                                     .size(11.0)
-                                                    .color(Color32::WHITE),
+                                                    .color(pal.on_err()),
                                                 )
-                                                .fill(Color32::from_rgb(185, 28, 28)))
+                                                .fill(pal.err_fg))
                                                 .clicked()
                                             {
                                                 self.comments_panel.confirm_batch_delete = false;
@@ -1827,7 +1828,7 @@ impl SheetApp {
                                         } else if ui
                                             .small_button(
                                                 egui::RichText::new("批量删除")
-                                                    .color(Color32::from_rgb(185, 28, 28)),
+                                                    .color(pal.err_fg),
                                             )
                                             .on_hover_text("删除当前筛选出的全部批注（单步可撤销）")
                                             .clicked()
@@ -1883,24 +1884,27 @@ impl SheetApp {
                                             ));
                                             let (card_bg, card_border) = if item.is_thread && item.resolved {
                                                 (
-                                                    Color32::from_rgb(242, 251, 245),
+                                                    pal.accent_tint,
                                                     if is_selected {
-                                                        Color32::from_rgb(22, 163, 74)
+                                                        pal.accent
                                                     } else {
-                                                        Color32::from_rgb(167, 220, 186)
+                                                        pal.accent_border()
                                                     },
                                                 )
                                             } else {
+                                                let note_bg = if is_selected {
+                                                    pal.warn_bg
+                                                } else if pal.theme == crate::theme::AppTheme::HighContrast {
+                                                    pal.card_bg
+                                                } else {
+                                                    pal.surface_subtle().lerp_to_gamma(pal.warn_bg, 0.55)
+                                                };
                                                 (
+                                                    note_bg,
                                                     if is_selected {
-                                                        Color32::from_rgb(255, 250, 224)
+                                                        pal.info_fg
                                                     } else {
-                                                        Color32::from_rgb(255, 253, 242)
-                                                    },
-                                                    if is_selected {
-                                                        Color32::from_rgb(29, 78, 216)
-                                                    } else {
-                                                        Color32::from_rgb(226, 206, 156)
+                                                        pal.warn_border()
                                                     },
                                                 )
                                             };
@@ -1928,7 +1932,7 @@ impl SheetApp {
                                                                     egui::RichText::new(&loc_lbl)
                                                                         .strong()
                                                                         .size(12.0)
-                                                                        .color(Color32::from_rgb(29, 78, 216)),
+                                                                        .color(pal.info_fg),
                                                                 )
                                                                 .frame(false),
                                                             )
@@ -1945,21 +1949,21 @@ impl SheetApp {
                                                             ui.label(
                                                                 egui::RichText::new(&item.author)
                                                                     .size(11.0)
-                                                                    .color(Color32::from_rgb(92, 64, 18)),
+                                                                    .color(pal.warn_fg),
                                                             );
                                                         }
                                                         if item.is_thread {
                                                             let (badge, bcol) = if item.resolved {
-                                                                ("已解决", Color32::from_rgb(22, 128, 72))
+                                                                ("已解决", pal.accent)
                                                             } else {
-                                                                ("未解决", Color32::from_rgb(180, 83, 9))
+                                                                ("未解决", pal.warn_fg)
                                                             };
                                                             ui.label(
                                                                 egui::RichText::new(format!(
                                                                     "[{badge}·{}]",
                                                                     item.reply_count
                                                                 ))
-                                                                .size(10.5)
+                                                                .size(11.0)
                                                                 .color(bcol),
                                                             );
                                                         }
@@ -1970,8 +1974,8 @@ impl SheetApp {
                                                             item.cell_value.chars().take(36).collect();
                                                         ui.label(
                                                             egui::RichText::new(format!("格值: {val_snip}"))
-                                                                .size(10.5)
-                                                                .color(ui_kit::TEXT_WEAK),
+                                                                .size(11.0)
+                                                                .color(pal.text_weak),
                                                         );
                                                     }
 
@@ -1980,7 +1984,7 @@ impl SheetApp {
                                                         egui::Label::new(
                                                             egui::RichText::new(&item.text)
                                                                 .size(12.0)
-                                                                .color(Color32::from_rgb(31, 41, 55)),
+                                                                .color(pal.text),
                                                         )
                                                         .selectable(true)
                                                         .wrap(),
@@ -2007,7 +2011,7 @@ impl SheetApp {
                                                                 .frame(false),
                                                             )
                                                         };
-                                                        if mini(ui, "复制", ui_kit::TEXT_WEAK).clicked() {
+                                                        if mini(ui, "复制", pal.text_weak).clicked() {
                                                             actions.push(PanelAction::CopyText(
                                                                 item.cell_addr.clone(),
                                                                 item.text.clone(),
@@ -2017,9 +2021,9 @@ impl SheetApp {
                                                             ui,
                                                             if pinned { "取消固定" } else { "固定" },
                                                             if pinned {
-                                                                Color32::from_rgb(29, 78, 216)
+                                                                pal.info_fg
                                                             } else {
-                                                                ui_kit::TEXT_WEAK
+                                                                pal.text_weak
                                                             },
                                                         )
                                                         .clicked()
@@ -2031,7 +2035,7 @@ impl SheetApp {
                                                             ));
                                                         }
                                                         if !edit_blocked {
-                                                            if mini(ui, "编辑", ui_kit::TEXT).clicked() {
+                                                            if mini(ui, "编辑", pal.text).clicked() {
                                                                 actions.push(PanelAction::Edit(
                                                                     item.sheet_idx,
                                                                     item.row,
@@ -2043,7 +2047,7 @@ impl SheetApp {
                                                             if mini(
                                                                 ui,
                                                                 if is_replying { "收起回复" } else { "回复" },
-                                                                Color32::from_rgb(29, 78, 216),
+                                                                pal.info_fg,
                                                             )
                                                             .clicked()
                                                             {
@@ -2063,7 +2067,7 @@ impl SheetApp {
                                                             if mini(
                                                                 ui,
                                                                 if next_res { "标记解决" } else { "重开" },
-                                                                Color32::from_rgb(22, 128, 72),
+                                                                pal.accent,
                                                             )
                                                             .clicked()
                                                             {
@@ -2074,7 +2078,7 @@ impl SheetApp {
                                                                     next_res,
                                                                 ));
                                                             }
-                                                            if mini(ui, "删", Color32::from_rgb(185, 28, 28))
+                                                            if mini(ui, "删", pal.err_fg)
                                                                 .clicked()
                                                             {
                                                                 actions.push(PanelAction::DeleteOne(

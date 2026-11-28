@@ -837,12 +837,13 @@ impl SheetApp {
                         reanalyze_range = true;
                     }
                     ui.separator();
+                    let pal = crate::theme::palette();
                     let badge = |ui: &mut egui::Ui, txt: &str, col: Color32| {
                         egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 22))
+                            .fill(Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 26))
                             .stroke(Stroke::new(
                                 1.0,
-                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 90),
+                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 105),
                             ))
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(6, 2))
@@ -853,29 +854,30 @@ impl SheetApp {
                     badge(
                         ui,
                         &format!("{} 行 × {} 列", w.profile.rows, w.profile.cols),
-                        Color32::from_rgb(37, 99, 235),
+                        pal.info_fg,
                     );
                     if w.profile.cat_looks_temporal {
-                        badge(ui, "时间序列", Color32::from_rgb(14, 165, 233));
+                        badge(ui, "时间序列", pal.accent);
                     }
                     if w.profile.scale_ratio >= 5.0 {
                         badge(
                             ui,
                             &format!("量级差 {:.0}× · 宜双轴", w.profile.scale_ratio),
-                            Color32::from_rgb(217, 119, 6),
+                            pal.warn_fg,
                         );
                     }
                     if w.profile.has_negative {
-                        badge(ui, "含正负变动", Color32::from_rgb(220, 38, 38));
+                        badge(ui, "含正负变动", pal.err_fg);
                     }
                     if w.profile.monotonic_decreasing {
-                        badge(ui, "逐级递减 · 宜漏斗", Color32::from_rgb(124, 58, 237));
+                        badge(ui, "逐级递减 · 宜漏斗", pal.brand_ink());
                     }
                 });
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
 
+                let pal = crate::theme::palette();
                 ui.columns(2, |cols| {
                     // 左侧：智能推荐 + 22 种分类图型库
                     cols[0].vertical(|ui| {
@@ -888,14 +890,14 @@ impl SheetApp {
                                 for rec in &w.recs {
                                     let sel = w.selected_kind == rec.kind;
                                     let fill = if sel {
-                                        Color32::from_rgba_unmultiplied(37, 99, 235, 22)
+                                        pal.accent_tint
                                     } else {
-                                        Color32::from_rgb(248, 250, 252)
+                                        pal.surface_subtle()
                                     };
                                     let stroke = if sel {
-                                        Stroke::new(1.5, ui_kit::ACCENT)
+                                        Stroke::new(1.5, pal.accent)
                                     } else {
-                                        Stroke::new(1.0, Color32::from_rgb(226, 232, 240))
+                                        Stroke::new(1.0, pal.card_border)
                                     };
                                     let resp = egui::Frame::NONE
                                         .fill(fill)
@@ -908,24 +910,24 @@ impl SheetApp {
                                                 ui.label(
                                                     egui::RichText::new(rec.kind.label())
                                                         .strong()
-                                                        .size(12.5),
+                                                        .size(13.0),
                                                 );
                                                 egui::Frame::NONE
-                                                    .fill(Color32::from_rgb(224, 242, 254))
+                                                    .fill(pal.info_bg)
                                                     .corner_radius(4.0)
                                                     .inner_margin(egui::Margin::symmetric(5, 1))
                                                     .show(ui, |ui| {
                                                         ui.label(
                                                             egui::RichText::new(rec.badge)
-                                                                .size(10.0)
-                                                                .color(Color32::from_rgb(3, 105, 161)),
+                                                                .size(11.0)
+                                                                .color(pal.info_fg),
                                                         );
                                                     });
                                             });
                                             ui.label(
                                                 egui::RichText::new(&rec.reason)
                                                     .size(11.0)
-                                                    .color(Color32::from_rgb(100, 116, 139)),
+                                                    .color(pal.text_weak),
                                             );
                                         })
                                         .response
@@ -956,7 +958,7 @@ impl SheetApp {
                                     for &k in kinds {
                                         let active = w.selected_kind == k;
                                         let btn = egui::Button::new(
-                                            egui::RichText::new(k.label()).size(11.5),
+                                            egui::RichText::new(k.label()).size(12.0),
                                         )
                                         .selected(active)
                                         .min_size(Vec2::new(112.0, 26.0));
@@ -1009,7 +1011,7 @@ impl SheetApp {
                                     r,
                                     4.0,
                                     if sel {
-                                        Stroke::new(1.8, ui_kit::ACCENT)
+                                        Stroke::new(1.8, pal.accent)
                                     } else {
                                         Stroke::new(1.0, rgb(spec.border))
                                     },
@@ -1094,7 +1096,7 @@ impl SheetApp {
                             w.preview_chart.series.len()
                         ))
                         .size(11.0)
-                        .color(Color32::from_rgb(100, 116, 139)),
+                        .color(pal.text_weak),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui_kit::secondary_button(ui, "取消").clicked() {
@@ -1177,14 +1179,15 @@ impl SheetApp {
             };
         }
 
+        let pal = crate::theme::palette();
         egui::SidePanel::right("chart_studio_panel")
             .resizable(true)
             .default_width(318.0)
             .width_range(276.0..=440.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(224, 229, 236)))
+                    .fill(pal.card_bg)
+                    .stroke(Stroke::new(1.0_f32, pal.card_border))
                     .inner_margin(egui::Margin::symmetric(10, 8)),
             )
             .show(ctx, |ui| {
@@ -1193,8 +1196,8 @@ impl SheetApp {
                     ui.label(
                         egui::RichText::new("Chart Studio 设计器")
                             .strong()
-                            .size(13.5)
-                            .color(Color32::from_rgb(24, 34, 52)),
+                            .size(14.0)
+                            .color(pal.text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("✕").on_hover_text("关闭设计器").clicked() {
@@ -1209,7 +1212,7 @@ impl SheetApp {
                         chart_snapshot.series.len()
                     ))
                     .size(11.0)
-                    .color(Color32::from_rgb(100, 116, 139)),
+                    .color(pal.text_weak),
                 );
                 ui.add_space(6.0);
 
@@ -1419,12 +1422,13 @@ impl SheetApp {
                 }
             });
         });
+        let pal = crate::theme::palette();
         ui.add_space(3.0);
         for (cat_name, kinds) in CHART_CATEGORIES {
             ui.label(
                 egui::RichText::new(*cat_name)
-                    .size(10.5)
-                    .color(Color32::from_rgb(100, 116, 139)),
+                    .size(11.0)
+                    .color(pal.text_weak),
             );
             ui.horizontal_wrapped(|ui| {
                 for &k in *kinds {
@@ -1469,7 +1473,7 @@ impl SheetApp {
                     r,
                     5.0,
                     if sel {
-                        Stroke::new(1.8, ui_kit::ACCENT)
+                        Stroke::new(1.8, pal.accent)
                     } else {
                         Stroke::new(1.0, rgb(spec.border))
                     },
@@ -1486,7 +1490,7 @@ impl SheetApp {
                     Pos2::new(r.min.x + 48.0, r.center().y),
                     egui::Align2::LEFT_CENTER,
                     tid.label(),
-                    FontId::proportional(10.5),
+                    FontId::proportional(11.0),
                     rgb(spec.title_fg),
                 );
                 if resp.clicked() && !sel {
@@ -1752,6 +1756,7 @@ impl SheetApp {
             self.chart_studio.selected_series = 0;
         }
 
+        let pal = crate::theme::palette();
         // 系列清单条
         for (si, s) in snap.series.iter().enumerate() {
             let sel = self.chart_studio.selected_series == si;
@@ -1781,7 +1786,7 @@ impl SheetApp {
                     s.name.clone()
                 };
                 if ui
-                    .selectable_label(sel, egui::RichText::new(label).color(if s.hidden { Color32::GRAY } else { sc }))
+                    .selectable_label(sel, egui::RichText::new(label).color(if s.hidden { pal.text_muted } else { sc }))
                     .clicked()
                 {
                     self.chart_studio.selected_series = si;
@@ -1819,15 +1824,15 @@ impl SheetApp {
         let s = &snap.series[si];
         ui.add_space(6.0);
         egui::Frame::NONE
-            .fill(Color32::from_rgb(248, 250, 252))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(226, 232, 240)))
+            .fill(pal.surface_subtle())
+            .stroke(Stroke::new(1.0, pal.card_border))
             .corner_radius(6.0)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!("系列 #{} 精调", si + 1))
                         .strong()
-                        .size(11.5),
+                        .size(12.0),
                 );
                 let mut sname = s.name.clone();
                 ui.horizontal(|ui| {
@@ -2244,11 +2249,12 @@ impl SheetApp {
     }
 
     fn draw_studio_tab_labels(&mut self, ui: &mut egui::Ui, ci: usize, snap: &Chart) {
+        let pal = crate::theme::palette();
         ui.label(egui::RichText::new("图例设置").strong().size(12.0));
         ui.label(
             egui::RichText::new("提示：画布上单击图例项可显隐该系列，双击可单独聚焦")
-                .size(10.5)
-                .color(Color32::from_rgb(100, 116, 139)),
+                .size(11.0)
+                .color(pal.text_weak),
         );
         let mut show_leg = snap.legend;
         if ui.checkbox(&mut show_leg, "显示图例").changed() {
@@ -2879,6 +2885,7 @@ impl SheetApp {
                     ui.add_space(8.0);
                     ui.label("这张表还没有图表，点击右上角「+ 新建智能图表」即可基于当前选区快速生成。");
                 }
+                let pal = crate::theme::palette();
                 for (i, ch) in charts.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let title = if ch.title.is_empty() {
@@ -2897,7 +2904,7 @@ impl SheetApp {
                                 cell_name(ch.anchor.2, ch.anchor.3)
                             ))
                             .size(11.0)
-                            .color(Color32::from_rgb(100, 116, 139)),
+                            .color(pal.text_weak),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("删除").clicked() {

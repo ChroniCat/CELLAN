@@ -247,7 +247,7 @@ pub(crate) fn style_preset_visuals(id: &str) -> (Color32, Color32, bool) {
         "StyleAccentGreen20" => (Color32::from_rgb(226, 239, 218), Color32::from_rgb(56, 87, 35), false),
         "StyleAccentOrange20" => (Color32::from_rgb(252, 228, 214), Color32::from_rgb(198, 89, 17), false),
         "StyleComma0" | "StyleCurrency0" => (Color32::from_rgb(248, 250, 252), Color32::from_rgb(30, 41, 59), false),
-        _ => (Color32::WHITE, ui_kit::TEXT, false),
+        _ => (Color32::WHITE, Color32::from_rgb(31, 35, 41), false),
     }
 }
 
@@ -2687,6 +2687,7 @@ impl SheetApp {
         let mut close = false;
         let mut exec_ref = false;
         let mut exec_special: Option<SpecialTarget> = None;
+        let pal = crate::theme::palette();
         ui_kit::window(ctx, "定位", 380.0).open(&mut open).show(ctx, |ui| {
             ui.set_width(350.0);
             ui_kit::dialog_tabs(ui, &mut st.tab, &["定位引用", "定位条件"]);
@@ -2705,7 +2706,7 @@ impl SheetApp {
                 });
                 if !self.wb.names.is_empty() {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("工作簿名称:").size(11.5).color(ui_kit::TEXT_WEAK));
+                    ui.label(RichText::new("工作簿名称:").size(12.0).color(pal.text_weak));
                     egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
                         for (name, _, refers) in &self.wb.names {
                             let label = format!("{name}  ({refers})");
@@ -2748,7 +2749,7 @@ impl SheetApp {
                     ui.add_space(4.0);
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("子类型:").size(11.5).color(ui_kit::TEXT_WEAK));
+                        ui.label(RichText::new("子类型:").size(12.0).color(pal.text_weak));
                         ui.checkbox(&mut st.sub_numbers, "数字");
                         ui.checkbox(&mut st.sub_text, "文本");
                         ui.checkbox(&mut st.sub_bools, "逻辑值");

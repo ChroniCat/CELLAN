@@ -1913,6 +1913,7 @@ impl SheetApp {
         let mut jump_preview = false;
         let mut undo_requested = false;
         let mut clear_chat = false;
+        let pal = crate::theme::palette();
 
         egui::SidePanel::right("wps_ai_panel")
             .resizable(true)
@@ -1921,7 +1922,7 @@ impl SheetApp {
             .width_range(316.0..=520.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(ui_kit::PAGE_BG)
+                    .fill(pal.page_bg)
                     .inner_margin(egui::Margin {
                         left: 0,
                         right: 8,
@@ -1948,14 +1949,14 @@ impl SheetApp {
                 }
 
                 egui::Frame::NONE
-                    .fill(Color32::WHITE)
-                    .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                    .fill(pal.card_bg)
+                    .stroke(Stroke::new(1.0_f32, pal.card_border))
                     .corner_radius(ui_kit::CARD_R)
                     .shadow(egui::epaint::Shadow {
                         offset: [0, 2],
                         blur: 8,
                         spread: 0,
-                        color: Color32::from_black_alpha(14),
+                        color: pal.shadow_color(),
                     })
                     .inner_margin(egui::Margin::same(0))
                     .show(ui, |ui| {
@@ -1964,7 +1965,7 @@ impl SheetApp {
                         ui.set_max_size(inner_rect.size());
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-                        // 1. 顶部工具栏式卡片头（浅灰蓝微底 + 品牌星标徽章 + 胶囊动作按钮）
+                        // 1. 顶部工具栏式卡片头（浅微底 + 品牌星标徽章 + 胶囊动作按钮）
                         let hdr_h = 40.0;
                         let (hdr_rect, _) = ui.allocate_exact_size(
                             Vec2::new(inner_rect.width(), hdr_h),
@@ -1978,14 +1979,14 @@ impl SheetApp {
                                 sw: 0,
                                 se: 0,
                             },
-                            Color32::from_rgb(250, 251, 253),
+                            pal.surface_subtle(),
                         );
                         ui.painter().line_segment(
                             [
                                 egui::pos2(hdr_rect.left(), hdr_rect.bottom()),
                                 egui::pos2(hdr_rect.right(), hdr_rect.bottom()),
                             ],
-                            Stroke::new(1.0_f32, ui_kit::SEP),
+                            Stroke::new(1.0_f32, pal.chrome_separator()),
                         );
 
                         let hdr_inner = hdr_rect.shrink2(Vec2::new(9.0, 6.0));
@@ -1997,16 +1998,12 @@ impl SheetApp {
                         hdr_ui.spacing_mut().item_spacing.x = 6.0;
                         let (badge_r, _) =
                             hdr_ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-                        hdr_ui.painter().rect_filled(
-                            badge_r,
-                            6.0,
-                            Color32::from_rgba_unmultiplied(27, 53, 129, 18),
-                        );
+                        hdr_ui.painter().rect_filled(badge_r, 6.0, pal.info_bg);
                         ui_icons::draw_excel(
                             hdr_ui.painter(),
                             badge_r.shrink(4.5),
                             Icon::AiSparkle,
-                            ui_kit::BRAND_NAVY,
+                            pal.brand_ink(),
                             true,
                         );
                         let title_w = 52.0;
@@ -2018,7 +2015,7 @@ impl SheetApp {
                             Align2::LEFT_CENTER,
                             "AI 助手",
                             14.0,
-                            ui_kit::TEXT,
+                            pal.text,
                         );
                         if self.ai.busy {
                             let round_txt =
@@ -2026,7 +2023,7 @@ impl SheetApp {
                             let rg = hdr_ui.painter().layout_no_wrap(
                                 round_txt.clone(),
                                 FontId::proportional(11.0),
-                                ui_kit::ACCENT,
+                                pal.accent,
                             );
                             let (pill_r, _) = hdr_ui.allocate_exact_size(
                                 Vec2::new(rg.size().x + 12.0, 20.0),
@@ -2035,8 +2032,8 @@ impl SheetApp {
                             hdr_ui.painter().rect(
                                 pill_r,
                                 10.0,
-                                Color32::from_rgb(236, 246, 240),
-                                Stroke::new(1.0_f32, Color32::from_rgb(190, 226, 204)),
+                                pal.accent_tint,
+                                Stroke::new(1.0_f32, pal.accent_border()),
                                 egui::StrokeKind::Inside,
                             );
                             hdr_ui.painter().text(
@@ -2044,7 +2041,7 @@ impl SheetApp {
                                 Align2::CENTER_CENTER,
                                 round_txt,
                                 FontId::proportional(11.0),
-                                ui_kit::ACCENT,
+                                pal.accent,
                             );
                         }
 
@@ -2060,7 +2057,7 @@ impl SheetApp {
                                         Vec2::new(1.0, 14.0),
                                         Sense::hover(),
                                     );
-                                    ui.painter().rect_filled(sep, 0.0, ui_kit::CARD_BORDER);
+                                    ui.painter().rect_filled(sep, 0.0, pal.card_border);
                                     if ai_header_chip(
                                         ui,
                                         "设置",
@@ -2109,8 +2106,8 @@ impl SheetApp {
                         // 2a. 可折叠模型设置子卡片
                         if self.ai.settings_open && !self.ai.busy {
                             egui::Frame::NONE
-                                .fill(Color32::from_rgb(248, 250, 253))
-                                .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                                .fill(pal.surface_subtle())
+                                .stroke(Stroke::new(1.0_f32, pal.card_border))
                                 .corner_radius(8.0)
                                 .inner_margin(egui::Margin::same(10))
                                 .show(&mut body_ui, |ui| {
@@ -2126,12 +2123,12 @@ impl SheetApp {
                                         Align2::LEFT_CENTER,
                                         "模型服务配置",
                                         12.0,
-                                        ui_kit::TEXT,
+                                        pal.text,
                                     );
                                     ui.label(
                                         egui::RichText::new("显示名称")
                                             .size(11.0)
-                                            .color(ui_kit::TEXT_WEAK),
+                                            .color(pal.text_weak),
                                     );
                                     ui_kit::text_input(
                                         ui,
@@ -2141,7 +2138,7 @@ impl SheetApp {
                                     ui.label(
                                         egui::RichText::new("接口地址 (OpenAI 兼容)")
                                             .size(11.0)
-                                            .color(ui_kit::TEXT_WEAK),
+                                            .color(pal.text_weak),
                                     );
                                     ui_kit::text_input(
                                         ui,
@@ -2151,7 +2148,7 @@ impl SheetApp {
                                     ui.label(
                                         egui::RichText::new("模型 ID")
                                             .size(11.0)
-                                            .color(ui_kit::TEXT_WEAK),
+                                            .color(pal.text_weak),
                                     );
                                     ui_kit::text_input(
                                         ui,
@@ -2173,13 +2170,13 @@ impl SheetApp {
                                         ui.label(
                                             egui::RichText::new("API Key")
                                                 .size(11.0)
-                                                .color(ui_kit::TEXT_WEAK),
+                                                .color(pal.text_weak),
                                         );
                                         if !self.ai.draft_cfg.has_api_key() {
                                             ui.label(
                                                 egui::RichText::new("（请填写个人密钥）")
                                                     .size(11.0)
-                                                    .color(ui_kit::TEXT_WEAK),
+                                                    .color(pal.text_weak),
                                             );
                                         }
                                         ui.with_layout(
@@ -2254,8 +2251,8 @@ impl SheetApp {
                         // 2b. 破坏性/覆盖写入确认卡片
                         if let Some(label) = &self.ai.confirmation_label {
                             egui::Frame::NONE
-                                .fill(Color32::from_rgb(255, 251, 235))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(245, 196, 81)))
+                                .fill(pal.warn_bg)
+                                .stroke(Stroke::new(1.0_f32, pal.warn_border()))
                                 .inner_margin(egui::Margin::same(10))
                                 .corner_radius(8.0)
                                 .show(&mut body_ui, |ui| {
@@ -2266,11 +2263,7 @@ impl SheetApp {
                                             Vec2::new(3.0, 16.0),
                                             Sense::hover(),
                                         );
-                                        ui.painter().rect_filled(
-                                            bar,
-                                            1.5,
-                                            Color32::from_rgb(217, 119, 6),
-                                        );
+                                        ui.painter().rect_filled(bar, 1.5, pal.warn_fg);
                                         let (tr, _) = ui.allocate_exact_size(
                                             Vec2::new(120.0, 16.0),
                                             Sense::hover(),
@@ -2281,7 +2274,7 @@ impl SheetApp {
                                             Align2::LEFT_CENTER,
                                             "确认修改工作表",
                                             12.0,
-                                            Color32::from_rgb(146, 64, 14),
+                                            pal.warn_fg,
                                         );
                                     });
                                     egui::ScrollArea::vertical()
@@ -2292,7 +2285,7 @@ impl SheetApp {
                                                 egui::Label::new(
                                                     egui::RichText::new(label)
                                                         .size(12.0)
-                                                        .color(ui_kit::TEXT),
+                                                        .color(pal.text),
                                                 )
                                                 .wrap(),
                                             );
@@ -2321,7 +2314,7 @@ impl SheetApp {
                         egui::TopBottomPanel::bottom("wps_ai_composer")
                             .resizable(false)
                             .show_separator_line(false)
-                            .frame(egui::Frame::NONE.fill(Color32::WHITE).inner_margin(
+                            .frame(egui::Frame::NONE.fill(pal.card_bg).inner_margin(
                                 egui::Margin {
                                     left: 0,
                                     right: 0,
@@ -2334,7 +2327,7 @@ impl SheetApp {
                                 let sep_w = ui.available_width();
                                 let (sep_r, _) =
                                     ui.allocate_exact_size(Vec2::new(sep_w, 1.0), Sense::hover());
-                                ui.painter().rect_filled(sep_r, 0.0, ui_kit::SEP);
+                                ui.painter().rect_filled(sep_r, 0.0, pal.chrome_separator());
 
                                 // 选区上下文胶囊 + 状态提示行
                                 let (r1, c1, r2, c2) = self.sel_rect();
@@ -2360,7 +2353,7 @@ impl SheetApp {
                                     let cg = ui.painter().layout_no_wrap(
                                         ctx_short.clone(),
                                         FontId::proportional(11.0),
-                                        ui_kit::TEXT,
+                                        pal.text,
                                     );
                                     let chip_w = cg.size().x + 24.0;
                                     let (chip_r, chip_resp) = ui.allocate_exact_size(
@@ -2370,8 +2363,8 @@ impl SheetApp {
                                     ui.painter().rect(
                                         chip_r,
                                         5.0,
-                                        Color32::from_rgb(243, 246, 250),
-                                        Stroke::new(1.0_f32, Color32::from_rgb(222, 228, 238)),
+                                        pal.surface_subtle(),
+                                        Stroke::new(1.0_f32, pal.card_border),
                                         egui::StrokeKind::Inside,
                                     );
                                     ui_icons::draw(
@@ -2381,14 +2374,14 @@ impl SheetApp {
                                             Vec2::splat(11.0),
                                         ),
                                         Icon::Grid,
-                                        ui_kit::BRAND_NAVY,
+                                        pal.brand_ink(),
                                     );
                                     ui.painter().text(
                                         egui::pos2(chip_r.left() + 19.0, chip_r.center().y),
                                         Align2::LEFT_CENTER,
                                         ctx_short,
                                         FontId::proportional(11.0),
-                                        Color32::from_rgb(51, 65, 85),
+                                        pal.text,
                                     );
                                     chip_resp.on_hover_text(format!("当前选区上下文：{ctx_lbl}"));
 
@@ -2401,9 +2394,9 @@ impl SheetApp {
                                             rem_w,
                                         );
                                         let st_col = if last_has_err {
-                                            Color32::from_rgb(196, 43, 28)
+                                            pal.err_fg
                                         } else {
-                                            ui_kit::ACCENT
+                                            pal.accent
                                         };
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -2472,13 +2465,13 @@ impl SheetApp {
                                     enter_send = true;
                                 }
                                 let box_bg = if had_focus {
-                                    Color32::WHITE
+                                    pal.grid_bg
                                 } else {
-                                    Color32::from_rgb(248, 250, 252)
+                                    pal.surface_subtle()
                                 };
                                 let box_resp = egui::Frame::NONE
                                     .fill(box_bg)
-                                    .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                                    .stroke(Stroke::new(1.0_f32, pal.card_border))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::symmetric(10, 8))
                                     .show(ui, |ui| {
@@ -2497,7 +2490,7 @@ impl SheetApp {
                                                         "输入需求，例如：按部门汇总金额并把负数标红",
                                                     )
                                                     .size(12.0)
-                                                    .color(Color32::from_rgb(148, 163, 184)),
+                                                    .color(pal.text_muted),
                                                 ),
                                         )
                                     });
@@ -2514,17 +2507,14 @@ impl SheetApp {
                                 if te_resp.has_focus() {
                                     ui.painter().rect_stroke(
                                         box_resp.response.rect.expand(1.5),
-                                        9.5,
-                                        Stroke::new(
-                                            2.5_f32,
-                                            Color32::from_rgba_unmultiplied(33, 115, 70, 26),
-                                        ),
+                                        9.0,
+                                        Stroke::new(2.5_f32, pal.accent.gamma_multiply(0.22)),
                                         egui::StrokeKind::Outside,
                                     );
                                     ui.painter().rect_stroke(
                                         box_resp.response.rect,
                                         8.0,
-                                        Stroke::new(1.5_f32, ui_kit::ACCENT),
+                                        Stroke::new(1.5_f32, pal.accent),
                                         egui::StrokeKind::Inside,
                                     );
                                 }
@@ -2539,7 +2529,7 @@ impl SheetApp {
                                     ui.label(
                                         egui::RichText::new("Enter 发送 · Shift+Enter 换行")
                                             .size(11.0)
-                                            .color(ui_kit::TEXT_WEAK),
+                                            .color(pal.text_weak),
                                     );
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -2569,8 +2559,8 @@ impl SheetApp {
                                 ui.spacing_mut().item_spacing.y = 10.0;
                                 if self.ai.messages.is_empty() {
                                     egui::Frame::NONE
-                                        .fill(Color32::from_rgb(248, 250, 253))
-                                        .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                                        .fill(pal.surface_subtle())
+                                        .stroke(Stroke::new(1.0_f32, pal.card_border))
                                         .corner_radius(8.0)
                                         .inner_margin(egui::Margin::same(12))
                                         .show(ui, |ui| {
@@ -2586,14 +2576,14 @@ impl SheetApp {
                                                 Align2::LEFT_CENTER,
                                                 "常用表格任务",
                                                 12.0,
-                                                ui_kit::TEXT,
+                                                pal.text,
                                             );
                                             ui.painter().text(
                                                 egui::pos2(wh.right(), wh.center().y),
                                                 Align2::RIGHT_CENTER,
                                                 format!("支持连续 {MAX_TOOL_ROUNDS} 轮推理与撤销"),
                                                 FontId::proportional(11.0),
-                                                ui_kit::TEXT_WEAK,
+                                                pal.text_weak,
                                             );
                                             for (icon, sample) in [
                                                 (Icon::Chart, "总结当前工作表的数据结构与关键指标"),
@@ -2610,16 +2600,16 @@ impl SheetApp {
                                                     cr,
                                                     6.0,
                                                     if hovered {
-                                                        Color32::from_rgb(243, 249, 245)
+                                                        pal.accent_tint
                                                     } else {
-                                                        Color32::WHITE
+                                                        pal.card_bg
                                                     },
                                                     Stroke::new(
                                                         1.0_f32,
                                                         if hovered {
-                                                            ui_kit::ACCENT
+                                                            pal.accent
                                                         } else {
-                                                            Color32::from_rgb(220, 227, 237)
+                                                            pal.card_border
                                                         },
                                                     ),
                                                     egui::StrokeKind::Inside,
@@ -2632,7 +2622,7 @@ impl SheetApp {
                                                     ui.painter(),
                                                     ir,
                                                     icon,
-                                                    ui_kit::BRAND_NAVY,
+                                                    pal.brand_ink(),
                                                     true,
                                                 );
                                                 let (txt_fit, _) = elide_to_width(
@@ -2646,15 +2636,15 @@ impl SheetApp {
                                                     Align2::LEFT_CENTER,
                                                     txt_fit,
                                                     FontId::proportional(12.0),
-                                                    ui_kit::TEXT,
+                                                    pal.text,
                                                 );
                                                 ui_kit::caret_right(
                                                     ui,
                                                     egui::pos2(cr.right() - 11.0, cr.center().y),
                                                     if hovered {
-                                                        ui_kit::ACCENT
+                                                        pal.accent
                                                     } else {
-                                                        ui_kit::TEXT_WEAK
+                                                        pal.text_weak
                                                     },
                                                 );
                                                 if hovered {
@@ -2701,10 +2691,10 @@ impl SheetApp {
                                                 egui::Layout::right_to_left(egui::Align::TOP),
                                                 |ui| {
                                                     egui::Frame::NONE
-                                                        .fill(Color32::from_rgb(236, 246, 240))
+                                                        .fill(pal.accent_tint)
                                                         .stroke(Stroke::new(
                                                             1.0_f32,
-                                                            Color32::from_rgb(194, 226, 206),
+                                                            pal.accent_border(),
                                                         ))
                                                         .corner_radius(8.0)
                                                         .inner_margin(egui::Margin::symmetric(11, 8))
@@ -2717,7 +2707,7 @@ impl SheetApp {
                                                                 egui::Label::new(
                                                                     egui::RichText::new(txt)
                                                                         .size(12.0)
-                                                                        .color(ui_kit::TEXT),
+                                                                        .color(pal.text),
                                                                 )
                                                                 .wrap(),
                                                             );
@@ -2785,8 +2775,8 @@ impl SheetApp {
                                             let mut toggle_reason = false;
 
                                             let card_resp = egui::Frame::NONE
-                                                .fill(Color32::from_rgb(250, 251, 253))
-                                                .stroke(Stroke::new(1.0_f32, ui_kit::CARD_BORDER))
+                                                .fill(pal.surface_subtle())
+                                                .stroke(Stroke::new(1.0_f32, pal.card_border))
                                                 .corner_radius(8.0)
                                                 .inner_margin(egui::Margin::symmetric(11, 10))
                                                 .show(ui, |ui| {
@@ -2803,14 +2793,11 @@ impl SheetApp {
                                                             hdr,
                                                             5.0,
                                                             if hresp.hovered() {
-                                                                Color32::from_rgb(233, 239, 247)
+                                                                pal.hover
                                                             } else {
-                                                                Color32::from_rgb(241, 245, 249)
+                                                                pal.header_bg
                                                             },
-                                                            Stroke::new(
-                                                                1.0_f32,
-                                                                Color32::from_rgb(224, 230, 239),
-                                                            ),
+                                                            Stroke::new(1.0_f32, pal.card_border),
                                                             egui::StrokeKind::Inside,
                                                         );
                                                         if reason_open {
@@ -2820,7 +2807,7 @@ impl SheetApp {
                                                                     hdr.left() + 10.0,
                                                                     hdr.center().y,
                                                                 ),
-                                                                ui_kit::TEXT_WEAK,
+                                                                pal.text_weak,
                                                             );
                                                         } else {
                                                             ui_kit::caret_right(
@@ -2829,7 +2816,7 @@ impl SheetApp {
                                                                     hdr.left() + 10.0,
                                                                     hdr.center().y,
                                                                 ),
-                                                                ui_kit::TEXT_WEAK,
+                                                                pal.text_weak,
                                                             );
                                                         }
                                                         ui.painter().text(
@@ -2844,7 +2831,7 @@ impl SheetApp {
                                                                 "已深度思考 · 点击展开"
                                                             },
                                                             FontId::proportional(11.0),
-                                                            ui_kit::TEXT_WEAK,
+                                                            pal.text_weak,
                                                         );
                                                         if hresp.hovered() {
                                                             ui.ctx().set_cursor_icon(
@@ -2856,12 +2843,10 @@ impl SheetApp {
                                                         }
                                                         if reason_open {
                                                             egui::Frame::NONE
-                                                                .fill(Color32::WHITE)
+                                                                .fill(pal.card_bg)
                                                                 .stroke(Stroke::new(
                                                                     1.0_f32,
-                                                                    Color32::from_rgb(
-                                                                        226, 232, 240,
-                                                                    ),
+                                                                    pal.card_border,
                                                                 ))
                                                                 .corner_radius(6.0)
                                                                 .inner_margin(
@@ -2882,7 +2867,7 @@ impl SheetApp {
                                                                                 ui,
                                                                                 msg.reasoning.as_str(),
                                                                                 11.0,
-                                                                                ui_kit::TEXT_WEAK,
+                                                                                pal.text_weak,
                                                                             );
                                                                         });
                                                                 });
@@ -2892,10 +2877,10 @@ impl SheetApp {
                                                     // 工具步骤子卡片（可折叠 + 限高滚动 + 带语义图标胶囊行）
                                                     if !msg.tool_logs.is_empty() {
                                                         egui::Frame::NONE
-                                                            .fill(Color32::from_rgb(243, 246, 251))
+                                                            .fill(pal.header_bg)
                                                             .stroke(Stroke::new(
                                                                 1.0_f32,
-                                                                Color32::from_rgb(222, 229, 239),
+                                                                pal.card_border,
                                                             ))
                                                             .corner_radius(6.0)
                                                             .inner_margin(egui::Margin::same(7))
@@ -2915,9 +2900,7 @@ impl SheetApp {
                                                                     ui.painter().rect_filled(
                                                                         th,
                                                                         4.0,
-                                                                        Color32::from_rgb(
-                                                                            234, 240, 248,
-                                                                        ),
+                                                                        pal.hover,
                                                                     );
                                                                     ui.ctx().set_cursor_icon(
                                                                         egui::CursorIcon::PointingHand,
@@ -2933,7 +2916,7 @@ impl SheetApp {
                                                                         Vec2::splat(13.0),
                                                                     ),
                                                                     Icon::Calc,
-                                                                    ui_kit::BRAND_NAVY,
+                                                                    pal.brand_ink(),
                                                                     true,
                                                                 );
                                                                 ui_kit::paint_medium(
@@ -2945,7 +2928,7 @@ impl SheetApp {
                                                                     Align2::LEFT_CENTER,
                                                                     "表格操作步骤",
                                                                     11.0,
-                                                                    ui_kit::TEXT,
+                                                                    pal.text,
                                                                 );
                                                                 let cnt_txt =
                                                                     format!("{} 步", msg.tool_logs.len());
@@ -2953,31 +2936,29 @@ impl SheetApp {
                                                                     ui.painter().layout_no_wrap(
                                                                         cnt_txt.clone(),
                                                                         FontId::proportional(11.0),
-                                                                        ui_kit::ACCENT,
+                                                                        pal.accent,
                                                                     );
                                                                 let cnt_r = Rect::from_min_size(
                                                                     egui::pos2(
                                                                         th.left() + 92.0,
-                                                                        th.center().y - 8.5,
+                                                                        th.center().y - 8.0,
                                                                     ),
                                                                     Vec2::new(
                                                                         cg.size().x + 10.0,
-                                                                        17.0,
+                                                                        16.0,
                                                                     ),
                                                                 );
                                                                 ui.painter().rect_filled(
                                                                     cnt_r,
-                                                                    8.5,
-                                                                    Color32::from_rgb(
-                                                                        228, 242, 234,
-                                                                    ),
+                                                                    8.0,
+                                                                    pal.accent_tint,
                                                                 );
                                                                 ui.painter().text(
                                                                     cnt_r.center(),
                                                                     Align2::CENTER_CENTER,
                                                                     cnt_txt,
                                                                     FontId::proportional(11.0),
-                                                                    ui_kit::ACCENT,
+                                                                    pal.accent,
                                                                 );
                                                                 ui.painter().text(
                                                                     egui::pos2(
@@ -2991,7 +2972,7 @@ impl SheetApp {
                                                                         "展开"
                                                                     },
                                                                     FontId::proportional(11.0),
-                                                                    ui_kit::TEXT_WEAK,
+                                                                    pal.text_weak,
                                                                 );
                                                                 if tools_open {
                                                                     ui_kit::caret(
@@ -3000,7 +2981,7 @@ impl SheetApp {
                                                                             th.right() - 8.0,
                                                                             th.center().y,
                                                                         ),
-                                                                        ui_kit::TEXT_WEAK,
+                                                                        pal.text_weak,
                                                                     );
                                                                 } else {
                                                                     ui_kit::caret_right(
@@ -3009,7 +2990,7 @@ impl SheetApp {
                                                                             th.right() - 8.0,
                                                                             th.center().y,
                                                                         ),
-                                                                        ui_kit::TEXT_WEAK,
+                                                                        pal.text_weak,
                                                                     );
                                                                 }
                                                                 if tresp.clicked() {
@@ -3053,7 +3034,7 @@ impl SheetApp {
                                                             ui,
                                                             msg.content.as_str(),
                                                             12.0,
-                                                            ui_kit::TEXT,
+                                                            pal.text,
                                                         );
                                                     } else if is_last
                                                         && ai_busy
@@ -3064,17 +3045,17 @@ impl SheetApp {
                                                                 "正在推理与生成答复…",
                                                             )
                                                             .size(12.0)
-                                                            .color(ui_kit::TEXT_WEAK),
+                                                            .color(pal.text_weak),
                                                         );
                                                     }
 
                                                     // 错误提示横幅卡片
                                                     if let Some(err) = msg.error.as_deref() {
                                                         egui::Frame::NONE
-                                                            .fill(Color32::from_rgb(254, 242, 242))
+                                                            .fill(pal.err_bg)
                                                             .stroke(Stroke::new(
                                                                 1.0_f32,
-                                                                Color32::from_rgb(252, 202, 202),
+                                                                pal.err_border(),
                                                             ))
                                                             .corner_radius(6.0)
                                                             .inner_margin(egui::Margin::symmetric(
@@ -3091,21 +3072,15 @@ impl SheetApp {
                                                                     ui.painter().rect_filled(
                                                                         bar,
                                                                         1.5,
-                                                                        Color32::from_rgb(
-                                                                            196, 43, 28,
-                                                                        ),
+                                                                        pal.err_fg,
                                                                     );
                                                                     ui.add(
                                                                         egui::Label::new(
                                                                             egui::RichText::new(
                                                                                 err,
                                                                             )
-                                                                            .size(11.5)
-                                                                            .color(
-                                                                                Color32::from_rgb(
-                                                                                    168, 28, 28,
-                                                                                ),
-                                                                            ),
+                                                                            .size(12.0)
+                                                                            .color(pal.err_fg),
                                                                         )
                                                                         .wrap(),
                                                                     );
@@ -3122,7 +3097,7 @@ impl SheetApp {
                                                         ui.painter().rect_filled(
                                                             sep_r,
                                                             0.0,
-                                                            Color32::from_rgb(228, 233, 241),
+                                                            pal.chrome_separator(),
                                                         );
                                                         ui.horizontal_wrapped(|ui| {
                                                             ui.spacing_mut().item_spacing =
@@ -3168,11 +3143,11 @@ impl SheetApp {
                                 }
                             });
 
-                        // 收尾再描一遍 1px 悬浮白卡外框，保证顶部栏与滚动区不会压住四角描边
+                        // 收尾再描一遍 1px 悬浮卡片外框，保证顶部栏与滚动区不会压住四角描边
                         ui.painter().rect_stroke(
                             card_rect,
                             egui::CornerRadius::same(ui_kit::CARD_R),
-                            Stroke::new(1.0_f32, ui_kit::CARD_BORDER),
+                            Stroke::new(1.0_f32, pal.card_border),
                             egui::StrokeKind::Inside,
                         );
                     });
@@ -3289,6 +3264,7 @@ fn elide_to_width(
 }
 
 fn ai_header_chip(ui: &mut egui::Ui, label: &str, active: bool, tip: &str) -> egui::Response {
+    let pal = crate::theme::palette();
     let font = if active {
         ui_kit::medium_in(ui.ctx(), 12.0)
     } else {
@@ -3300,29 +3276,21 @@ fn ai_header_chip(ui: &mut egui::Ui, label: &str, active: bool, tip: &str) -> eg
     let size = Vec2::new(galley.size().x + 16.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let (bg, border, fg) = if active {
-        (
-            Color32::from_rgba_unmultiplied(27, 53, 129, 18),
-            ui_kit::BRAND_NAVY,
-            ui_kit::BRAND_NAVY,
-        )
+        (pal.info_bg, pal.brand_ink(), pal.brand_ink())
     } else if resp.is_pointer_button_down_on() {
         (
-            ui_kit::PRESSED,
-            Color32::from_rgb(176, 186, 201),
-            ui_kit::TEXT,
+            pal.pressed,
+            pal.card_border.lerp_to_gamma(pal.text, 0.25),
+            pal.text,
         )
     } else if resp.hovered() {
         (
-            ui_kit::HOVER,
-            Color32::from_rgb(186, 196, 212),
-            ui_kit::TEXT,
+            pal.hover,
+            pal.card_border.lerp_to_gamma(pal.text, 0.2),
+            pal.text,
         )
     } else {
-        (
-            Color32::WHITE,
-            Color32::from_rgb(218, 225, 235),
-            Color32::from_rgb(51, 65, 85),
-        )
+        (pal.card_bg, pal.card_border, pal.text)
     };
     ui.painter()
         .rect(rect, 5.0, bg, Stroke::new(1.0_f32, border), egui::StrokeKind::Inside);
@@ -3333,16 +3301,17 @@ fn ai_header_chip(ui: &mut egui::Ui, label: &str, active: bool, tip: &str) -> eg
 }
 
 fn ai_close_btn(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    let pal = crate::theme::palette();
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
     if resp.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 5.0, ui_kit::PRESSED);
+        ui.painter().rect_filled(rect, 5.0, pal.pressed);
     } else if resp.hovered() {
-        ui.painter().rect_filled(rect, 5.0, ui_kit::HOVER);
+        ui.painter().rect_filled(rect, 5.0, pal.hover);
     }
     let col = if resp.hovered() {
-        ui_kit::TEXT
+        pal.text
     } else {
-        Color32::from_rgb(100, 116, 139)
+        pal.text_weak
     };
     let k = 4.0;
     let st = Stroke::new(1.25_f32, col);
@@ -3371,6 +3340,7 @@ fn ai_action_capsule(
     accent_style: bool,
     tip: &str,
 ) -> egui::Response {
+    let pal = crate::theme::palette();
     let font = ui_kit::medium_in(ui.ctx(), 12.0);
     let galley = ui
         .painter()
@@ -3380,37 +3350,33 @@ fn ai_action_capsule(
     let (bg, border, fg) = if accent_style {
         if resp.is_pointer_button_down_on() {
             (
-                Color32::from_rgb(209, 234, 219),
-                ui_kit::ACCENT,
-                ui_kit::ACCENT,
+                pal.accent_tint.lerp_to_gamma(pal.accent, 0.22),
+                pal.accent,
+                pal.accent,
             )
         } else if resp.hovered() {
             (
-                Color32::from_rgb(223, 241, 230),
-                ui_kit::ACCENT,
-                ui_kit::ACCENT,
+                pal.accent_tint.lerp_to_gamma(pal.accent, 0.12),
+                pal.accent,
+                pal.accent,
             )
         } else {
-            (
-                Color32::from_rgb(236, 246, 240),
-                Color32::from_rgb(168, 213, 186),
-                ui_kit::ACCENT,
-            )
+            (pal.accent_tint, pal.accent_border(), pal.accent)
         }
     } else if resp.is_pointer_button_down_on() {
         (
-            ui_kit::PRESSED,
-            Color32::from_rgb(168, 178, 194),
-            ui_kit::TEXT,
+            pal.pressed,
+            pal.card_border.lerp_to_gamma(pal.text, 0.25),
+            pal.text,
         )
     } else if resp.hovered() {
         (
-            ui_kit::HOVER,
-            Color32::from_rgb(176, 186, 201),
-            ui_kit::TEXT,
+            pal.hover,
+            pal.card_border.lerp_to_gamma(pal.text, 0.2),
+            pal.text,
         )
     } else {
-        (Color32::WHITE, ui_kit::CARD_BORDER, ui_kit::TEXT)
+        (pal.card_bg, pal.card_border, pal.text)
     };
     ui.painter()
         .rect(rect, 6.0, bg, Stroke::new(1.0_f32, border), egui::StrokeKind::Inside);
@@ -3431,6 +3397,7 @@ fn ai_action_capsule(
 }
 
 fn ai_secret_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> egui::Response {
+    let pal = crate::theme::palette();
     let desired_w = ui.available_width().max(120.0);
     let (outer, _) = ui.allocate_exact_size(Vec2::new(desired_w, 34.0), Sense::hover());
     let bg_slot = ui.painter().add(egui::Shape::Noop);
@@ -3450,24 +3417,24 @@ fn ai_secret_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> egui::Res
             .hint_text(
                 egui::RichText::new(hint)
                     .size(12.0)
-                    .color(Color32::from_rgb(156, 163, 175)),
+                    .color(pal.text_muted),
             ),
     );
     let has_focus = te_resp.has_focus() || focused_id == Some(te_resp.id);
     let hovered = ui.rect_contains_pointer(outer);
     let bg = if has_focus {
-        Color32::WHITE
+        pal.grid_bg
     } else if hovered {
-        Color32::from_rgb(252, 252, 253)
+        pal.card_bg
     } else {
-        Color32::from_rgb(248, 249, 251)
+        pal.surface_subtle()
     };
     let border = if has_focus {
-        Stroke::new(1.5_f32, ui_kit::BRAND_NAVY)
+        Stroke::new(1.5_f32, pal.brand_ink())
     } else if hovered {
-        Stroke::new(1.0_f32, Color32::from_rgb(180, 186, 198))
+        Stroke::new(1.0_f32, pal.card_border.lerp_to_gamma(pal.text, 0.2))
     } else {
-        Stroke::new(1.0_f32, Color32::from_rgb(216, 220, 228))
+        Stroke::new(1.0_f32, pal.card_border)
     };
     ui.painter().set(
         bg_slot,
@@ -3476,8 +3443,8 @@ fn ai_secret_input(ui: &mut egui::Ui, buf: &mut String, hint: &str) -> egui::Res
     if has_focus {
         ui.painter().rect_stroke(
             outer.expand(1.5),
-            7.5,
-            Stroke::new(2.5_f32, Color32::from_rgba_unmultiplied(27, 53, 129, 28)),
+            7.0,
+            Stroke::new(2.5_f32, pal.brand_ink().gamma_multiply(0.22)),
             egui::StrokeKind::Outside,
         );
     }
@@ -3491,21 +3458,14 @@ fn draw_ai_tool_step(
     log: &str,
     elide_cache: &mut std::collections::HashMap<(u32, u32, String), (String, bool)>,
 ) {
+    let pal = crate::theme::palette();
     let (icon, is_err) = classify_tool_log(log);
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
     let (bg, border, fg) = if is_err {
-        (
-            Color32::from_rgb(255, 248, 248),
-            Color32::from_rgb(248, 202, 202),
-            Color32::from_rgb(168, 28, 28),
-        )
+        (pal.err_bg, pal.err_border(), pal.err_fg)
     } else {
-        (
-            Color32::WHITE,
-            Color32::from_rgb(226, 231, 239),
-            Color32::from_rgb(45, 55, 72),
-        )
+        (pal.card_bg, pal.card_border, pal.text)
     };
     ui.painter()
         .rect(rect, 5.0, bg, Stroke::new(1.0_f32, border), egui::StrokeKind::Inside);
@@ -3539,10 +3499,9 @@ fn draw_ai_tool_step(
 
     let mc = egui::pos2(rect.right() - 10.0, rect.center().y);
     if is_err {
-        ui.painter()
-            .circle_filled(mc, 3.0, Color32::from_rgb(196, 43, 28));
+        ui.painter().circle_filled(mc, 3.0, pal.err_fg);
     } else {
-        let st = Stroke::new(1.4_f32, ui_kit::ACCENT);
+        let st = Stroke::new(1.4_f32, pal.accent);
         ui.painter().line_segment(
             [
                 egui::pos2(mc.x - 3.6, mc.y + 0.2),
