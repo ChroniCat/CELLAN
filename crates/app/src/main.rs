@@ -11337,26 +11337,28 @@ impl SheetApp {
                                         .on_hover_text(&display_code);
                                     });
                                 ui.add_space(7.0);
-                                let copy_label = if copied_recently {
-                                    "已复制，发给同事即可"
-                                } else {
-                                    "复制邀请"
-                                };
-                                let doc_for_msg = if hosting {
-                                    current_doc_name.as_str()
-                                } else {
-                                    remote_doc_name.as_str()
-                                };
-                                if ui_kit::primary_button(ui, copy_label).clicked() {
-                                    let msg = session_lock::format_share_invite_message(
-                                        doc_for_msg,
-                                        addr,
-                                        &share_secret,
-                                    );
-                                    ctx.copy_text(msg);
-                                    ctx.data_mut(|d| d.insert_temp(copied_id, now));
-                                    self.status = "已复制邀请消息，发给同事后点「粘贴并加入」即可实时协作".into();
-                                }
+                                ui.horizontal(|ui| {
+                                    let copy_label = if copied_recently {
+                                        "已复制，发给同事即可"
+                                    } else {
+                                        "复制邀请"
+                                    };
+                                    let doc_for_msg = if hosting {
+                                        current_doc_name.as_str()
+                                    } else {
+                                        remote_doc_name.as_str()
+                                    };
+                                    if ui_kit::primary_button(ui, copy_label).clicked() {
+                                        let msg = session_lock::format_share_invite_message(
+                                            doc_for_msg,
+                                            addr,
+                                            &share_secret,
+                                        );
+                                        ctx.copy_text(msg);
+                                        ctx.data_mut(|d| d.insert_temp(copied_id, now));
+                                        self.status = "已复制邀请消息，发给同事后点「粘贴并加入」即可实时协作".into();
+                                    }
+                                });
                             }
                         });
 
