@@ -2150,6 +2150,7 @@ pub struct Net {
     min_saved_watermark: Arc<AtomicU64>,
     acked_op_ts: Arc<AtomicU64>,
     connected_room_id: Arc<Mutex<String>>,
+    connected_doc_title: Arc<Mutex<String>>,
     pending_sorts: Arc<Mutex<std::collections::BTreeMap<u64,Arc<SortBatch>>>>,
     local_sort_ranges: Mutex<Vec<(u64,u64)>>,
     cmd: Sender<Cmd>,
@@ -2162,6 +2163,8 @@ pub struct Net {
     /// 宿主写进占用卡的自动协作房间密钥（只在宿主侧、且未设房间口令时非空）。
     /// 每次刷新占用卡都要原样写回，否则后来的同事读不到。
     pub lock_secret: String,
+    /// 宿主当前会话生效的邀请口令/密钥（用于在共享面板生成一键 `cellan://IP:端口#口令` 邀请链接）。
+    pub share_secret: String,
     alive: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     wake_ctx: Arc<Mutex<Option<eframe::egui::Context>>>,
@@ -4129,6 +4132,17 @@ impl Net {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// 客户端：宿主在 Welcome 握手中声明的共享工作簿标题（用于单文件协作标签页展示真实文件名）
+    pub fn connected_doc_title(&self) -> Option<String> {
+        let t = self
+            .connected_doc_title
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim()
+            .to_string();
+        (!t.is_empty()).then_some(t)
     }
 
     /// 测试用：把一条事件塞进本连接的事件队列，模拟网络线程产生的事件（例如重连后的 Welcome）
@@ -8091,6 +8105,8 @@ fn host_initialized(
         min_saved_watermark: Default::default(),
         acked_op_ts: Default::default(),
         connected_room_id: Default::default(),
+        connected_doc_title: Default::default(),
+        share_secret: String::new(),
         structural_ack: Default::default(),
         palette_styles_cap: Arc::new(AtomicBool::new(true)),
         thread_changes_cap: Arc::new(AtomicBool::new(true)),
@@ -8543,6 +8559,8 @@ fn join_session(
     let acked_op_ts_for_reader = acked_op_ts.clone();
     let connected_room_id = Arc::new(Mutex::new(String::new()));
     let connected_room_id_for_reader = connected_room_id.clone();
+    let connected_doc_title = Arc::new(Mutex::new(String::new()));
+    let connected_doc_title_for_reader = connected_doc_title.clone();
     // 写线程
     {
         let writer = writer.clone();
@@ -8964,6 +8982,11 @@ fn join_session(
                                 *rid = room_id.clone();
                                 same
                             };
+                            if !remote_doc.trim().is_empty() {
+                                *connected_doc_title_for_reader
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = remote_doc.clone();
+                            }
                             if same_room {
                                 acked_op_ts_for_reader.fetch_max(acked_op_ts, Ordering::AcqRel);
                             } else {
@@ -9651,6 +9674,8 @@ fn join_session(
         min_saved_watermark,
         acked_op_ts,
         connected_room_id,
+        connected_doc_title,
+        share_secret: String::new(),
         structural_ack,
         palette_styles_cap,
         thread_changes_cap,

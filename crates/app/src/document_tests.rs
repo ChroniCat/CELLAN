@@ -2460,3 +2460,77 @@ fn review_183_issue_17_comment_edits_undo_and_redo_preserve_later_replies() {
     a.do_undo(false);
     wait(&mut host, &mut a, &mut b, &["R", "A1", "B1", "H1"]);
 }
+
+#[test]
+fn local_single_file_share_invite_joins_in_new_tab_with_remote_title_and_works_for_unsaved_book() {
+    let env = crate::test_env::TestEnv::new("single-file-share-invite");
+    env.sc("SC_HOST_ADDR", "127.0.0.1");
+
+    // 1. 普通本地文件夹中的单个文件（未标记协作目录、未手动填口令）直接一键开启单文件共享
+    let local_dir = env.path("private_local");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let quote_path = local_dir.join("报价表.xlsx");
+    sheetcore::xlsx::save_atomic(&quote_path, &book(123.0)).unwrap();
+    assert!(!session_lock::is_dir_marked_shared(&quote_path));
+
+    let mut host = app();
+    host.has_open_workbook = true;
+    host.wb = sheetcore::xlsx::load(&quote_path).unwrap();
+    host.start_host();
+    let (host_addr, share_secret) = host.active_share_addr_and_secret();
+    let host_addr = host_addr.expect("host should have active share address");
+    assert_eq!(share_secret.len(), 12, "manual single-file host should auto-generate 12-char invite code");
+    assert!(!session_lock::is_dir_marked_shared(&quote_path), "single-file share must NOT mark folder shared");
+
+    let invite_msg = session_lock::format_share_invite_message("报价表.xlsx", &host_addr, &share_secret);
+
+    // 2. 同事手头已打开自己的一份独立表格，直接粘贴整段邀请消息加入 → 自动新建标签页，不覆盖自己的原表
+    let other_path = env.path("我的报销.xlsx");
+    sheetcore::xlsx::save_atomic(&other_path, &book(42.0)).unwrap();
+    let mut guest = app();
+    guest.has_open_workbook = true;
+    guest.wb = sheetcore::xlsx::load(&other_path).unwrap();
+    guest.join_addr = invite_msg;
+    guest.join_shared();
+
+    assert_eq!(guest.tabs.len(), 2, "joining via invite link should open a fresh tab to protect active workbook");
+    assert_eq!(guest.active_tab, 1);
+    assert_eq!(guest.tab_title(0), "我的报销.xlsx");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while (!guest.joined_doc || guest.wb.sheet(0).value(0, 0) != Value::Number(123.0))
+        && Instant::now() < deadline
+    {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(guest.joined_doc, "guest should authenticate and join using invite code");
+    assert_eq!(guest.wb.sheet(0).value(0, 0), Value::Number(123.0));
+    assert_eq!(guest.tab_title(1), "报价表.xlsx（共享）");
+
+    // 3. 实时协作编辑双向同步，且同事原本的 tab 0 毫发无损
+    guest.begin_edit(Some("888".into()));
+    assert!(guest.commit_edit(None));
+    let sync_deadline = Instant::now() + Duration::from_secs(5);
+    while host.wb.sheet(0).value(0, 0) != Value::Number(888.0) && Instant::now() < sync_deadline {
+        host.poll_net();
+        guest.poll_net();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(host.wb.sheet(0).value(0, 0), Value::Number(888.0));
+
+    guest.switch_tab(0);
+    assert_eq!(guest.wb.sheet(0).value(0, 0), Value::Number(42.0));
+    guest.switch_tab(1);
+    guest.leave_session();
+    host.leave_session();
+
+    // 4. 未保存的空白工作簿也能直接一键开启共享，自动生成邀请码
+    let mut blank_host = app();
+    blank_host.has_open_workbook = true;
+    blank_host.start_host();
+    let (blank_addr, blank_secret) = blank_host.active_share_addr_and_secret();
+    assert!(blank_addr.is_some() && blank_secret.len() == 12);
+    blank_host.leave_session();
+}

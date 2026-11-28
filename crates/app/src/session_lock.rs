@@ -40,6 +40,94 @@ pub fn new_room_secret() -> std::io::Result<String> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
+/// 生成单文件手动共享用的 12 位清晰随机邀请口令（60 位 CSPRNG 熵，排除 0/O/1/I/L 易混字符；配合 20 万轮 PBKDF2 加密通道）。
+pub fn new_invite_code() -> std::io::Result<String> {
+    const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let mut raw = [0u8; 12];
+    getrandom::fill(&mut raw).map_err(|e| std::io::Error::other(format!("系统随机数不可用：{e}")))?;
+    let mut out = String::with_capacity(12);
+    for byte in raw {
+        out.push(ALPHABET[(byte & 31) as usize] as char);
+    }
+    Ok(out)
+}
+
+/// 组装 `cellan://IP:端口#口令` 一键邀请链接（供粘贴加入或微信/钉钉转发）。
+pub fn format_share_link(addr: &str, secret: &str) -> String {
+    let addr = addr.trim();
+    let secret = secret.trim();
+    if secret.is_empty() {
+        format!("cellan://{addr}")
+    } else {
+        format!("cellan://{addr}#{secret}")
+    }
+}
+
+/// 组装面向微信/钉钉/飞书转发的单文件协作邀请文案（含可直接一键粘贴识别的 `cellan://` 邀请码）。
+pub fn format_share_invite_message(doc_title: &str, addr: &str, secret: &str) -> String {
+    let title = if doc_title.trim().is_empty() {
+        "未命名表格"
+    } else {
+        doc_title.trim()
+    };
+    let link = format_share_link(addr, secret);
+    format!(
+        "邀请你实时协作「{title}」（仅共享此文件，不共享本地文件夹）\n在 CELLAN「共享」里点「粘贴并加入」即可：{link}"
+    )
+}
+
+/// 智能解析同事发来的邀请内容：
+/// - 含 `cellan://IP:端口#口令`（或 `?k=口令`）的整段聊天消息；
+/// - 裸 `cellan://IP:端口#口令`、`IP:端口#口令`、`IP#口令`；
+/// - 普通 `IP:端口` 或 `IP`。
+pub fn parse_share_invite(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    fn trim_token_end(s: &str) -> &str {
+        s.trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '。' | '，' | '；' | '！' | '？' | '）' | '】' | '》' | '"' | '\'' | ')' | ']' | '>' | ',' | ';'
+            )
+        })
+    }
+    let candidate = if let Some(idx) = trimmed.find("cellan://").or_else(|| {
+        trimmed
+            .to_ascii_lowercase()
+            .find("cellan://")
+    }) {
+        let rest = &trimmed[idx + "cellan://".len()..];
+        let token = rest
+            .split(|c: char| c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        trim_token_end(token)
+    } else {
+        trim_token_end(trimmed)
+    };
+    if candidate.is_empty() {
+        return None;
+    }
+    let (addr_raw, sec_raw) = if let Some((a, s)) = candidate.split_once('#') {
+        (a, Some(s))
+    } else if let Some((a, q)) = candidate.split_once("?k=") {
+        (a, Some(q))
+    } else {
+        (candidate, None)
+    };
+    let addr = addr_raw.trim().trim_end_matches('/');
+    if addr.is_empty() {
+        return None;
+    }
+    let secret = sec_raw
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((addr.to_string(), secret))
+}
+
 impl LockInfo {
     /// 宿主是否为自动协作写了房间密钥（旧版本宿主不写）
     pub fn has_secret(&self) -> bool {
@@ -1354,5 +1442,36 @@ beat={}
         assert!(!info.host.contains('\n'));
         assert!(!info.user.contains('\n'));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn share_invite_code_format_and_smart_parser_handle_chat_messages_and_plain_ips() {
+        let code = new_invite_code().unwrap();
+        assert_eq!(code.len(), 12);
+        assert!(code.chars().all(|c| !"0O1IL".contains(c) && c.is_ascii_alphanumeric()));
+
+        let msg = format_share_invite_message("报价表.xlsx", "192.168.3.232:7878", &code);
+        assert!(msg.contains("报价表.xlsx"));
+        assert!(msg.contains("不共享本地文件夹"));
+        let parsed = parse_share_invite(&msg).expect("should extract invite from full Chinese chat message");
+        assert_eq!(parsed, ("192.168.3.232:7878".to_string(), Some(code.clone())));
+
+        assert_eq!(
+            parse_share_invite("同事发来：CELLAN://192.168.1.9:7880#ABC987。"),
+            Some(("192.168.1.9:7880".to_string(), Some("ABC987".to_string())))
+        );
+        assert_eq!(
+            parse_share_invite("cellan://10.0.0.5:7878?k=PASS42"),
+            Some(("10.0.0.5:7878".to_string(), Some("PASS42".to_string())))
+        );
+        assert_eq!(
+            parse_share_invite("192.168.3.232:7878#MYCODE"),
+            Some(("192.168.3.232:7878".to_string(), Some("MYCODE".to_string())))
+        );
+        assert_eq!(
+            parse_share_invite("192.168.3.232:7878"),
+            Some(("192.168.3.232:7878".to_string(), None))
+        );
+        assert_eq!(parse_share_invite("   "), None);
     }
 }
