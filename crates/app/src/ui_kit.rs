@@ -151,6 +151,7 @@ pub fn draw_brand_logo(painter: &egui::Painter, rect: Rect) {
 }
 
 /// Chrome 风格标签页轮廓：顶部圆角 + 底部左右外撇凹圆角平滑过渡到底栏，避免“上圆下尖”。
+#[allow(dead_code)]
 pub fn paint_chrome_tab(
     painter: &egui::Painter,
     rect: Rect,
@@ -159,15 +160,49 @@ pub fn paint_chrome_tab(
     fill: Color32,
     contour: Option<Stroke>,
 ) {
+    paint_chrome_tab_lifted(painter, rect, top_r, flare_r, 0.0, fill, contour);
+}
+
+/// Chrome 风格标签页轮廓（支持拖拽悬浮态 `lift_t: 0.0..=1.0`）：
+/// - `lift_t == 0`：底部左右外撇凹圆角平滑汇入下方功能区；
+/// - `lift_t > 0`：底部凹角柔和收回为圆角浮动卡片，叠柔和弥散投影与细腻边线，放下时再自然融回功能区。
+pub fn paint_chrome_tab_lifted(
+    painter: &egui::Painter,
+    rect: Rect,
+    top_r: f32,
+    flare_r: f32,
+    lift_t: f32,
+    fill: Color32,
+    contour: Option<Stroke>,
+) {
+    let lift_t = lift_t.clamp(0.0, 1.0);
     let top_r = top_r.clamp(0.0, (rect.width() * 0.45).min(rect.height() * 0.48));
-    let r = flare_r.clamp(0.0, (rect.height() - top_r).max(0.0));
+    // 拖拽提起前半段先平滑收回外撇凹角，后半段柔和过渡出底部圆角
+    let flare_t = (1.0 - lift_t * 2.0).clamp(0.0, 1.0);
+    let round_t = ((lift_t - 0.35) / 0.65).clamp(0.0, 1.0);
+    let r = (flare_r * flare_t).clamp(0.0, (rect.height() - top_r).max(0.0));
     let top_u8 = top_r.round().clamp(0.0, 255.0) as u8;
-    let body = Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.bottom() + 0.5));
-    painter.rect_filled(
-        body,
-        egui::CornerRadius { nw: top_u8, ne: top_u8, sw: 0, se: 0 },
-        fill,
-    );
+    let bot_u8 = (6.5 * round_t).round().clamp(0.0, 255.0) as u8;
+    let body_bottom = rect.bottom() + 0.5 * flare_t - 2.0 * round_t;
+    let body = Rect::from_min_max(rect.min, egui::pos2(rect.right(), body_bottom.max(rect.top() + 8.0)));
+    let corners = egui::CornerRadius { nw: top_u8, ne: top_u8, sw: bot_u8, se: bot_u8 };
+
+    if lift_t > 0.01 {
+        let pal = crate::theme::palette();
+        let dark = pal.theme.is_dark();
+        let shadow_alpha = (if dark { 88.0 } else { 34.0 } * lift_t).round().clamp(0.0, 255.0) as u8;
+        if shadow_alpha > 0 {
+            let shadow = egui::epaint::Shadow {
+                offset: [0, (2.0 * lift_t).round() as i8],
+                blur: (10.0 * lift_t).round().max(2.0) as u8,
+                spread: 0,
+                color: Color32::from_black_alpha(shadow_alpha),
+            };
+            painter.add(shadow.as_shape(body, corners));
+        }
+    }
+
+    painter.rect_filled(body, corners, fill);
 
     const SEG: usize = 10;
     let paint_flare = |corner: egui::Pos2, center: egui::Pos2, a0: f32, a1: f32| {
@@ -210,39 +245,49 @@ pub fn paint_chrome_tab(
     );
 
     if let Some(stroke) = contour {
-        let mut pts = Vec::with_capacity(4 * (SEG + 1));
-        if r >= 0.5 {
-            for k in 0..=SEG {
-                let a = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / SEG as f32);
-                pts.push(egui::pos2(center_l.x + r * a.cos(), center_l.y + r * a.sin()));
-            }
+        if round_t > 0.05 && r < 0.5 {
+            painter.rect_stroke(body, corners, stroke, egui::StrokeKind::Inside);
         } else {
-            pts.push(rect.left_bottom());
-        }
-        if top_r >= 0.5 {
-            let tl = egui::pos2(rect.left() + top_r, rect.top() + top_r);
-            for k in 0..=SEG {
-                let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
-                pts.push(egui::pos2(tl.x + top_r * a.cos(), tl.y + top_r * a.sin()));
+            let mut pts = Vec::with_capacity(4 * (SEG + 1));
+            if r >= 0.5 {
+                for k in 0..=SEG {
+                    let a = std::f32::consts::FRAC_PI_2 * (1.0 - k as f32 / SEG as f32);
+                    pts.push(egui::pos2(center_l.x + r * a.cos(), center_l.y + r * a.sin()));
+                }
+            } else {
+                pts.push(body.left_bottom());
             }
-            let tr = egui::pos2(rect.right() - top_r, rect.top() + top_r);
-            for k in 0..=SEG {
-                let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
-                pts.push(egui::pos2(tr.x + top_r * a.cos(), tr.y + top_r * a.sin()));
+            if top_r >= 0.5 {
+                let tl = egui::pos2(rect.left() + top_r, rect.top() + top_r);
+                for k in 0..=SEG {
+                    let a = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                    pts.push(egui::pos2(tl.x + top_r * a.cos(), tl.y + top_r * a.sin()));
+                }
+                let tr = egui::pos2(rect.right() - top_r, rect.top() + top_r);
+                for k in 0..=SEG {
+                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                    pts.push(egui::pos2(tr.x + top_r * a.cos(), tr.y + top_r * a.sin()));
+                }
+            } else {
+                pts.push(rect.left_top());
+                pts.push(rect.right_top());
             }
-        } else {
-            pts.push(rect.left_top());
-            pts.push(rect.right_top());
-        }
-        if r >= 0.5 {
-            for k in 0..=SEG {
-                let a = std::f32::consts::PI - std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
-                pts.push(egui::pos2(center_r.x + r * a.cos(), center_r.y + r * a.sin()));
+            if r >= 0.5 {
+                for k in 0..=SEG {
+                    let a = std::f32::consts::PI - std::f32::consts::FRAC_PI_2 * (k as f32 / SEG as f32);
+                    pts.push(egui::pos2(center_r.x + r * a.cos(), center_r.y + r * a.sin()));
+                }
+            } else {
+                pts.push(body.right_bottom());
             }
-        } else {
-            pts.push(rect.right_bottom());
+            painter.add(egui::Shape::line(pts, stroke));
         }
-        painter.add(egui::Shape::line(pts, stroke));
+    } else if lift_t > 0.05 {
+        let pal = crate::theme::palette();
+        let lift_border = lerp_color(Color32::TRANSPARENT, pal.card_border, lift_t * 0.85);
+        if lift_border != Color32::TRANSPARENT {
+            painter.rect_stroke(body, corners, Stroke::new(1.0, lift_border), egui::StrokeKind::Inside);
+        }
     }
 }
 
@@ -621,6 +666,78 @@ pub fn anim_toggle(ctx: &egui::Context, id: egui::Id, on: bool) -> f32 {
         return if on { 1.0 } else { 0.0 };
     }
     ctx.animate_bool_with_time_and_easing(id, on, dur, egui::emath::easing::cubic_out)
+}
+
+/// Smooth ~115ms drag-lift elevation ease-out (`0.0..=1.0`). Immediate in HighContrast / `SC_SHOT`.
+pub fn anim_drag_lift(ctx: &egui::Context, id: egui::Id, lifted: bool) -> f32 {
+    let dur = motion_duration(0.115);
+    if dur <= 0.0 || ctx.input(|i| i.time <= 0.0) {
+        return if lifted { 1.0 } else { 0.0 };
+    }
+    ctx.animate_bool_with_time_and_easing(id, lifted, dur, egui::emath::easing::cubic_out)
+}
+
+/// 纯物理阻尼弹簧单步积分（无全局主题/上下文副作用，供 `anim_spring` 与单元测试共用）。
+pub fn anim_spring_step(
+    value: &mut f32,
+    velocity: &mut f32,
+    target: f32,
+    dt: f32,
+    omega: f32,
+    zeta: f32,
+) -> bool {
+    if !dt.is_finite() || dt <= 0.0 {
+        return (*value - target).abs() >= 0.25 || velocity.abs() >= 4.0;
+    }
+    let step_dt = dt.min(0.05);
+    let sub_steps = if step_dt > 0.02 { 4 } else { 2 };
+    let sub = step_dt / sub_steps as f32;
+    for _ in 0..sub_steps {
+        let acc = -omega * omega * (*value - target) - 2.0 * zeta * omega * (*velocity);
+        *velocity += acc * sub;
+        *value += *velocity * sub;
+    }
+    if (*value - target).abs() < 0.25 && velocity.abs() < 4.0 {
+        *value = target;
+        *velocity = 0.0;
+        false
+    } else {
+        true
+    }
+}
+
+/// 轻量阻尼弹簧单步推进（像素坐标）：用于标签页拖拽让位、松手落位回弹等灵动微动效。
+///
+/// - 推荐 `omega = 26.0`, `zeta = 0.86`：约 140ms 自然加减速落位，柔和不死板、不晃眼。
+/// - 高对比主题、`SC_SHOT` 截图或静态单帧测试（`time <= 0`）直接一步到位；
+///   同一时间戳内的多遍重排（`time > 0 && dt == 0`）保持当前位置不误瞬移。
+pub fn anim_spring(
+    ctx: &egui::Context,
+    value: &mut f32,
+    velocity: &mut f32,
+    target: f32,
+    omega: f32,
+    zeta: f32,
+) -> bool {
+    if motion_duration(1.0) <= 0.0 {
+        *value = target;
+        *velocity = 0.0;
+        return false;
+    }
+    let (now, dt) = ctx.input(|i| (i.time, i.unstable_dt));
+    if now <= 0.0 || !dt.is_finite() {
+        *value = target;
+        *velocity = 0.0;
+        return false;
+    }
+    if dt <= 0.0 {
+        return (*value - target).abs() >= 0.25 || velocity.abs() >= 4.0;
+    }
+    let moving = anim_spring_step(value, velocity, target, dt, omega, zeta);
+    if moving {
+        ctx.request_repaint();
+    }
+    moving
 }
 
 /// Subtle ~120ms entrance ease-out (`0.0..=1.0`) from the first shown pass.
@@ -2205,22 +2322,23 @@ pub fn sheet_tab_label(ui: &egui::Ui, name: &str, active: bool, max_width: f32) 
     ui.painter().layout_job(job)
 }
 
-pub fn sheet_tab(
-    ui: &mut egui::Ui,
-    name: &str,
+/// 绘制工作表标签视觉外观（复用于常态标签、平滑让位动画和拖拽悬浮胶囊）。
+pub fn paint_sheet_tab_face(
+    painter: &egui::Painter,
+    rect: Rect,
     galley: Arc<egui::Galley>,
     active: bool,
     grouped: bool,
+    hov_t: f32,
+    lift_t: f32,
     color: Option<[u8; 3]>,
-) -> Response {
+) {
     let pal = crate::theme::palette();
     let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
-    let size = Vec2::new(galley.size().x + crate::tokens::size::SHEET_TAB_PAD, crate::tokens::size::SHEET_TAB_H);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
-    let chip = rect.shrink2(Vec2::new(1.0, 3.0));
-    let hov_t = anim_hover(ui.ctx(), resp.id.with("sheet_hov"), !active && !grouped && resp.hovered());
-    let (fill, text_color) = if active {
+    let lift_t = lift_t.clamp(0.0, 1.0);
+    let draw_rect = rect.translate(Vec2::new(0.0, -1.5 * lift_t));
+    let chip = draw_rect.shrink2(Vec2::new(1.0, 3.0));
+    let (base_fill, base_text) = if active {
         active_tab_colors(pal)
     } else if grouped {
         (pal.accent_tint, pal.accent_hover)
@@ -2230,30 +2348,104 @@ pub fn sheet_tab(
             lerp_color(pal.text_weak, pal.text, hov_t * 0.6),
         )
     };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(chip, 5.0, fill);
+    let (fill, text_color) = if lift_t > 0.01 {
+        let lifted_surface = if active || grouped {
+            base_fill
+        } else {
+            pal.card_bg
+        };
+        (
+            lerp_color(base_fill, lifted_surface, lift_t),
+            lerp_color(base_text, if active { base_text } else { pal.text }, lift_t * 0.8),
+        )
+    } else {
+        (base_fill, base_text)
+    };
+
+    if lift_t > 0.01 {
+        let shadow_alpha = (if pal.theme.is_dark() { 92.0 } else { 38.0 } * lift_t)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        if shadow_alpha > 0 {
+            let shadow = egui::epaint::Shadow {
+                offset: [0, (2.0 * lift_t).round() as i8],
+                blur: (9.0 * lift_t).round().max(2.0) as u8,
+                spread: 0,
+                color: Color32::from_black_alpha(shadow_alpha),
+            };
+            painter.add(shadow.as_shape(chip, 5.0));
+        }
     }
 
-    let center_y = rect.center().y;
+    if fill != Color32::TRANSPARENT {
+        painter.rect_filled(chip, 5.0, fill);
+    }
+    if lift_t > 0.05 {
+        let border_col = lerp_color(pal.card_border, pal.accent, 0.35);
+        let stroke_col = lerp_color(Color32::TRANSPARENT, border_col, lift_t * 0.9);
+        if stroke_col != Color32::TRANSPARENT {
+            painter.rect_stroke(chip, 5.0, Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+        }
+    }
+
+    let center_y = draw_rect.center().y;
     let color_offset = if let Some([r, g, b]) = color {
-        let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, center_y), Vec2::splat(8.0));
+        let swatch = Rect::from_center_size(egui::pos2(draw_rect.left() + 10.0, center_y), Vec2::splat(8.0));
         let edge = if active && is_hc { text_color } else { pal.text_weak };
-        ui.painter().rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+        painter.rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         5.0
     } else {
         0.0
     };
     let text_pos = Align2::CENTER_CENTER
-        .anchor_size(egui::pos2(rect.center().x + color_offset, center_y), galley.size())
+        .anchor_size(egui::pos2(draw_rect.center().x + color_offset, center_y), galley.size())
         .min;
+    painter.galley_with_override_text_color(text_pos, galley, text_color);
+}
+
+/// 分配工作表标签交互槽位并支持水平让位偏移动画（`visual_dx`）与拖拽隐身（`ghost_source`）。
+pub fn sheet_tab_animated(
+    ui: &mut egui::Ui,
+    name: &str,
+    galley: Arc<egui::Galley>,
+    active: bool,
+    grouped: bool,
+    color: Option<[u8; 3]>,
+    visual_dx: f32,
+    ghost_source: bool,
+    suppress_hover: bool,
+) -> Response {
+    let size = Vec2::new(galley.size().x + crate::tokens::size::SHEET_TAB_PAD, crate::tokens::size::SHEET_TAB_H);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
+    let hov_t = anim_hover(
+        ui.ctx(),
+        resp.id.with("sheet_hov"),
+        !suppress_hover && !active && !grouped && resp.hovered(),
+    );
     let elided = galley.elided;
-    ui.painter().galley_with_override_text_color(text_pos, galley, text_color);
-    tab_focus_ring(ui, &resp, chip, 5.0, active);
-    if elided {
+    if !ghost_source {
+        let shifted = rect.translate(Vec2::new(visual_dx, 0.0));
+        paint_sheet_tab_face(ui.painter(), shifted, galley, active, grouped, hov_t, 0.0, color);
+        tab_focus_ring(ui, &resp, shifted.shrink2(Vec2::new(1.0, 3.0)), 5.0, active);
+    }
+    if elided && !suppress_hover {
         resp.on_hover_text(name)
     } else {
         resp
     }
+}
+
+#[allow(dead_code)]
+pub fn sheet_tab(
+    ui: &mut egui::Ui,
+    name: &str,
+    galley: Arc<egui::Galley>,
+    active: bool,
+    grouped: bool,
+    color: Option<[u8; 3]>,
+) -> Response {
+    sheet_tab_animated(ui, name, galley, active, grouped, color, 0.0, false, false)
 }
 
 /// 统一样式的对话框窗口：自绘标题栏（左对齐标题 + 关闭按钮 + 可拖动），

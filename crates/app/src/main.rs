@@ -6366,7 +6366,7 @@ impl SheetApp {
         }
     }
 
-    fn draw_notice_banner(&mut self, ctx: &egui::Context) {
+    pub(crate) fn draw_notice_banner(&mut self, ctx: &egui::Context) {
         if self.show_start {
             return;
         }
@@ -6388,48 +6388,50 @@ impl SheetApp {
                     .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 18.0), Sense::hover());
-                    ui.painter().rect_filled(bar, 1.5, accent);
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new(&banner.title).size(12.0).strong().color(accent));
-                    if !banner.detail.is_empty() {
-                        ui.add_space(6.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&banner.detail)
-                                    .size(11.0)
-                                    .color(pal.text),
-                            )
-                            .truncate(),
+                // 先在右侧分配关闭与操作按钮，再在剩余左侧空间截断正文，避免窄窗/高缩放下操作按钮被长提示文字挤出可视区。
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("×").size(13.0).color(pal.text_weak))
+                                .frame(false),
                         )
-                        .on_hover_text(&banner.detail);
+                        .on_hover_text("关闭提示")
+                        .clicked()
+                    {
+                        dismissed = true;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for (label, act) in banner.actions.iter().rev() {
                         if ui
                             .add(
-                                egui::Button::new(egui::RichText::new("×").size(13.0).color(pal.text_weak))
-                                    .frame(false),
+                                egui::Button::new(
+                                    egui::RichText::new(label).size(11.0).color(accent),
+                                )
+                                .fill(pal.card_bg)
+                                .stroke(Stroke::new(1.0, border))
+                                .corner_radius(4.0),
                             )
-                            .on_hover_text("关闭提示")
                             .clicked()
                         {
-                            dismissed = true;
+                            clicked_action = Some(act.clone());
                         }
-                        for (label, act) in banner.actions.iter().rev() {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(label).size(11.0).color(accent),
-                                    )
-                                    .fill(pal.card_bg)
-                                    .stroke(Stroke::new(1.0, border))
-                                    .corner_radius(4.0),
+                    }
+                    ui.add_space(8.0);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let (bar, _) = ui.allocate_exact_size(Vec2::new(3.0, 18.0), Sense::hover());
+                        ui.painter().rect_filled(bar, 1.5, accent);
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&banner.title).size(12.0).strong().color(accent));
+                        if !banner.detail.is_empty() {
+                            ui.add_space(6.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&banner.detail)
+                                        .size(11.0)
+                                        .color(pal.text),
                                 )
-                                .clicked()
-                            {
-                                clicked_action = Some(act.clone());
-                            }
+                                .truncate(),
+                            )
+                            .on_hover_text(&banner.detail);
                         }
                     });
                 });
@@ -46738,6 +46740,30 @@ fn elide(s: &str, max_chars: usize) -> String {
             Some(TabSlot::Parked(p)) => p.title.clone(),
             None => String::new(),
         }
+    }
+
+    pub(crate) fn tab_uid(&self, idx: usize) -> Option<u64> {
+        match self.tabs.get(idx)? {
+            TabSlot::Active => Some(self.doc_uid),
+            TabSlot::Parked(p) => Some(p.doc_uid),
+        }
+    }
+
+    /// 拖拽重排顶部文档标签页（仅调整槽位顺序，不切换当前文档，也不触碰工作簿内容或撤销栈）。
+    pub(crate) fn move_tab(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return false;
+        }
+        let slot = self.tabs.remove(from);
+        self.tabs.insert(to, slot);
+        if self.active_tab == from {
+            self.active_tab = to;
+        } else if from < self.active_tab && self.active_tab <= to {
+            self.active_tab -= 1;
+        } else if to <= self.active_tab && self.active_tab < from {
+            self.active_tab += 1;
+        }
+        true
     }
 
     /// 在新标签里打开文件（若文件已在某个标签打开则直接切过去保留未保存改动；冷启动尚未打开工作簿时直接复用首个槽位）

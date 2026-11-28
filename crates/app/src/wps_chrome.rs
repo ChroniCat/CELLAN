@@ -256,6 +256,34 @@ fn scrollable_file_menu(ui: &mut egui::Ui, width: f32, max_height: f32, content:
 const DOC_TAB_MIN: f32 = 84.0;
 const DOC_TAB_GAP: f32 = 4.0;
 const DOC_ACTION_SLOT: f32 = 28.0;
+const TAB_SPRING_OMEGA: f32 = 26.0;
+const TAB_SPRING_ZETA: f32 = 0.86;
+
+#[derive(Clone, Copy, Default)]
+struct TabSpring {
+    x: f32,
+    v: f32,
+}
+
+#[derive(Clone, Default)]
+struct DocTabAnimState {
+    dragged_uid: Option<u64>,
+    elevated_uid: Option<u64>,
+    grab_offset_x: f32,
+    drag_x: f32,
+    origin_idx: usize,
+    springs: std::collections::HashMap<u64, TabSpring>,
+}
+
+#[derive(Clone, Default)]
+struct SheetTabAnimState {
+    doc_uid: u64,
+    dragged_sheet_id: Option<u64>,
+    grab_offset_x: f32,
+    pill_x: f32,
+    offsets: std::collections::HashMap<u64, TabSpring>,
+    pending_settle_x: std::collections::HashMap<u64, f32>,
+}
 
 struct SheetTabDrag {
     doc_uid: u64,
@@ -542,6 +570,180 @@ mod sheet_tab_tests {
         frame(&ctx, &mut app, button_event(plus, true));
         frame(&ctx, &mut app, button_event(plus, false));
         assert_eq!(names(&app), ["B", "C", "A", "D"]);
+    }
+
+    #[test]
+    fn document_tab_drag_reorders_tracks_active_and_preserves_click_and_close() {
+        let _env = crate::test_env::TestEnv::new("doc-tab-drag");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.has_open_workbook = true;
+        app.tabs = vec![TabSlot::Active];
+        app.active_tab = 0;
+        app.wb.path = Some(PathBuf::from("Alpha.xlsx"));
+        app.open_in_new_tab(PathBuf::new());
+        app.wb.path = Some(PathBuf::from("Beta.xlsx"));
+        app.open_in_new_tab(PathBuf::new());
+        app.wb.path = Some(PathBuf::from("Gamma.xlsx"));
+        app.switch_tab(0); // Alpha active
+        app.show_start = false;
+
+        let alpha_uid = app.tab_uid(0).unwrap();
+        let beta_uid = app.tab_uid(1).unwrap();
+        let gamma_uid = app.tab_uid(2).unwrap();
+
+        let title_frame = |app: &mut SheetApp, events: Vec<egui::Event>| -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1200.0, 680.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw_wps_title_bar(ctx),
+            )
+        };
+        let tab_titles = |app: &SheetApp| (0..app.tabs.len()).map(|i| app.tab_title(i)).collect::<Vec<_>>();
+        let tab_center = |uid: u64| ctx.read_response(egui::Id::new(("wps_doctab", uid))).unwrap().rect.center();
+        let settle = |app: &mut SheetApp| {
+            for _ in 0..20 {
+                title_frame(app, Vec::new());
+            }
+        };
+
+        title_frame(&mut app, Vec::new());
+        assert_eq!(tab_titles(&app), ["Alpha.xlsx", "Beta.xlsx", "Gamma.xlsx"]);
+        assert_eq!(app.active_tab, 0);
+
+        // 1. 拖动当前活动标签 Alpha 越过 Beta 和 Gamma → [Beta, Gamma, Alpha]，active_tab 同步跟随至 2
+        let a = tab_center(alpha_uid);
+        let g = tab_center(gamma_uid);
+        let beta_before_x = tab_center(beta_uid).x;
+        title_frame(&mut app, button_event(a, true));
+        title_frame(&mut app, vec![egui::Event::PointerMoved(a + Vec2::new(10.0, 0.0))]);
+        title_frame(&mut app, vec![egui::Event::PointerMoved(g + Vec2::new(20.0, 0.0))]);
+        title_frame(&mut app, button_event(g + Vec2::new(20.0, 0.0), false));
+        assert_eq!(tab_titles(&app), ["Beta.xlsx", "Gamma.xlsx", "Alpha.xlsx"]);
+        assert_eq!(app.active_tab, 2);
+        assert_eq!(app.tab_uid(app.active_tab), Some(alpha_uid));
+        assert_eq!(app.doc_uid, alpha_uid);
+        // 兄弟标签 Beta 在松手后应先平滑滑向左侧新槽位，再完整落位
+        let beta_mid_x = tab_center(beta_uid).x;
+        settle(&mut app);
+        let beta_final_x = tab_center(beta_uid).x;
+        assert!(
+            beta_final_x < beta_before_x - 20.0 && beta_mid_x >= beta_final_x - 1.0,
+            "Beta should smoothly glide left into slot 0: before={beta_before_x}, mid={beta_mid_x}, final={beta_final_x}"
+        );
+
+        // 2. 拖动非活动标签 Beta 到最右侧 → [Gamma, Alpha, Beta]，active_tab 自动左移为 1 且不切换当前文档
+        let b = tab_center(beta_uid);
+        let a_right = tab_center(alpha_uid);
+        title_frame(&mut app, button_event(b, true));
+        title_frame(&mut app, vec![egui::Event::PointerMoved(b + Vec2::new(10.0, 0.0))]);
+        title_frame(&mut app, vec![egui::Event::PointerMoved(a_right + Vec2::new(20.0, 0.0))]);
+        title_frame(&mut app, button_event(a_right + Vec2::new(20.0, 0.0), false));
+        assert_eq!(tab_titles(&app), ["Gamma.xlsx", "Alpha.xlsx", "Beta.xlsx"]);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.doc_uid, alpha_uid);
+
+        // 3. 拖动过程中按 Esc 取消，恢复拖动前的顺序
+        settle(&mut app);
+        let b2 = tab_center(beta_uid);
+        let g2 = tab_center(gamma_uid);
+        title_frame(&mut app, button_event(b2, true));
+        title_frame(&mut app, vec![egui::Event::PointerMoved(b2 - Vec2::new(10.0, 0.0))]);
+        title_frame(&mut app, vec![egui::Event::PointerMoved(g2 - Vec2::new(10.0, 0.0))]);
+        assert_eq!(tab_titles(&app), ["Beta.xlsx", "Gamma.xlsx", "Alpha.xlsx"]);
+        title_frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        title_frame(&mut app, button_event(g2 - Vec2::new(10.0, 0.0), false));
+        assert_eq!(tab_titles(&app), ["Gamma.xlsx", "Alpha.xlsx", "Beta.xlsx"]);
+        assert_eq!(app.active_tab, 1);
+
+        // 4. 短按点击非活动标签正常切换，不误触发拖动
+        settle(&mut app);
+        let g_click = tab_center(gamma_uid);
+        title_frame(&mut app, button_event(g_click, true));
+        title_frame(&mut app, button_event(g_click, false));
+        assert_eq!(app.active_tab, 0);
+        assert_eq!(app.doc_uid, gamma_uid);
+        assert_eq!(tab_titles(&app), ["Gamma.xlsx", "Alpha.xlsx", "Beta.xlsx"]);
+
+        // 5. 点击标签关闭按钮正常关闭对应标签
+        settle(&mut app);
+        let close_beta = ctx
+            .read_response(egui::Id::new(("wps_doctabx", beta_uid)))
+            .unwrap()
+            .rect
+            .center();
+        title_frame(&mut app, button_event(close_beta, true));
+        title_frame(&mut app, button_event(close_beta, false));
+        assert_eq!(tab_titles(&app), ["Gamma.xlsx", "Alpha.xlsx"]);
+    }
+
+    #[test]
+    fn spring_animation_glides_smoothly_and_converges() {
+        let mut x = 0.0f32;
+        let mut v = 0.0f32;
+        let target = 120.0f32;
+        let mut samples = Vec::new();
+        for _ in 0..45 {
+            ui_kit::anim_spring_step(&mut x, &mut v, target, 0.016, TAB_SPRING_OMEGA, TAB_SPRING_ZETA);
+            samples.push(x);
+        }
+        assert!(samples[0] > 0.0 && samples[0] < target * 0.35, "should ease out smoothly: {:?}", &samples[..5]);
+        assert!(samples[2] > samples[0], "should accelerate smoothly toward target: {:?}", &samples[..5]);
+        assert!((x - target).abs() < 0.01, "spring should converge cleanly to target, got {x}");
+        // Same-timestamp multi-pass (`dt == 0.0`) must hold position instead of snapping mid-flight.
+        let mut mid_x = 40.0f32;
+        let mut mid_v = 120.0f32;
+        assert!(ui_kit::anim_spring_step(&mut mid_x, &mut mid_v, target, 0.0, TAB_SPRING_OMEGA, TAB_SPRING_ZETA));
+        assert_eq!(mid_x, 40.0);
+    }
+
+    #[test]
+    fn notice_banner_keeps_action_button_inside_narrow_viewport() {
+        let _env = crate::test_env::TestEnv::new("notice-banner-narrow");
+        let ctx = egui::Context::default();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.new_document();
+        app.show_start = false;
+        app.set_notice(crate::NoticeBanner {
+            level: crate::NoticeLevel::Warn,
+            title: "已暂停自动读取目录外外部链接".into(),
+            detail: "此工作簿包含指向当前项目目录之外的外部链接。默认仅显示内嵌缓存值；确认来源可信后再启用自动更新。".into(),
+            actions: vec![("信任并更新外部链接".into(), crate::NoticeAction::TrustExternalLinks)],
+            tag: Some("xlink_trust"),
+            target_doc_uid: Some(app.doc_uid),
+        });
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 400.0));
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ctx| app.draw_notice_banner(ctx),
+        );
+        let (btn_rect, _, _) = text_rect(&out, "信任并更新外部链接")
+            .expect("action button must remain rendered on narrow viewport");
+        let (close_rect, _, _) = text_rect(&out, "×")
+            .expect("dismiss button must remain rendered on narrow viewport");
+        assert!(
+            btn_rect.right() <= screen.right() && btn_rect.left() >= screen.left(),
+            "action button clipped off-screen: {btn_rect:?} vs {screen:?}"
+        );
+        assert!(
+            close_rect.right() <= screen.right() && close_rect.left() >= btn_rect.right(),
+            "dismiss button should sit cleanly to the right of action button: {close_rect:?} vs {btn_rect:?}"
+        );
     }
 }
 
@@ -1062,9 +1264,10 @@ impl SheetApp {
         };
         let chrome_tab_stroke = is_hc.then(|| Stroke::new(1.25, pal.card_border));
 
-        let mut tab_metas: Vec<(String, bool, bool)> = Vec::new();
+        let mut tab_metas: Vec<(u64, String, bool, bool)> = Vec::new();
         if self.has_open_workbook {
             for i in 0..self.tabs.len() {
+                let uid = self.tab_uid(i).unwrap_or(i as u64);
                 let mut title = self.tab_title(i);
                 if i == self.active_tab && self.selected_sheets.len() > 1 {
                     title.push_str(" [工作组]");
@@ -1073,11 +1276,12 @@ impl SheetApp {
                     TabSlot::Active => self.wb.dirty || self.tasks.saving.is_some() || self.editing.is_some(),
                     TabSlot::Parked(d) => d.wb.dirty || d.tasks.saving.is_some(),
                 };
-                tab_metas.push((title, dirty, !self.show_start && i == self.active_tab));
+                tab_metas.push((uid, title, dirty, !self.show_start && i == self.active_tab));
             }
         }
         let mut do_switch: Option<usize> = None;
         let mut do_close: Option<usize> = None;
+        let mut do_move: Option<(usize, usize)> = None;
         let mut new_tab = false;
 
         egui::TopBottomPanel::top("titlebar")
@@ -1187,14 +1391,28 @@ impl SheetApp {
                 let sx = acc.left() - search_w - 10.0;
                 let right_limit = if show_search { sx - 10.0 } else { acc.left() - 10.0 };
 
-                // 3. Chrome 风格文档标签直接融入第 1 排（活动页签顶部圆角 + 底部外撇凹圆角平滑汇入下方功能区）
+                // 3. Chrome 风格文档标签直接融入第 1 排（支持平滑弹簧拖拽重排与悬浮微动效）
                 let mut cur_x = left_end;
+                let doc_anim_id = egui::Id::new("wps_doctab_anim_state");
                 if self.has_open_workbook {
                     let (visible, width_limit) = document_tab_layout(tab_metas.len(), self.active_tab, right_limit - cur_x);
                     let overflow = visible.len() < tab_metas.len();
-                    let mut prev_inactive_quiet = false;
+                    let strip_left = cur_x;
+
+                    struct VisDocTab {
+                        slot_idx: usize,
+                        uid: u64,
+                        title: String,
+                        dirty: bool,
+                        active: bool,
+                        galley: std::sync::Arc<egui::Galley>,
+                        tw: f32,
+                        slot_x: f32,
+                    }
+
+                    let mut vis_items: Vec<VisDocTab> = Vec::with_capacity(visible.len());
                     for i in visible {
-                        let (title, dirty, active) = &tab_metas[i];
+                        let (uid, title, dirty, active) = &tab_metas[i];
                         let font = if *active { ui_kit::medium_in(ctx, ui_kit::T_BODY) } else { FontId::proportional(ui_kit::T_BODY) };
                         let tc = if *active { pal.text } else { pal.text_weak };
                         let mut job = egui::text::LayoutJob::simple_singleline(title.clone(), font, tc);
@@ -1202,45 +1420,251 @@ impl SheetApp {
                         job.wrap = egui::text::TextWrapping::truncate_at_width(width_limit - padding);
                         let galley = painter.layout_job(job);
                         let tw = (galley.size().x + padding).clamp(DOC_TAB_MIN, width_limit);
-                        let tab = Rect::from_min_size(egui::pos2(cur_x, rect.top() + 5.0), Vec2::new(tw, rect.height() - 5.0));
+                        vis_items.push(VisDocTab {
+                            slot_idx: i,
+                            uid: *uid,
+                            title: title.clone(),
+                            dirty: *dirty,
+                            active: *active,
+                            galley,
+                            tw,
+                            slot_x: cur_x,
+                        });
+                        cur_x += tw + DOC_TAB_GAP;
+                    }
+                    let strip_right = if vis_items.is_empty() {
+                        strip_left
+                    } else {
+                        (cur_x - DOC_TAB_GAP).max(strip_left)
+                    };
+
+                    let mut anim = ctx.data_mut(|d| {
+                        d.get_temp::<DocTabAnimState>(doc_anim_id).unwrap_or_default()
+                    });
+                    anim.springs.retain(|uid, _| tab_metas.iter().any(|(u, ..)| u == uid));
+                    let can_drag = vis_items.len() > 1;
+                    let (pointer_pos, press_origin, primary_down, esc_pressed) = ctx.input(|i| {
+                        (
+                            i.pointer.interact_pos(),
+                            i.pointer.press_origin(),
+                            i.pointer.primary_down(),
+                            i.key_pressed(Key::Escape),
+                        )
+                    });
+
+                    // 第一遍：按稳定 `doc_uid` 注册交互区域，识别点击、关闭与拖拽起止
+                    struct TabInteract {
+                        uid: u64,
+                        tr: egui::Response,
+                        cr: egui::Response,
+                    }
+                    let mut interacts: Vec<TabInteract> = Vec::with_capacity(vis_items.len());
+                    let was_dragging = anim.dragged_uid.is_some();
+                    for item in &vis_items {
+                        let base_x = anim.springs.get(&item.uid).map_or(item.slot_x, |s| s.x);
+                        let tab = Rect::from_min_size(egui::pos2(base_x, rect.top() + 5.0), Vec2::new(item.tw, rect.height() - 5.0));
                         let inactive_pill = Rect::from_min_max(
                             egui::pos2(tab.left() + 1.0, rect.top() + 6.0),
                             egui::pos2(tab.right() - 1.0, rect.bottom() - 5.0),
                         );
-                        let tab_cy = if *active { tab.center().y + 0.5 } else { inactive_pill.center().y };
+                        let tab_cy = if item.active { tab.center().y + 0.5 } else { inactive_pill.center().y };
                         let close = Rect::from_center_size(egui::pos2(tab.right() - 13.0, tab_cy), Vec2::splat(20.0));
                         let tab_hit = Rect::from_min_max(tab.min, egui::pos2(close.left() - 2.0, tab.bottom()));
-                        let tr = ui.interact(tab_hit, egui::Id::new(("wps_doctab", i)), Sense::click());
-                        let cr = ui.interact(close, egui::Id::new(("wps_doctabx", i)), Sense::click());
-                        let hovered = tr.hovered() || cr.hovered();
+                        let tab_sense = if can_drag { Sense::click_and_drag() } else { Sense::click() };
+                        let tr = ui.interact(tab_hit, egui::Id::new(("wps_doctab", item.uid)), tab_sense);
+                        let cr = ui.interact(
+                            close,
+                            egui::Id::new(("wps_doctabx", item.uid)),
+                            if was_dragging { Sense::hover() } else { Sense::click() },
+                        );
+                        if can_drag && tr.drag_started_by(egui::PointerButton::Primary) {
+                            let start_px = press_origin
+                                .or_else(|| tr.interact_pointer_pos())
+                                .or(pointer_pos)
+                                .map_or(base_x + item.tw * 0.5, |p| p.x);
+                            let cur_px = pointer_pos.or_else(|| tr.interact_pointer_pos()).map_or(start_px, |p| p.x);
+                            let grab = (start_px - base_x).clamp(0.0, item.tw);
+                            anim.dragged_uid = Some(item.uid);
+                            anim.elevated_uid = Some(item.uid);
+                            anim.grab_offset_x = grab;
+                            anim.drag_x = (cur_px - grab).clamp(strip_left, (strip_right - item.tw).max(strip_left));
+                            anim.origin_idx = item.slot_idx;
+                        }
+                        interacts.push(TabInteract { uid: item.uid, tr, cr });
+                    }
+
+                    // 更新拖拽位置、实时平滑换位（带 2px 滞回避免不等宽抖动）以及松手/Esc 取消
+                    if let Some(drag_uid) = anim.dragged_uid {
+                        if let Some(cur_vis_pos) = vis_items.iter().position(|it| it.uid == drag_uid) {
+                            let drag_stopped = interacts
+                                .iter()
+                                .find(|it| it.uid == drag_uid)
+                                .is_some_and(|it| it.tr.drag_stopped());
+                            if esc_pressed {
+                                let cur_slot = vis_items[cur_vis_pos].slot_idx;
+                                let orig = anim.origin_idx.min(tab_metas.len().saturating_sub(1));
+                                if cur_slot != orig {
+                                    do_move = Some((cur_slot, orig));
+                                    if let Some(target_vis) = vis_items.iter().position(|it| it.slot_idx == orig) {
+                                        let moved = vis_items.remove(cur_vis_pos);
+                                        vis_items.insert(target_vis, moved);
+                                        let mut rx = strip_left;
+                                        for it in &mut vis_items {
+                                            it.slot_x = rx;
+                                            rx += it.tw + DOC_TAB_GAP;
+                                        }
+                                    }
+                                }
+                                anim.dragged_uid = None;
+                            } else if !primary_down || drag_stopped || !can_drag {
+                                anim.dragged_uid = None;
+                            } else {
+                                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                                let dragged_tw = vis_items[cur_vis_pos].tw;
+                                if let Some(p) = pointer_pos {
+                                    let max_x = (strip_right - dragged_tw).max(strip_left);
+                                    anim.drag_x = (p.x - anim.grab_offset_x).clamp(strip_left, max_x);
+                                }
+                                anim.springs.insert(drag_uid, TabSpring { x: anim.drag_x, v: 0.0 });
+                                const SWAP_HYST: f32 = 2.0;
+                                let mut pos = cur_vis_pos;
+                                let mut cur_slot_x = vis_items[pos].slot_x;
+                                while pos + 1 < vis_items.len() {
+                                    let step = vis_items[pos + 1].tw + DOC_TAB_GAP;
+                                    if anim.drag_x > cur_slot_x + step * 0.5 + SWAP_HYST {
+                                        cur_slot_x += step;
+                                        pos += 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if pos == cur_vis_pos {
+                                    while pos > 0 {
+                                        let step = vis_items[pos - 1].tw + DOC_TAB_GAP;
+                                        if anim.drag_x < cur_slot_x - step * 0.5 - SWAP_HYST {
+                                            cur_slot_x -= step;
+                                            pos -= 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if pos != cur_vis_pos {
+                                    let from_slot = vis_items[cur_vis_pos].slot_idx;
+                                    let to_slot = vis_items[pos].slot_idx;
+                                    do_move = Some((from_slot, to_slot));
+                                    let moved = vis_items.remove(cur_vis_pos);
+                                    vis_items.insert(pos, moved);
+                                    let mut rx = strip_left;
+                                    for it in &mut vis_items {
+                                        it.slot_x = rx;
+                                        rx += it.tw + DOC_TAB_GAP;
+                                    }
+                                }
+                            }
+                        } else {
+                            anim.dragged_uid = None;
+                        }
+                    }
+
+                    // 推进每个标签的阻尼弹簧位置，实现让位与松手落位的自然加减速动效
+                    let is_dragging_any = anim.dragged_uid.is_some();
+                    let mut any_moving = is_dragging_any;
+                    for item in &vis_items {
+                        if anim.dragged_uid == Some(item.uid) {
+                            anim.springs.insert(item.uid, TabSpring { x: anim.drag_x, v: 0.0 });
+                        } else {
+                            let sp = anim
+                                .springs
+                                .entry(item.uid)
+                                .or_insert(TabSpring { x: item.slot_x, v: 0.0 });
+                            if ui_kit::anim_spring(ctx, &mut sp.x, &mut sp.v, item.slot_x, TAB_SPRING_OMEGA, TAB_SPRING_ZETA) {
+                                any_moving = true;
+                            }
+                        }
+                    }
+
+                    // 第二遍：先绘制底层标签（含静默分割线），最后在顶层绘制被拖拽/正在落位的标签
+                    let elevated_uid = anim.elevated_uid;
+                    let mut elevated_settled = true;
+                    let mut prev_inactive_quiet = false;
+                    let mut paint_one = |item: &VisDocTab, draw_divider: bool, prev_quiet: bool| -> (bool, f32) {
+                        let Some(inter) = interacts.iter().find(|it| it.uid == item.uid) else {
+                            return (false, 0.0);
+                        };
+                        let tr = &inter.tr;
+                        let cr = &inter.cr;
+                        let is_self_drag = anim.dragged_uid == Some(item.uid);
+                        let lift_t = ui_kit::anim_drag_lift(ctx, egui::Id::new(("wps_doctab_lift", item.uid)), is_self_drag);
+                        let visual_x = anim.springs.get(&item.uid).map_or(item.slot_x, |s| s.x);
+                        let lift_y = -1.5 * lift_t;
+                        let tab = Rect::from_min_size(
+                            egui::pos2(visual_x, rect.top() + 5.0 + lift_y),
+                            Vec2::new(item.tw, rect.height() - 5.0),
+                        );
+                        let inactive_pill = Rect::from_min_max(
+                            egui::pos2(tab.left() + 1.0, rect.top() + 6.0 + lift_y),
+                            egui::pos2(tab.right() - 1.0, rect.bottom() - 5.0 + lift_y),
+                        );
+                        let tab_cy = if item.active { tab.center().y + 0.5 } else { inactive_pill.center().y };
+                        let close = Rect::from_center_size(egui::pos2(tab.right() - 13.0, tab_cy), Vec2::splat(20.0));
+                        let tab_hit = Rect::from_min_max(tab.min, egui::pos2(close.left() - 2.0, tab.bottom()));
+                        let hovered = !is_dragging_any && (tr.hovered() || cr.hovered());
                         let tab_hov = ui_kit::anim_hover(
                             ctx,
                             tr.id.with("hov"),
-                            !*active && hovered,
+                            !item.active && hovered,
                         );
-                        if prev_inactive_quiet && !*active && tab_hov < 0.05 {
-                            let div_x = cur_x - DOC_TAB_GAP * 0.5;
+                        if draw_divider && !any_moving && prev_quiet && !item.active && tab_hov < 0.05 && lift_t < 0.01 {
+                            let div_x = visual_x - DOC_TAB_GAP * 0.5;
                             painter.vline(
                                 div_x,
                                 (inactive_pill.center().y - 7.0)..=(inactive_pill.center().y + 7.0),
                                 Stroke::new(1.0, tab_divider_col),
                             );
                         }
-                        if *active {
-                            ui_kit::paint_chrome_tab(&painter, tab, 8.0, 8.0, pal.page_bg, chrome_tab_stroke);
+                        if item.active {
+                            ui_kit::paint_chrome_tab_lifted(&painter, tab, 8.0, 8.0, lift_t, pal.page_bg, chrome_tab_stroke);
                         } else {
-                            let bg = ui_kit::lerp_color(Color32::TRANSPARENT, tab_hover_fill, tab_hov);
+                            if lift_t > 0.01 {
+                                let shadow_alpha = (if pal.theme.is_dark() { 84.0 } else { 32.0 } * lift_t)
+                                    .round()
+                                    .clamp(0.0, 255.0) as u8;
+                                if shadow_alpha > 0 {
+                                    let shadow = egui::epaint::Shadow {
+                                        offset: [0, (2.0 * lift_t).round() as i8],
+                                        blur: (9.0 * lift_t).round().max(2.0) as u8,
+                                        spread: 0,
+                                        color: Color32::from_black_alpha(shadow_alpha),
+                                    };
+                                    painter.add(shadow.as_shape(inactive_pill, 7.0));
+                                }
+                            }
+                            let hover_bg = ui_kit::lerp_color(Color32::TRANSPARENT, tab_hover_fill, tab_hov);
+                            let lifted_surface = ui_kit::lerp_color(tab_hover_fill, pal.page_bg, 0.82);
+                            let bg = ui_kit::lerp_color(hover_bg, lifted_surface, lift_t);
                             if bg != Color32::TRANSPARENT {
                                 painter.rect_filled(inactive_pill, 7.0, bg);
                             }
+                            if lift_t > 0.05 {
+                                let border = ui_kit::lerp_color(Color32::TRANSPARENT, pal.card_border, lift_t * 0.9);
+                                if border != Color32::TRANSPARENT {
+                                    painter.rect_stroke(inactive_pill, 7.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                }
+                            }
                         }
-                        let text_pos = egui::pos2(tab.left() + 12.0, tab_cy - galley.size().y / 2.0);
-                        painter.galley(text_pos, galley, tc);
-                        if *dirty {
+                        let text_col = if item.active {
+                            pal.text
+                        } else {
+                            ui_kit::lerp_color(pal.text_weak, pal.text, lift_t * 0.85)
+                        };
+                        let text_pos = egui::pos2(tab.left() + 12.0, tab_cy - item.galley.size().y / 2.0);
+                        painter.galley_with_override_text_color(text_pos, item.galley.clone(), text_col);
+                        if item.dirty {
                             painter.circle_filled(egui::pos2(tab.right() - 27.0, tab_cy), 3.0, pal.warn_fg);
                         }
-                        let close_hov = ui_kit::anim_hover(ctx, cr.id.with("hov"), cr.hovered());
-                        let close_fill = if cr.is_pointer_button_down_on() {
+                        let close_hov = ui_kit::anim_hover(ctx, cr.id.with("hov"), !is_dragging_any && cr.hovered());
+                        let close_fill = if !is_dragging_any && cr.is_pointer_button_down_on() {
                             pal.pressed
                         } else {
                             ui_kit::lerp_color(Color32::TRANSPARENT, hover, close_hov)
@@ -1252,25 +1676,47 @@ impl SheetApp {
                         let cc0 = close.center();
                         painter.line_segment([egui::pos2(cc0.x - 3.2, cc0.y - 3.2), egui::pos2(cc0.x + 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
                         painter.line_segment([egui::pos2(cc0.x + 3.2, cc0.y - 3.2), egui::pos2(cc0.x - 3.2, cc0.y + 3.2)], Stroke::new(1.1, cc));
-                        let tab_tip = if *dirty {
-                            format!("{title}（有未保存的修改）")
+                        let tab_tip = if item.dirty {
+                            format!("{}（有未保存的修改）", item.title)
                         } else {
-                            title.clone()
+                            item.title.clone()
                         };
-                        ui_kit::a11y_role(&tr, &tab_tip, egui::accesskit::Role::Tab, Some(*active));
+                        ui_kit::a11y_role(tr, &tab_tip, egui::accesskit::Role::Tab, Some(item.active));
                         if ui_kit::is_accesskit_active(ctx) {
-                            ui_kit::a11y_name(&cr, &format!("关闭 {title}"), true, None);
+                            ui_kit::a11y_name(cr, &format!("关闭 {}", item.title), true, None);
                         }
-                        ui_kit::focus_ring(ui, &tr, if *active { tab_hit } else { inactive_pill }, 7.0);
-                        ui_kit::focus_ring(ui, &cr, close, 9.0);
-                        if cr.on_hover_text("关闭此文档 (Ctrl+W)").clicked() {
-                            do_close = Some(i);
-                        } else if tr.on_hover_text(tab_tip).clicked() {
-                            do_switch = Some(i);
+                        ui_kit::focus_ring(ui, tr, if item.active { tab_hit } else { inactive_pill }, 7.0);
+                        ui_kit::focus_ring(ui, cr, close, 9.0);
+                        if !is_dragging_any && !was_dragging {
+                            if cr.clone().on_hover_text("关闭此文档 (Ctrl+W)").clicked() {
+                                do_close = Some(item.slot_idx);
+                            } else if tr.clone().on_hover_text(tab_tip).clicked() {
+                                do_switch = Some(item.slot_idx);
+                            }
                         }
-                        prev_inactive_quiet = !*active && tab_hov < 0.05;
-                        cur_x += tw + DOC_TAB_GAP;
+                        (!item.active && tab_hov < 0.05 && lift_t < 0.01, lift_t)
+                    };
+
+                    for item in &vis_items {
+                        if elevated_uid == Some(item.uid) {
+                            prev_inactive_quiet = false;
+                            continue;
+                        }
+                        let (quiet, _) = paint_one(item, true, prev_inactive_quiet);
+                        prev_inactive_quiet = quiet;
                     }
+                    if let Some(el_uid) = elevated_uid {
+                        if let Some(item) = vis_items.iter().find(|it| it.uid == el_uid) {
+                            let (_, lift_t) = paint_one(item, false, false);
+                            let dx = anim.springs.get(&el_uid).map_or(0.0, |s| (s.x - item.slot_x).abs());
+                            elevated_settled = anim.dragged_uid.is_none() && dx < 0.5 && lift_t < 0.01;
+                        }
+                    }
+                    if elevated_settled && anim.dragged_uid.is_none() {
+                        anim.elevated_uid = None;
+                    }
+                    ctx.data_mut(|d| d.insert_temp(doc_anim_id, anim));
+
                     let switcher_id = egui::Id::new("title_document_switcher");
                     if overflow {
                         let button = Rect::from_center_size(egui::pos2(cur_x + 12.0, rect.center().y), Vec2::splat(24.0));
@@ -1294,7 +1740,7 @@ impl SheetApp {
                             ui.set_width(260.0);
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                             egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                                for (i, (title, dirty, active)) in tab_metas.iter().enumerate() {
+                                for (i, (_uid, title, dirty, active)) in tab_metas.iter().enumerate() {
                                     let text = if *dirty { format!("{title}（未保存）") } else { title.clone() };
                                     let row = egui::SelectableLabel::new(*active, &text);
                                     if ui.add(row).on_hover_text(text).clicked() {
@@ -1332,6 +1778,7 @@ impl SheetApp {
                         cur_x = plus.right() + 6.0;
                     }
                 } else {
+                    ctx.data_mut(|d| d.remove_temp::<DocTabAnimState>(doc_anim_id));
                     painter.text(
                         egui::pos2(rect.left() + 50.0, rect.center().y),
                         Align2::LEFT_CENTER,
@@ -1511,6 +1958,9 @@ impl SheetApp {
                 }
             });
 
+        if let Some((from, to)) = do_move {
+            self.move_tab(from, to);
+        }
         if let Some(i) = do_close {
             self.request_close_tab(i);
         }
@@ -1620,6 +2070,92 @@ impl SheetApp {
                 }
                 let max_tab_scroll = (tab_end - scroll_rect.width()).max(0.0);
                 self.tab_scroll = self.tab_scroll.clamp(0.0, max_tab_scroll);
+
+                // 底栏工作表标签拖拽微动效状态：兄弟标签弹簧让位 + 悬浮拖拽胶囊 + 松手丝滑落位
+                // 保持“松手才提交一次 swap_sheet_positions”的不变量，不破坏撤销栈与局域网协同协议。
+                let sheet_anim_id = egui::Id::new("wps_sheet_tab_anim_state");
+                let mut sheet_anim = ctx.data_mut(|d| {
+                    d.get_temp::<SheetTabAnimState>(sheet_anim_id).unwrap_or_default()
+                });
+                if sheet_anim.doc_uid != self.doc_uid {
+                    sheet_anim = SheetTabAnimState {
+                        doc_uid: self.doc_uid,
+                        ..Default::default()
+                    };
+                }
+                sheet_anim
+                    .offsets
+                    .retain(|id, _| self.wb.sheets.iter().any(|s| s.identity == *id));
+
+                let (pointer_pos, press_origin, dt) = ctx.input(|i| {
+                    (
+                        i.pointer.interact_pos(),
+                        i.pointer.press_origin(),
+                        i.unstable_dt,
+                    )
+                });
+                let active_drag_id = if structure_unavailable.is_none() {
+                    egui::DragAndDrop::payload::<SheetTabDrag>(ctx)
+                        .filter(|s| s.doc_uid == self.doc_uid)
+                        .map(|s| s.sheet_id)
+                } else {
+                    None
+                };
+
+                // 若上一帧刚完成松手换位，用上一帧视觉 X 与新槽位 X 的差值作为初始弹簧偏移，让松手落位完全无跳变
+                if !sheet_anim.pending_settle_x.is_empty() {
+                    let pending = std::mem::take(&mut sheet_anim.pending_settle_x);
+                    for tab in &sheet_tabs {
+                        let sid = self.wb.sheets[tab.index].identity;
+                        if let Some(prev_x) = pending.get(&sid) {
+                            let new_slot_x = scroll_rect.left() - self.tab_scroll + tab.start;
+                            sheet_anim.offsets.insert(sid, TabSpring { x: prev_x - new_slot_x, v: 0.0 });
+                        }
+                    }
+                }
+
+                // 拖拽至长标签条左右边缘时自动缓速平移，方便跨多表重排
+                if active_drag_id.is_some() && overflow {
+                    if let Some(p) = pointer_pos.filter(|p| scroll_rect.expand2(Vec2::new(8.0, 12.0)).contains(*p)) {
+                        let edge = 26.0;
+                        let step_dt = dt.clamp(0.0, 0.05);
+                        if p.x < scroll_rect.left() + edge && self.tab_scroll > 0.0 {
+                            self.tab_scroll = (self.tab_scroll - 260.0 * step_dt).max(0.0);
+                            ctx.request_repaint();
+                        } else if p.x > scroll_rect.right() - edge && self.tab_scroll < max_tab_scroll {
+                            self.tab_scroll = (self.tab_scroll + 260.0 * step_dt).min(max_tab_scroll);
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+
+                let from_vis = active_drag_id.and_then(|sid| {
+                    sheet_tabs.iter().position(|t| self.wb.sheets[t.index].identity == sid)
+                });
+                let hover_vis = from_vis.and_then(|_| {
+                    let p = pointer_pos.filter(|p| scroll_rect.contains(*p))?;
+                    let local_x = p.x - scroll_rect.left() + self.tab_scroll;
+                    sheet_tabs
+                        .iter()
+                        .position(|t| local_x >= t.start && local_x <= t.start + t.width())
+                });
+                let dragged_w = from_vis.map_or(0.0, |idx| sheet_tabs[idx].width());
+                for (vis_i, tab) in sheet_tabs.iter().enumerate() {
+                    let sid = self.wb.sheets[tab.index].identity;
+                    let target_dx = match (from_vis, hover_vis) {
+                        (Some(from), Some(target)) if target > from && vis_i > from && vis_i <= target => -dragged_w,
+                        (Some(from), Some(target)) if target < from && vis_i >= target && vis_i < from => dragged_w,
+                        _ => 0.0,
+                    };
+                    let sp = sheet_anim.offsets.entry(sid).or_default();
+                    ui_kit::anim_spring(ctx, &mut sp.x, &mut sp.v, target_dx, TAB_SPRING_OMEGA, TAB_SPRING_ZETA);
+                }
+
+                let mut newly_started_drag: Option<(usize, Rect)> = None;
+                let mut tab_rects: Vec<(u64, Rect, f32)> = Vec::with_capacity(sheet_tabs.len());
+                let mut drop_indicator: Option<(f32, Rect)> = None;
+                let mut dragged_source_rect: Option<Rect> = None;
+
                 ui.scope_builder(egui::UiBuilder::new().max_rect(scroll_rect), |ui| {
                     let area = egui::ScrollArea::horizontal()
                         .id_salt("sheet_tabs")
@@ -1628,27 +2164,46 @@ impl SheetApp {
                         .horizontal_scroll_offset(self.tab_scroll);
                     let out = area.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for tab in &sheet_tabs {
+                            for (vis_i, tab) in sheet_tabs.iter().enumerate() {
                                 let i = tab.index;
+                                let sid = self.wb.sheets[i].identity;
                                 let name = &self.wb.sheets[i].name;
                                 let tab_color = self.wb.sheets[i].tab_color;
                                 let is_grouped = self.selected_sheets.len() > 1
                                     && self.selected_sheets.contains(&i);
-                                let resp = ui_kit::sheet_tab(ui, name, tab.label.clone(), self.sheet_idx == i, is_grouped, tab_color);
+                                let is_dragged_tab = active_drag_id == Some(sid);
+                                let visual_dx = if is_dragged_tab {
+                                    0.0
+                                } else {
+                                    sheet_anim.offsets.get(&sid).map_or(0.0, |s| s.x)
+                                };
+                                let resp = ui_kit::sheet_tab_animated(
+                                    ui,
+                                    name,
+                                    tab.label.clone(),
+                                    self.sheet_idx == i,
+                                    is_grouped,
+                                    tab_color,
+                                    visual_dx,
+                                    is_dragged_tab,
+                                    active_drag_id.is_some(),
+                                );
+                                tab_rects.push((sid, resp.rect, visual_dx));
+                                if is_dragged_tab {
+                                    dragged_source_rect = Some(resp.rect);
+                                }
                                 if resp.gained_focus() {
                                     resp.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
                                 }
                                 if structure_unavailable.is_none() {
                                     if resp.drag_started_by(egui::PointerButton::Primary) {
-                                        resp.dnd_set_drag_payload(SheetTabDrag { doc_uid: self.doc_uid, sheet_id: self.wb.sheets[i].identity });
+                                        resp.dnd_set_drag_payload(SheetTabDrag { doc_uid: self.doc_uid, sheet_id: sid });
+                                        newly_started_drag = Some((vis_i, resp.rect));
                                     }
                                     if let Some(source) = resp.dnd_hover_payload::<SheetTabDrag>().filter(|s| s.doc_uid == self.doc_uid) {
                                         if let Some(from) = self.wb.sheets.iter().position(|sheet| sheet.identity == source.sheet_id).filter(|&from| from != i) {
                                             let x = if from < i { resp.rect.right() - 1.0 } else { resp.rect.left() + 1.0 };
-                                            ui.painter().line_segment(
-                                                [egui::pos2(x, resp.rect.top() + 4.0), egui::pos2(x, resp.rect.bottom() - 4.0)],
-                                                Stroke::new(2.0, pal.accent),
-                                            );
+                                            drop_indicator = Some((x, resp.rect));
                                             if ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
                                                 && resp.dnd_release_payload::<SheetTabDrag>().is_some() {
                                                 move_sheet = Some((from, i));
@@ -1728,6 +2283,82 @@ impl SheetApp {
                     });
                     self.tab_scroll = out.state.offset.x;
                 });
+
+                // 渲染工作表拖拽悬浮胶囊 + 柔和落点预览与圆头插入指示条
+                let effective_drag_vis = if let Some((vis_i, src_rect)) = newly_started_drag {
+                    let sid = self.wb.sheets[sheet_tabs[vis_i].index].identity;
+                    let start_px = press_origin.or(pointer_pos).map_or(src_rect.center().x, |p| p.x);
+                    sheet_anim.dragged_sheet_id = Some(sid);
+                    sheet_anim.grab_offset_x = (start_px - src_rect.left()).clamp(0.0, src_rect.width());
+                    sheet_anim.pill_x = src_rect.left();
+                    dragged_source_rect = Some(src_rect);
+                    Some(vis_i)
+                } else {
+                    from_vis
+                };
+
+                let is_sheet_dragging = effective_drag_vis.is_some() && move_sheet.is_none();
+                let sheet_lift_t = ui_kit::anim_drag_lift(
+                    ctx,
+                    egui::Id::new(("wps_sheet_drag_lift", self.doc_uid)),
+                    is_sheet_dragging,
+                );
+                if let Some(drag_vis) = effective_drag_vis {
+                    let tab = &sheet_tabs[drag_vis];
+                    let i = tab.index;
+                    let sid = self.wb.sheets[i].identity;
+                    let w = tab.width();
+                    let min_x = scroll_rect.left() - 2.0;
+                    let max_x = (scroll_rect.left() + tab_end - w + 2.0)
+                        .min(scroll_rect.right() - w + 2.0)
+                        .max(min_x);
+                    let default_x = dragged_source_rect.map_or(scroll_rect.left() - self.tab_scroll + tab.start, |r| r.left());
+                    let pill_x = pointer_pos
+                        .map_or(default_x, |p| p.x - sheet_anim.grab_offset_x)
+                        .clamp(min_x, max_x);
+                    sheet_anim.pill_x = pill_x;
+
+                    let overlay_painter = ui.painter().with_clip_rect(scroll_rect.expand2(Vec2::new(6.0, 6.0)));
+                    if let Some((ind_x, ind_rect)) = drop_indicator {
+                        let ind = Rect::from_min_max(
+                            egui::pos2(ind_x - 1.25, ind_rect.top() + 5.0),
+                            egui::pos2(ind_x + 1.25, ind_rect.bottom() - 5.0),
+                        );
+                        overlay_painter.rect_filled(ind, 1.25, pal.accent);
+                    }
+                    if move_sheet.is_none() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                        let pill_rect = Rect::from_min_size(
+                            egui::pos2(pill_x, scroll_rect.top()),
+                            Vec2::new(w, tokens::size::SHEET_TAB_H),
+                        );
+                        let is_grouped = self.selected_sheets.len() > 1 && self.selected_sheets.contains(&i);
+                        ui_kit::paint_sheet_tab_face(
+                            &overlay_painter,
+                            pill_rect,
+                            tab.label.clone(),
+                            self.sheet_idx == i,
+                            is_grouped,
+                            0.0,
+                            sheet_lift_t.max(0.15),
+                            self.wb.sheets[i].tab_color,
+                        );
+                    } else {
+                        // 松手提交移动：保存所有标签当前视觉 X，下一帧无缝接力弹簧落位
+                        for (rec_sid, rec_rect, rec_dx) in &tab_rects {
+                            let vx = if *rec_sid == sid {
+                                pill_x
+                            } else {
+                                rec_rect.left() + *rec_dx
+                            };
+                            sheet_anim.pending_settle_x.insert(*rec_sid, vx);
+                        }
+                        sheet_anim.dragged_sheet_id = None;
+                    }
+                } else {
+                    sheet_anim.dragged_sheet_id = None;
+                }
+                ctx.data_mut(|d| d.insert_temp(sheet_anim_id, sheet_anim));
 
                 if overflow {
                     for (i, (d, label)) in [(-1.0, "工作表标签左移"), (1.0, "工作表标签右移")].into_iter().enumerate() {
