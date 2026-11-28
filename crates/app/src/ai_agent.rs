@@ -277,7 +277,7 @@ fn demo_ai_messages() -> Vec<AiMessage> {
     vec![
         AiMessage {
             role: AiRole::User,
-            content: "请汇总各部门 Q1 营收与毛利率，用公式自动计算合计，并把毛利率低于 25% 的行标红。"
+            content: "请汇总各部门 Q1 营收与毛利率，用公式计算合计并标红毛利率低于 25% 的行。"
                 .into(),
             reasoning: String::new(),
             reasoning_open: false,
@@ -290,36 +290,28 @@ fn demo_ai_messages() -> Vec<AiMessage> {
             content: "\
 ## Q1 部门营收与毛利率汇总
 
-已完成 **Sheet1** 的公式填充与异常高亮，关键结论如下：
-
-- 合计营收使用 `=SUM(C2:C5)` 自动汇总，当前总计 **¥1,280.5 万**
-- 综合毛利率为 **31.4%**，*华东区* 与 *华南区* 盈利质量最佳
-- 检测到 `西北区` 毛利率仅 **21.8%**（低于 25% 阈值），已标红警示
-
-### 核心动态公式
+- 合计营收 `=SUM(C2:C4)` 为 **¥1,032.5 万**，*华东区*盈利最佳
+- `西北区` 毛利率 **21.8%** 低于 25% 阈值，已标红警示
 
 ```excel
 =IF(C2=0, 0, (C2-D2)/C2)
-=SUMIFS(C2:C5, B2:B5, \"华东区\")
 ```
 
 | 部门 | Q1 营收 | 毛利率 | 状态 |
 | :--- | ---: | ---: | :---: |
 | 华东区 | 482.0 万 | 36.2% | 达标 |
 | 华南区 | 396.5 万 | 33.8% | 达标 |
-| 华北区 | 248.0 万 | 28.5% | 达标 |
 | 西北区 | 154.0 万 | **21.8%** | 需复核 |
 
-> 如需按月拆分或自动生成数据透视表，可直接回复，所有写入均支持一键撤销。"
+> 已写入动态公式，所有修改支持一键撤销。"
                 .into(),
-            reasoning: "先读取工作簿结构与 Sheet1!A1:E12，确认营收在 C 列、成本在 D 列。\n毛利率采用 =IF(C2=0,0,(C2-D2)/C2) 避免除零错误，再用 =SUM(C2:C5) 汇总营收并标红毛利率低于 25% 的西北区。"
+            reasoning: "先读取工作簿结构与 Sheet1!A1:E12，确认营收在 C 列、成本在 D 列。\n毛利率采用 =IF(C2=0,0,(C2-D2)/C2) 避免除零错误，再用 =SUM(C2:C4) 汇总并标红毛利率低于 25% 的西北区。"
                 .into(),
             reasoning_open: false,
             tool_logs: vec![
-                "读取工作簿概览".into(),
-                "查看 Sheet1!A1:E12（4 个部门，12 行数据）".into(),
-                "填充公式 Sheet1!E2:E6（=IF(C2=0,0,(C2-D2)/C2)）".into(),
-                "设置样式 Sheet1!A5:E5（毛利率 < 25% 标红提醒）".into(),
+                "读取工作簿概览与 Sheet1!A1:E12".into(),
+                "填充公式 Sheet1!E2:E5（=IF(C2=0,0,(C2-D2)/C2)）".into(),
+                "高亮 Sheet1!A4:E4（毛利率 < 25% 标红）".into(),
             ],
             error: None,
             undo_ids: vec![1],
@@ -2371,7 +2363,7 @@ impl SheetApp {
                 }
 
                 // 3. 底部一体化现代输入盒（Claude / Codex 风格：输入区 + 底部上下文芯片/发送按钮融于同一圆角盒）
-                egui::TopBottomPanel::bottom("wps_ai_composer")
+                let composer_resp = egui::TopBottomPanel::bottom("wps_ai_composer")
                     .resizable(false)
                     .show_separator_line(false)
                     .frame(
@@ -2380,7 +2372,7 @@ impl SheetApp {
                             .inner_margin(egui::Margin {
                                 left: 12,
                                 right: 12,
-                                top: 6,
+                                top: 10,
                                 bottom: 12,
                             }),
                     )
@@ -2606,22 +2598,38 @@ impl SheetApp {
                         }
                     });
 
-                // 4. 开放式对话阅读流（无外框嵌套，充分留白）
-                egui::ScrollArea::vertical()
-                    .id_salt("wps_ai_msgs")
-                    .auto_shrink([false, false])
-                    .show(&mut body_ui, |ui| {
-                        egui::Frame::NONE
-                            .inner_margin(egui::Margin {
-                                left: 16,
-                                right: 16,
-                                top: 14,
-                                bottom: 14,
-                            })
-                            .show(ui, |ui| {
-                                let avail_msg_w = ui.available_width().max(80.0);
-                                ui.set_width(avail_msg_w);
-                                ui.spacing_mut().item_spacing.y = 14.0;
+                // 4. 开放式对话阅读流（严格裁切于输入区顶部细线之上，杜绝滚动内容越界侵入输入框）
+                let composer_rect = composer_resp.response.rect;
+                let avail_chat = body_ui.available_rect_before_wrap();
+                let chat_bottom = composer_rect.top().min(avail_chat.bottom());
+                let chat_rect = Rect::from_min_max(
+                    avail_chat.min,
+                    egui::pos2(avail_chat.right(), chat_bottom.max(avail_chat.top())),
+                );
+                if chat_rect.height() > 8.0 {
+                    let mut chat_ui = body_ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(chat_rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    chat_ui.style_mut().visuals.clip_rect_margin = 0.0;
+                    chat_ui.set_clip_rect(chat_rect.intersect(body_ui.clip_rect()));
+                    egui::ScrollArea::vertical()
+                        .id_salt("wps_ai_msgs")
+                        .max_height(chat_rect.height())
+                        .auto_shrink([false, false])
+                        .show(&mut chat_ui, |ui| {
+                            egui::Frame::NONE
+                                .inner_margin(egui::Margin {
+                                    left: 16,
+                                    right: 16,
+                                    top: 12,
+                                    bottom: 12,
+                                })
+                                .show(ui, |ui| {
+                                    let avail_msg_w = ui.available_width().max(80.0);
+                                    ui.set_width(avail_msg_w);
+                                    ui.spacing_mut().item_spacing.y = 12.0;
 
                                 // 4a. 空白欢迎态：通透无外框，静谧无边框单行建议
                                 if self.ai.messages.is_empty() {
@@ -2795,41 +2803,53 @@ impl SheetApp {
                                             } else {
                                                 Stroke::NONE
                                             };
+                                            let max_w = (avail_msg_w - 28.0)
+                                                .min(avail_msg_w * 0.86)
+                                                .max(120.0);
+                                            let mut job = egui::text::LayoutJob::default();
+                                            job.wrap.max_width = max_w;
+                                            job.halign = egui::Align::LEFT;
+                                            job.append(
+                                                txt,
+                                                0.0,
+                                                egui::TextFormat {
+                                                    font_id: FontId::proportional(13.0),
+                                                    color: pal.text,
+                                                    line_height: Some(20.0),
+                                                    ..Default::default()
+                                                },
+                                            );
+                                            let measured_w = ui
+                                                .fonts(|f| f.layout_job(job.clone()))
+                                                .size()
+                                                .x
+                                                .ceil()
+                                                .min(max_w)
+                                                .max(24.0);
                                             let row_resp = ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::TOP),
                                                 |ui| {
-                                                    egui::Frame::NONE
-                                                        .fill(user_bg)
-                                                        .stroke(user_stroke)
-                                                        .corner_radius(10.0)
-                                                        .inner_margin(egui::Margin::symmetric(
-                                                            12, 9,
-                                                        ))
-                                                        .show(ui, |ui| {
-                                                            let max_w = (avail_msg_w * 0.86)
-                                                                .max(150.0);
-                                                            ui.set_max_width(max_w);
-                                                            let mut job =
-                                                                egui::text::LayoutJob::default();
-                                                            job.wrap.max_width = max_w;
-                                                            job.append(
-                                                                txt,
-                                                                0.0,
-                                                                egui::TextFormat {
-                                                                    font_id: FontId::proportional(
-                                                                        13.0,
-                                                                    ),
-                                                                    color: pal.text,
-                                                                    line_height: Some(20.0),
-                                                                    ..Default::default()
-                                                                },
-                                                            );
-                                                            ui.add(
-                                                                egui::Label::new(job)
-                                                                    .selectable(true)
-                                                                    .wrap(),
-                                                            );
-                                                        });
+                                                    ui.allocate_ui_with_layout(
+                                                        Vec2::new(measured_w + 24.0, 0.0),
+                                                        egui::Layout::top_down(egui::Align::LEFT),
+                                                        |ui| {
+                                                            egui::Frame::NONE
+                                                                .fill(user_bg)
+                                                                .stroke(user_stroke)
+                                                                .corner_radius(10.0)
+                                                                .inner_margin(
+                                                                    egui::Margin::symmetric(12, 8),
+                                                                )
+                                                                .show(ui, |ui| {
+                                                                    ui.set_max_width(measured_w);
+                                                                    ui.add(
+                                                                        egui::Label::new(job)
+                                                                            .selectable(true)
+                                                                            .wrap(),
+                                                                    );
+                                                                });
+                                                        },
+                                                    );
                                                 },
                                             );
                                             self.ai
@@ -3016,149 +3036,153 @@ impl SheetApp {
 
                                                 // b) Codex / Claude Code 风格纵向工具时间轴（无外框嵌套）
                                                 if !msg.tool_logs.is_empty() {
-                                                    let any_err = msg
-                                                        .tool_logs
-                                                        .iter()
-                                                        .any(|l| classify_tool_log(l).1);
-                                                    let (th, tresp) = ui.allocate_exact_size(
-                                                        Vec2::new(avail_msg_w, 24.0),
-                                                        Sense::click(),
-                                                    );
-                                                    let hover_t = ai_anim_bool(
-                                                        ui.ctx(),
-                                                        egui::Id::new(("ai_tools_hdr", idx)),
-                                                        tresp.hovered(),
-                                                        0.11,
-                                                    );
-                                                    if hover_t > 0.01 {
-                                                        ui.painter().rect_filled(
-                                                            th,
-                                                            5.0,
-                                                            ai_lerp_color(
-                                                                Color32::TRANSPARENT,
-                                                                pal.hover,
-                                                                hover_t,
-                                                            ),
+                                                    ui.vertical(|ui| {
+                                                        ui.set_width(avail_msg_w);
+                                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                                        let any_err = msg
+                                                            .tool_logs
+                                                            .iter()
+                                                            .any(|l| classify_tool_log(l).1);
+                                                        let (th, tresp) = ui.allocate_exact_size(
+                                                            Vec2::new(avail_msg_w, 22.0),
+                                                            Sense::click(),
                                                         );
-                                                    }
-                                                    let dot_c = egui::pos2(
-                                                        th.left() + 7.0,
-                                                        th.center().y,
-                                                    );
-                                                    if any_err {
-                                                        ui.painter().circle_filled(
-                                                            dot_c,
-                                                            3.5,
-                                                            pal.err_fg,
+                                                        let hover_t = ai_anim_bool(
+                                                            ui.ctx(),
+                                                            egui::Id::new(("ai_tools_hdr", idx)),
+                                                            tresp.hovered(),
+                                                            0.11,
                                                         );
-                                                    } else {
-                                                        paint_tiny_check(
-                                                            ui.painter(),
-                                                            dot_c,
-                                                            pal.accent,
-                                                        );
-                                                    }
-                                                    let hdr_lbl = format!(
-                                                        "已完成 {} 项表格操作",
-                                                        msg.tool_logs.len()
-                                                    );
-                                                    let hdr_fg = ai_lerp_color(
-                                                        pal.text_weak,
-                                                        pal.text,
-                                                        hover_t,
-                                                    );
-                                                    ui.painter().text(
-                                                        egui::pos2(
-                                                            th.left() + 18.0,
-                                                            th.center().y,
-                                                        ),
-                                                        Align2::LEFT_CENTER,
-                                                        &hdr_lbl,
-                                                        ui_kit::medium_in(ui.ctx(), 12.0),
-                                                        hdr_fg,
-                                                    );
-                                                    if tools_open {
-                                                        ui_kit::caret(
-                                                            ui,
-                                                            egui::pos2(
-                                                                th.right() - 8.0,
-                                                                th.center().y,
-                                                            ),
-                                                            hdr_fg,
-                                                        );
-                                                    } else {
-                                                        ui_kit::caret_right(
-                                                            ui,
-                                                            egui::pos2(
-                                                                th.right() - 8.0,
-                                                                th.center().y,
-                                                            ),
-                                                            hdr_fg,
-                                                        );
-                                                    }
-                                                    if tresp.hovered() {
-                                                        ui.ctx().set_cursor_icon(
-                                                            egui::CursorIcon::PointingHand,
-                                                        );
-                                                    }
-                                                    if tresp.clicked() {
-                                                        ui.ctx().data_mut(|d| {
-                                                            d.insert_temp(open_id, !tools_open);
-                                                        });
-                                                    }
-
-                                                    if tools_open {
-                                                        let mut render_steps = |ui: &mut egui::Ui| {
-                                                            ui.spacing_mut().item_spacing.y = 1.0;
-                                                            let list_resp = ui.vertical(|ui| {
-                                                                ui.set_width(ui.available_width());
-                                                                for (ti, tl) in
-                                                                    msg.tool_logs.iter().enumerate()
-                                                                {
-                                                                    draw_ai_tool_step(
-                                                                        ui,
-                                                                        egui::Id::new((
-                                                                            "ai_step", idx, ti,
-                                                                        )),
-                                                                        tl,
-                                                                        elide_cache,
-                                                                    );
-                                                                }
-                                                            });
-                                                            let lr = list_resp.response.rect;
-                                                            let rail_x = lr.left() + 7.0;
-                                                            ui.painter().line_segment(
-                                                                [
-                                                                    egui::pos2(
-                                                                        rail_x,
-                                                                        lr.top() + 3.0,
-                                                                    ),
-                                                                    egui::pos2(
-                                                                        rail_x,
-                                                                        lr.bottom() - 3.0,
-                                                                    ),
-                                                                ],
-                                                                Stroke::new(
-                                                                    1.5_f32,
-                                                                    pal.chrome_separator(),
+                                                        if hover_t > 0.01 {
+                                                            ui.painter().rect_filled(
+                                                                th,
+                                                                5.0,
+                                                                ai_lerp_color(
+                                                                    Color32::TRANSPARENT,
+                                                                    pal.hover,
+                                                                    hover_t,
                                                                 ),
                                                             );
-                                                        };
-                                                        if msg.tool_logs.len() > 7 {
-                                                            egui::ScrollArea::vertical()
-                                                                .id_salt(("ai_tools_scroll", idx))
-                                                                .max_height(176.0)
-                                                                .auto_shrink([false, true])
-                                                                .show(ui, |ui| {
-                                                                    ui.set_width(
-                                                                        ui.available_width(),
-                                                                    );
-                                                                    render_steps(ui);
-                                                                });
-                                                        } else {
-                                                            render_steps(ui);
                                                         }
-                                                    }
+                                                        let dot_c = egui::pos2(
+                                                            th.left() + 7.0,
+                                                            th.center().y,
+                                                        );
+                                                        if any_err {
+                                                            ui.painter().circle_filled(
+                                                                dot_c,
+                                                                3.5,
+                                                                pal.err_fg,
+                                                            );
+                                                        } else {
+                                                            paint_tiny_check(
+                                                                ui.painter(),
+                                                                dot_c,
+                                                                pal.accent,
+                                                            );
+                                                        }
+                                                        let hdr_lbl = format!(
+                                                            "已完成 {} 项表格操作",
+                                                            msg.tool_logs.len()
+                                                        );
+                                                        let hdr_fg = ai_lerp_color(
+                                                            pal.text_weak,
+                                                            pal.text,
+                                                            hover_t,
+                                                        );
+                                                        ui.painter().text(
+                                                            egui::pos2(
+                                                                th.left() + 18.0,
+                                                                th.center().y,
+                                                            ),
+                                                            Align2::LEFT_CENTER,
+                                                            &hdr_lbl,
+                                                            ui_kit::medium_in(ui.ctx(), 12.0),
+                                                            hdr_fg,
+                                                        );
+                                                        if tools_open {
+                                                            ui_kit::caret(
+                                                                ui,
+                                                                egui::pos2(
+                                                                    th.right() - 8.0,
+                                                                    th.center().y,
+                                                                ),
+                                                                hdr_fg,
+                                                            );
+                                                        } else {
+                                                            ui_kit::caret_right(
+                                                                ui,
+                                                                egui::pos2(
+                                                                    th.right() - 8.0,
+                                                                    th.center().y,
+                                                                ),
+                                                                hdr_fg,
+                                                            );
+                                                        }
+                                                        if tresp.hovered() {
+                                                            ui.ctx().set_cursor_icon(
+                                                                egui::CursorIcon::PointingHand,
+                                                            );
+                                                        }
+                                                        if tresp.clicked() {
+                                                            ui.ctx().data_mut(|d| {
+                                                                d.insert_temp(open_id, !tools_open);
+                                                            });
+                                                        }
+
+                                                        if tools_open {
+                                                            let mut render_steps = |ui: &mut egui::Ui| {
+                                                                ui.spacing_mut().item_spacing.y = 1.0;
+                                                                let list_resp = ui.vertical(|ui| {
+                                                                    ui.set_width(ui.available_width());
+                                                                    for (ti, tl) in
+                                                                        msg.tool_logs.iter().enumerate()
+                                                                    {
+                                                                        draw_ai_tool_step(
+                                                                            ui,
+                                                                            egui::Id::new((
+                                                                                "ai_step", idx, ti,
+                                                                            )),
+                                                                            tl,
+                                                                            elide_cache,
+                                                                        );
+                                                                    }
+                                                                });
+                                                                let lr = list_resp.response.rect;
+                                                                let rail_x = lr.left() + 7.0;
+                                                                ui.painter().line_segment(
+                                                                    [
+                                                                        egui::pos2(
+                                                                            rail_x,
+                                                                            lr.top() + 3.0,
+                                                                        ),
+                                                                        egui::pos2(
+                                                                            rail_x,
+                                                                            lr.bottom() - 3.0,
+                                                                        ),
+                                                                    ],
+                                                                    Stroke::new(
+                                                                        1.5_f32,
+                                                                        pal.chrome_separator(),
+                                                                    ),
+                                                                );
+                                                            };
+                                                            if msg.tool_logs.len() > 7 {
+                                                                egui::ScrollArea::vertical()
+                                                                    .id_salt(("ai_tools_scroll", idx))
+                                                                    .max_height(176.0)
+                                                                    .auto_shrink([false, true])
+                                                                    .show(ui, |ui| {
+                                                                        ui.set_width(
+                                                                            ui.available_width(),
+                                                                        );
+                                                                        render_steps(ui);
+                                                                    });
+                                                            } else {
+                                                                render_steps(ui);
+                                                            }
+                                                        }
+                                                    });
                                                 }
 
                                                 // c) 助手 Markdown 正文阅读流
@@ -3343,7 +3367,17 @@ impl SheetApp {
                                     self.ai.scroll_bottom = false;
                                 }
                             });
-                    });
+                        });
+                }
+
+                // 输入区顶部 1px 分隔细线（把滚动阅读流与底部输入盒干净分隔）
+                body_ui.painter().line_segment(
+                    [
+                        egui::pos2(composer_rect.left(), composer_rect.top()),
+                        egui::pos2(composer_rect.right(), composer_rect.top()),
+                    ],
+                    Stroke::new(1.0_f32, pal.chrome_separator()),
+                );
 
                 // 左侧 1px 分隔细线，清晰区分工作表网格与 AI 阅读画布
                 ui.painter().line_segment(
@@ -4028,19 +4062,23 @@ mod grouped_undo_tests {
     fn ai_demo_env_hook_populates_markdown_and_renders_without_width_drift() {
         let env = crate::test_env::TestEnv::new("ai_demo_hook");
         env.sc("SC_AI_DEMO", "1");
+        env.sc("SC_SHOT", "1");
         let ctx = egui::Context::default();
+        crate::install_fonts(&ctx);
         let mut app = SheetApp::new_with_context(&ctx, None);
         assert!(app.ai.open, "SC_AI_DEMO=1 应自动打开 AI 面板");
         assert_eq!(app.ai.messages.len(), 2);
 
+        // 模拟 1440x900 主窗口扣除标题栏+功能区+编辑栏(~182px)与状态栏(~26px)后的 AI 面板实际高度 692px
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(1440.0, 900.0),
+                egui::vec2(1440.0, 692.0),
             )),
             ..Default::default()
         };
         let mut baseline = None;
+        let mut last_out = None;
         for _ in 0..4 {
             let out = ctx.run(raw.clone(), |ctx| {
                 app.draw_ai_panel(ctx);
@@ -4049,7 +4087,101 @@ mod grouped_undo_tests {
                 assert!((w - exp).abs() < 0.01, "demo panel width crept: {exp} -> {w}");
             });
             assert!(!out.shapes.is_empty());
+            last_out = Some(out);
         }
+
+        // 检查：1) 滚动区严格裁切于输入盒上方；2) 多行用户气泡内文本左对齐；3) 表格/引用/微操作全部落于视口内
+        fn walk_texts(
+            clip: egui::Rect,
+            s: &egui::Shape,
+            out: &mut Vec<(String, egui::Pos2, egui::Rect, egui::Rect, Vec<egui::Rect>)>,
+        ) {
+            match s {
+                egui::Shape::Text(ts) => {
+                    let vis = ts.visual_bounding_rect();
+                    let row_rects: Vec<egui::Rect> = ts
+                        .galley
+                        .rows
+                        .iter()
+                        .map(|r| r.rect.translate(ts.pos.to_vec2()))
+                        .collect();
+                    out.push((ts.galley.text().to_owned(), ts.pos, vis, clip, row_rects));
+                }
+                egui::Shape::Vec(v) => {
+                    for x in v {
+                        walk_texts(clip, x, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let out = last_out.unwrap();
+        let mut items = Vec::new();
+        for cs in &out.shapes {
+            walk_texts(cs.clip_rect, &cs.shape, &mut items);
+        }
+
+        let send_top = items
+            .iter()
+            .find(|(t, ..)| t == "发送")
+            .map(|(_, _, vis, ..)| vis.top())
+            .expect("composer 发送 button should render");
+        // 输入盒顶部位于发送按钮上方约 48px；聊天区裁切底边应位于输入盒之上（留出 >= 8px 清晰留白）
+        let composer_box_top = send_top - 48.0;
+
+        for needle in [
+            "请汇总各部门",
+            "Q1 部门营收与毛利率汇总",
+            "=IF(C2=0, 0, (C2-D2)/C2)",
+            "华东区",
+            "西北区",
+            "达标",
+            "需复核",
+            "已写入动态公式",
+            "撤销本轮表格编辑",
+        ] {
+            let hit = items
+                .iter()
+                .find(|(t, ..)| t.contains(needle))
+                .unwrap_or_else(|| panic!("demo viewport missing expected text `{needle}`"));
+            let (_, _, vis, clip, _) = hit;
+            assert!(
+                clip.max.y <= composer_box_top,
+                "chat item `{needle}` clip_rect.max.y={} bleeds into composer (composer_box_top={})",
+                clip.max.y,
+                composer_box_top
+            );
+            assert!(
+                vis.bottom() <= clip.max.y + 1.0,
+                "demo item `{needle}` pushed off-screen: bottom={} > clip.max.y={}",
+                vis.bottom(),
+                clip.max.y
+            );
+        }
+
+        let user_hit = items
+            .iter()
+            .find(|(t, ..)| t.contains("请汇总各部门"))
+            .expect("user bubble text");
+        assert!(
+            user_hit.4.len() >= 2,
+            "expected multi-line user bubble in demo, got {} row(s)",
+            user_hit.4.len()
+        );
+        assert!(
+            (user_hit.4[1].min.x - user_hit.4[0].min.x).abs() <= 1.0,
+            "multi-line user bubble line 2 must be left-aligned: row0={:?}, row1={:?}",
+            user_hit.4[0],
+            user_hit.4[1]
+        );
+        // 气泡整体靠右放置（x 起点大于面板中线偏左，至少高于 panel left + 25px）
+        let panel_left = 1440.0 - baseline.unwrap();
+        assert!(
+            user_hit.2.left() > panel_left + 32.0,
+            "user bubble should stay right-aligned in feed: text_left={}, panel_left={}",
+            user_hit.2.left(),
+            panel_left
+        );
         drop(env);
     }
 

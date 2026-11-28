@@ -1068,7 +1068,7 @@ fn render_table(
                     sw: 0,
                     se: 0,
                 })
-                .inner_margin(egui::Margin::symmetric(0, 5))
+                .inner_margin(egui::Margin::symmetric(0, 4))
                 .show(ui, |ui| {
                     ui.set_width(inner_w);
                     paint_table_row(ui, headers, alignments, &col_ws, true, pal);
@@ -1079,7 +1079,7 @@ fn render_table(
                 let (sep_r, _) = ui.allocate_exact_size(Vec2::new(inner_w, 1.0), Sense::hover());
                 ui.painter().rect_filled(sep_r, 0.0, pal.chrome_separator());
                 egui::Frame::NONE
-                    .inner_margin(egui::Margin::symmetric(0, 5))
+                    .inner_margin(egui::Margin::symmetric(0, 4))
                     .show(ui, |ui| {
                         ui.set_width(inner_w);
                         paint_table_row(ui, row, alignments, &col_ws, false, pal);
