@@ -1,4 +1,4 @@
-[workspace]
+﻿[workspace]
 members = ["crates/core", "crates/app"]
 resolver = "2"
 
@@ -33,3 +33,6 @@ opt-level = 3
 # GridCell），这里本地打一行补丁，让 UIA 的 IsSelected 对网格单元格与行列标可用。
 [patch.crates-io]
 accesskit_windows = { path = "vendor/accesskit_windows" }
+epaint = { path = "vendor/epaint" }
+egui-wgpu = { path = "vendor/egui-wgpu" }
+egui_glow = { path = "vendor/egui_glow" }
