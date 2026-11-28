@@ -12,6 +12,9 @@ struct Locals {
     // Uniform buffers need to be at least 16 bytes in WebGL.
     // See https://github.com/gfx-rs/wgpu/issues/2072
     _padding: u32,
+    cleartype_gamma: f32,
+    cleartype_contrast: f32,
+    _padding2: vec2<u32>,
 };
 @group(0) @binding(0) var<uniform> r_locals: Locals;
 

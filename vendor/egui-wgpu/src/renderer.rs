@@ -148,12 +148,17 @@ struct UniformBuffer {
     // Uniform buffers need to be at least 16 bytes in WebGL.
     // See https://github.com/gfx-rs/wgpu/issues/2072
     _padding: u32,
+    cleartype_gamma: f32,
+    cleartype_contrast: f32,
+    _padding2: [u32; 2],
 }
 
 impl PartialEq for UniformBuffer {
     fn eq(&self, other: &Self) -> bool {
         self.screen_size_in_points == other.screen_size_in_points
             && self.dithering == other.dithering
+            && self.cleartype_gamma.to_bits() == other.cleartype_gamma.to_bits()
+            && self.cleartype_contrast.to_bits() == other.cleartype_contrast.to_bits()
     }
 }
 
@@ -178,6 +183,7 @@ pub struct Texture {
 /// Renderer for a egui based GUI.
 pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
+    cleartype_pipeline: Option<wgpu::RenderPipeline>,
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
@@ -225,12 +231,16 @@ impl Renderer {
             device.create_shader_module(shader)
         };
 
+        let (initial_gamma, initial_contrast) = epaint::text::cleartype_blend_params();
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("egui_uniform_buffer"),
             contents: bytemuck::cast_slice(&[UniformBuffer {
                 screen_size_in_points: [0.0, 0.0],
                 dithering: u32::from(dithering),
                 _padding: Default::default(),
+                cleartype_gamma: initial_gamma,
+                cleartype_contrast: initial_contrast,
+                _padding2: Default::default(),
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -307,6 +317,29 @@ impl Renderer {
             bias: wgpu::DepthBiasState::default(),
         });
 
+        let vertex_buffers = [wgpu::VertexBufferLayout {
+            array_stride: 5 * 4,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            // 0: vec2 position
+            // 1: vec2 texture coordinates
+            // 2: uint color
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+        }];
+        let primitive = wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            unclipped_depth: false,
+            conservative: false,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::default(),
+            polygon_mode: wgpu::PolygonMode::default(),
+            strip_index_format: None,
+        };
+        let multisample = wgpu::MultisampleState {
+            alpha_to_coverage_enabled: false,
+            count: msaa_samples,
+            mask: !0,
+        };
+
         let pipeline = {
             profiling::scope!("create_render_pipeline");
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -315,31 +348,12 @@ impl Renderer {
                 vertex: wgpu::VertexState {
                     entry_point: Some("vs_main"),
                     module: &module,
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: 5 * 4,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        // 0: vec2 position
-                        // 1: vec2 texture coordinates
-                        // 2: uint color
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
-                    }],
-                    compilation_options: wgpu::PipelineCompilationOptions::default()
+                    buffers: &vertex_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    unclipped_depth: false,
-                    conservative: false,
-                    cull_mode: None,
-                    front_face: wgpu::FrontFace::default(),
-                    polygon_mode: wgpu::PolygonMode::default(),
-                    strip_index_format: None,
-                },
-                depth_stencil,
-                multisample: wgpu::MultisampleState {
-                    alpha_to_coverage_enabled: false,
-                    count: msaa_samples,
-                    mask: !0,
-                },
+                primitive,
+                depth_stencil: depth_stencil.clone(),
+                multisample,
 
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
@@ -365,12 +379,69 @@ impl Renderer {
                         }),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default()
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
                 multiview: None,
                 cache: None,
-            }
-        )
+            })
+        };
+
+        let cleartype_pipeline = if device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            profiling::scope!("create_cleartype_render_pipeline");
+            let ct_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("egui_cleartype"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "egui_cleartype.wgsl"
+                ))),
+            });
+            let ct_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("egui_cleartype_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    entry_point: Some("vs_main"),
+                    module: &ct_module,
+                    buffers: &vertex_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive,
+                depth_stencil,
+                multisample,
+                fragment: Some(wgpu::FragmentState {
+                    module: &ct_module,
+                    entry_point: Some(if output_color_format.is_srgb() {
+                        "fs_cleartype_linear_framebuffer"
+                    } else {
+                        "fs_cleartype_gamma_framebuffer"
+                    }),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_color_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview: None,
+                cache: None,
+            });
+            epaint::text::set_dual_source_blending_supported(true);
+            Some(ct_pipeline)
+        } else {
+            epaint::text::set_dual_source_blending_supported(false);
+            None
         };
 
         const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
@@ -380,6 +451,7 @@ impl Renderer {
 
         Self {
             pipeline,
+            cleartype_pipeline,
             vertex_buffer: SlicedBuffer {
                 buffer: create_vertex_buffer(device, VERTEX_BUFFER_START_CAPACITY),
                 slices: Vec::with_capacity(64),
@@ -396,6 +468,9 @@ impl Renderer {
                 screen_size_in_points: [0.0, 0.0],
                 dithering: 0,
                 _padding: 0,
+                cleartype_gamma: 0.0,
+                cleartype_contrast: 0.0,
+                _padding2: [0, 0],
             },
             uniform_bind_group,
             texture_bind_group_layout,
@@ -428,6 +503,9 @@ impl Renderer {
         // Whether or not we need to reset the render pass because a paint callback has just
         // run.
         let mut needs_reset = true;
+        let subpixel_active =
+            self.cleartype_pipeline.is_some() && epaint::text::cleartype_subpixel_active();
+        let mut bound_cleartype = false;
 
         let mut index_buffer_slices = self.index_buffer.slices.iter();
         let mut vertex_buffer_slices = self.vertex_buffer.slices.iter();
@@ -447,6 +525,7 @@ impl Renderer {
                     1.0,
                 );
                 render_pass.set_pipeline(&self.pipeline);
+                bound_cleartype = false;
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 needs_reset = false;
             }
@@ -473,6 +552,19 @@ impl Renderer {
                     let vertex_buffer_slice = vertex_buffer_slices.next().unwrap();
 
                     if let Some(Texture { bind_group, .. }) = self.textures.get(&mesh.texture_id) {
+                        let want_cleartype =
+                            subpixel_active && mesh.texture_id == epaint::TextureId::Managed(0);
+                        if want_cleartype != bound_cleartype {
+                            if want_cleartype {
+                                if let Some(ct_pipeline) = self.cleartype_pipeline.as_ref() {
+                                    render_pass.set_pipeline(ct_pipeline);
+                                    bound_cleartype = true;
+                                }
+                            } else {
+                                render_pass.set_pipeline(&self.pipeline);
+                                bound_cleartype = false;
+                            }
+                        }
                         render_pass.set_bind_group(1, bind_group, &[]);
                         render_pass.set_index_buffer(
                             self.index_buffer.buffer.slice(
@@ -852,11 +944,15 @@ impl Renderer {
         profiling::function_scope!();
 
         let screen_size_in_points = screen_descriptor.screen_size_in_points();
+        let (cleartype_gamma, cleartype_contrast) = epaint::text::cleartype_blend_params();
 
         let uniform_buffer_content = UniformBuffer {
             screen_size_in_points,
             dithering: u32::from(self.dithering),
             _padding: Default::default(),
+            cleartype_gamma,
+            cleartype_contrast,
+            _padding2: Default::default(),
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
             profiling::scope!("update uniforms");
@@ -1091,4 +1187,139 @@ impl ScissorRect {
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
+}
+
+#[cfg(test)]
+mod cleartype_tests {
+    use super::*;
+
+    fn cpu_cleartype_gamma_blend(
+        v: [f32; 4],
+        tex_rgb: [f32; 3],
+        dst: [f32; 3],
+        gamma: f32,
+        enhanced_contrast: f32,
+    ) -> ([f32; 4], [f32; 4], [f32; 3]) {
+        let gamma = gamma.max(1.0);
+        let enhanced_contrast = enhanced_contrast.max(0.0);
+        let alpha_denom = v[3].max(1e-5);
+        let fg = [
+            (v[0] / alpha_denom).clamp(0.0, 1.0),
+            (v[1] / alpha_denom).clamp(0.0, 1.0),
+            (v[2] / alpha_denom).clamp(0.0, 1.0),
+        ];
+        let lum = fg[0] * 0.299 + fg[1] * 0.587 + fg[2] * 0.114;
+
+        let mut eff = [0.0_f32; 3];
+        for i in 0..3 {
+            let t = tex_rgb[i];
+            let eff_dark = (t + (enhanced_contrast * 0.4) * t * (1.0 - t)).clamp(0.0, 1.0);
+            let eff_light = if t <= 0.0 {
+                0.0
+            } else {
+                t.max(1e-6).powf(1.0 / gamma)
+            };
+            eff[i] = eff_dark * (1.0 - lum) + eff_light * lum;
+        }
+        let max_eff = eff[0].max(eff[1]).max(eff[2]);
+        let out_color = [v[0] * eff[0], v[1] * eff[1], v[2] * eff[2], v[3] * max_eff];
+        let out_mask = [v[3] * eff[0], v[3] * eff[1], v[3] * eff[2], v[3] * max_eff];
+        let blended = [
+            out_color[0] + (1.0 - out_mask[0]) * dst[0],
+            out_color[1] + (1.0 - out_mask[1]) * dst[1],
+            out_color[2] + (1.0 - out_mask[2]) * dst[2],
+        ];
+        (out_color, out_mask, blended)
+    }
+
+    #[test]
+    fn uniform_buffer_layout_and_cleartype_eq() {
+        assert_eq!(std::mem::size_of::<UniformBuffer>(), 32);
+        let a = UniformBuffer {
+            screen_size_in_points: [1280.0, 720.0],
+            dithering: 1,
+            _padding: 0,
+            cleartype_gamma: 1.8,
+            cleartype_contrast: 0.5,
+            _padding2: [0, 0],
+        };
+        let mut b = a;
+        assert_eq!(a, b);
+        b.cleartype_gamma = 2.2;
+        assert_ne!(a, b);
+        b.cleartype_gamma = 1.8;
+        b.cleartype_contrast = 1.0;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cleartype_wgsl_dual_source_contract() {
+        let src = include_str!("egui_cleartype.wgsl");
+        assert!(
+            !src.lines()
+                .any(|line| line.trim_start().starts_with("enable ")),
+            "naga 24.0 rejects `enable dual_source_blending;`"
+        );
+        assert!(src.contains("@location(0) color: vec4<f32>"));
+        assert!(src.contains("@location(0) @second_blend_source mask: vec4<f32>"));
+        assert!(src.contains("fn fs_cleartype_gamma_framebuffer("));
+        assert!(src.contains("fn fs_cleartype_linear_framebuffer("));
+        assert!(src.contains("cleartype_gamma: f32"));
+        assert!(src.contains("cleartype_contrast: f32"));
+    }
+
+    #[test]
+    fn cleartype_blend_invariants_and_subpixel_weighting() {
+        let dst = [0.85, 0.90, 0.95];
+
+        // 1. Opaque untextured solid shape tex=(1,1,1) matches standard blend identically.
+        let (_, _, solid_opaque) =
+            cpu_cleartype_gamma_blend([0.2, 0.4, 0.6, 1.0], [1.0, 1.0, 1.0], dst, 1.8, 0.5);
+        for (got, want) in solid_opaque.iter().zip([0.2_f32, 0.4, 0.6]) {
+            assert!((got - want).abs() < 1e-6);
+        }
+
+        // 2. Semi-transparent solid shape tex=(1,1,1) matches premultiplied over identically.
+        let alpha = 0.4_f32;
+        let v = [0.2 * alpha, 0.5 * alpha, 0.8 * alpha, alpha];
+        let (_, _, solid_semi) = cpu_cleartype_gamma_blend(v, [1.0, 1.0, 1.0], dst, 1.8, 0.5);
+        for i in 0..3 {
+            let expected = v[i] + (1.0 - alpha) * dst[i];
+            assert!((solid_semi[i] - expected).abs() < 1e-6);
+        }
+
+        // 3. Additive shape (v.a == 0) with tex=(1,1,1) preserves dst + v.rgb identically.
+        let (_, mask_add, solid_add) =
+            cpu_cleartype_gamma_blend([0.1, 0.2, 0.3, 0.0], [1.0, 1.0, 1.0], dst, 1.8, 0.5);
+        assert!(mask_add.iter().all(|m| *m == 0.0));
+        for i in 0..3 {
+            let expected = [0.1, 0.2, 0.3][i] + dst[i];
+            assert!((solid_add[i] - expected).abs() < 1e-6);
+        }
+
+        // 4. Empty glyph texel tex=(0,0,0) leaves destination completely unchanged and NaN-free.
+        let (col0, mask0, empty) =
+            cpu_cleartype_gamma_blend([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0], dst, 1.8, 0.5);
+        assert!(col0.iter().all(|c| *c == 0.0));
+        assert!(mask0.iter().all(|m| *m == 0.0));
+        assert_eq!(empty, dst);
+
+        // 5. Luminance-aware weighting: white text on dark lifts mid-coverage more than dark on light.
+        let (_, mask_dark, _) =
+            cpu_cleartype_gamma_blend([0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5], [1.0; 3], 1.8, 0.5);
+        let (_, mask_light, _) =
+            cpu_cleartype_gamma_blend([1.0, 1.0, 1.0, 1.0], [0.5, 0.5, 0.5], [0.0; 3], 1.8, 0.5);
+        assert!(mask_dark[0] > 0.54 && mask_dark[0] < 0.56);
+        assert!(mask_light[0] > mask_dark[0] + 0.1);
+
+        // 6. Asymmetric subpixel mask blends R, G, B channels independently.
+        let (_, mask_sub, blended_sub) =
+            cpu_cleartype_gamma_blend([0.0, 0.0, 0.0, 1.0], [1.0, 0.5, 0.0], [1.0; 3], 1.8, 0.5);
+        assert!((mask_sub[0] - 1.0).abs() < 1e-6);
+        assert!(mask_sub[1] > 0.5 && mask_sub[1] < 0.6);
+        assert!(mask_sub[2].abs() < 1e-6);
+        assert!(blended_sub[0].abs() < 1e-6);
+        assert!(blended_sub[1] > 0.4 && blended_sub[1] < 0.5);
+        assert!((blended_sub[2] - 1.0).abs() < 1e-6);
+    }
 }
