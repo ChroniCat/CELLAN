@@ -11337,39 +11337,26 @@ impl SheetApp {
                                         .on_hover_text(&display_code);
                                     });
                                 ui.add_space(7.0);
-                                ui.horizontal_wrapped(|ui| {
-                                    let copy_label = if copied_recently {
-                                        "已复制，发给同事即可"
-                                    } else {
-                                        "一键复制邀请"
-                                    };
-                                    let doc_for_msg = if hosting {
-                                        current_doc_name.as_str()
-                                    } else {
-                                        remote_doc_name.as_str()
-                                    };
-                                    if ui_kit::primary_button(ui, copy_label).clicked() {
-                                        let msg = session_lock::format_share_invite_message(
-                                            doc_for_msg,
-                                            addr,
-                                            &share_secret,
-                                        );
-                                        ctx.copy_text(msg);
-                                        ctx.data_mut(|d| d.insert_temp(copied_id, now));
-                                        self.status = "已复制邀请消息，发给同事后点「粘贴并加入」即可实时协作".into();
-                                    }
-                                    if !share_secret.is_empty()
-                                        && ui_kit::pill(ui, "复制邀请码", "仅复制 cellan:// 邀请码（含地址与口令）").clicked()
-                                    {
-                                        ctx.copy_text(share_link.clone());
-                                        ctx.data_mut(|d| d.insert_temp(copied_id, now));
-                                        self.status = format!("已复制邀请码：{share_link}");
-                                    }
-                                    if ui_kit::pill(ui, "复制地址", "仅复制 IP:端口").clicked() {
-                                        ctx.copy_text(addr.clone());
-                                        self.status = format!("已复制协作地址：{addr}");
-                                    }
-                                });
+                                let copy_label = if copied_recently {
+                                    "已复制，发给同事即可"
+                                } else {
+                                    "复制邀请"
+                                };
+                                let doc_for_msg = if hosting {
+                                    current_doc_name.as_str()
+                                } else {
+                                    remote_doc_name.as_str()
+                                };
+                                if ui_kit::primary_button(ui, copy_label).clicked() {
+                                    let msg = session_lock::format_share_invite_message(
+                                        doc_for_msg,
+                                        addr,
+                                        &share_secret,
+                                    );
+                                    ctx.copy_text(msg);
+                                    ctx.data_mut(|d| d.insert_temp(copied_id, now));
+                                    self.status = "已复制邀请消息，发给同事后点「粘贴并加入」即可实时协作".into();
+                                }
                             }
                         });
 
@@ -26807,7 +26794,7 @@ fn clear_selection(&mut self) {
                                                     .size(12.0)
                                                     .color(bs_pal.text),
                                             );
-                                            if ui_kit::secondary_button(ui, "一键复制邀请").clicked() {
+                                            if ui_kit::secondary_button(ui, "复制邀请").clicked() {
                                                 let msg = session_lock::format_share_invite_message(
                                                     &doc_name,
                                                     &addr,
