@@ -128,7 +128,7 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         }
         let resp = ui.push_id(i, |ui| ui_kit::tab_ex(ui, layout, active, false)).inner;
         ui_kit::a11y_role(&resp, &tab.label, egui::accesskit::Role::Tab, Some(active));
-        ui_kit::focus_ring(ui, &resp, resp.rect, 4.0);
+        ui_kit::tab_focus_ring(ui, &resp, resp.rect.shrink2(Vec2::new(2.0, 3.0)), 5.0, active);
         if app.keytips && app.keytip_tab.is_none() {
             if let Some(ch) = tab.keytip.chars().next() {
                 let b = Rect::from_center_size(egui::pos2(resp.rect.center().x, resp.rect.top() + 6.0), Vec2::new(13.0, 11.0));
@@ -158,20 +158,33 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     let (_, rect) = ui.allocate_space(Vec2::new(28.0, 24.0));
     let resp = ui.interact(rect, menu_id.with("button"), Sense::click());
     let pal = crate::theme::palette();
-    let resp = resp.on_hover_text("更多选项卡");
-    ui_kit::a11y_name(&resp, "更多选项卡", true, None);
+    let active_hidden = hidden.iter().find(|(i, _)| *i == app.ribbon_tab);
+    let title = active_hidden.map(|(_, tab)| format!("更多选项卡，当前页为{}", tab.label));
+    let title = title.as_deref().unwrap_or("更多选项卡");
+    let resp = resp.on_hover_text(title);
+    ui_kit::a11y_name(&resp, title, true, None);
     if resp.clicked() {
         ui.memory_mut(|m| m.toggle_popup(menu_id));
     }
-    if resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id)) {
+    let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
+    if active_hidden.is_some() {
+        ui.painter().rect_filled(rect, 4.0, selected_fill);
+    } else if resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id)) {
         ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
     }
-    ui_kit::caret(ui, rect.center(), pal.text);
-    ui_kit::focus_ring(ui, &resp, rect, 4.0);
+    ui_kit::caret(ui, rect.center(), if active_hidden.is_some() { selected_ink } else { pal.text });
+    ui_kit::tab_focus_ring(ui, &resp, rect, 4.0, active_hidden.is_some());
     egui::popup_below_widget(ui, menu_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
         ui.set_width(132.0);
+        ui.visuals_mut().selection.bg_fill = selected_fill;
+        ui.visuals_mut().selection.stroke.color = selected_ink;
         for (i, tab) in hidden {
-            if ui.selectable_label(i == app.ribbon_tab, &tab.label).clicked() {
+            let active = i == app.ribbon_tab;
+            let mut label = egui::RichText::new(&tab.label);
+            if active {
+                label = label.font(ui_kit::medium_in(ui.ctx(), 12.5)).color(selected_ink);
+            }
+            if ui.selectable_label(active, label).clicked() {
                 select_tab(app, i, false);
                 ui.memory_mut(|m| m.close_popup());
             }
@@ -2889,6 +2902,49 @@ mod compact_tests {
             click(&mut app, main.center());
             assert_eq!(app.current_style().fill, Some(if enabled { chosen } else { previous }));
             assert!(app.color_popup.is_none());
+        }
+    }
+
+    #[test]
+    fn contextual_tab_keeps_its_selected_surface_when_only_overflow_fits() {
+        let _env = crate::test_env::TestEnv::new("ribbon-context-tab-surface");
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = SheetApp::new_with_context(&ctx, None);
+        app.wb.sheet_mut(0).tables.push(sheetcore::table::Table {
+            name: "Sales".into(), display: "Sales".into(), range: (0, 0, 2, 0),
+            columns: vec!["Total".into()], column_ids: vec![1], header_row: true, ..Default::default()
+        });
+        app.ribbon_tab = 100;
+        let label = app.ribbon.context.iter().find(|c| c.set_id == "TabSetTableTools").unwrap().tab.label.clone();
+        let overflow_name = format!("更多选项卡，当前页为{label}");
+        for theme in crate::theme::AppTheme::ALL {
+            crate::theme::apply_app_theme(&ctx, theme);
+            let pal = crate::theme::palette();
+            let (fill, ink) = ui_kit::active_tab_colors(pal);
+            for width in [1440.0, 48.0] {
+                let out = ctx.run(egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(width, 100.0))),
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| { ui.horizontal(|ui| tabs(&mut app, ui)); });
+                });
+                let selected = out.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) if r.fill == fill && r.rect.height() >= 18.0 => Some(r.rect),
+                    _ => None,
+                }).expect("the selected tab or its overflow trigger needs a full surface");
+                if width > 100.0 {
+                    assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+                        if t.galley.job.text == label && t.override_text_color == Some(ink)
+                        && selected.contains(t.pos + 0.5 * t.galley.size()))));
+                } else {
+                    assert_eq!(selected.width(), 28.0);
+                    assert!(out.platform_output.accesskit_update.unwrap().nodes.iter()
+                        .any(|(_, node)| node.label() == Some(overflow_name.as_str())));
+                }
+                assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                    if r.fill == pal.accent && r.rect.width() > 12.0 && r.rect.height() < 4.0)));
+            }
         }
     }
 

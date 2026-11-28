@@ -14,8 +14,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-/// Excel 绿色（选项卡下划线、工作表标签下划线、选中框）。
-/// 本机 Excel 16.0 实测取色：#217346，选中行列头底线、页签下的线、单元格选中框都是它。
+/// Excel 绿色（单元格选区及主题强调色）。
 pub const ACCENT: Color32 = Color32::from_rgb(33, 115, 70);
 /// 分区分隔线 / 控件边框
 pub const BORDER: Color32 = Color32::from_rgb(208, 208, 208);
@@ -1226,8 +1225,29 @@ pub fn text_toggle(
     }
 }
 
-/// Fluent 风格功能区页签：直接浮在 PAGE_BG 上，活动页签用 2.5px 主题绿圆角短横条标记，
-/// 下方命令区独立收为完整四圆角纯白卡片，彻底告别「半灰半白双拼断层框」。
+/// 当前页的底色和文字色。高对比使用反白；其它主题的底色比悬停态深一级。
+pub fn active_tab_colors(pal: crate::theme::ThemePalette) -> (Color32, Color32) {
+    if pal.theme == crate::theme::AppTheme::HighContrast {
+        (pal.text, pal.page_bg)
+    } else {
+        (pal.pressed, pal.text)
+    }
+}
+
+/// 高对比反白页签内的黑色焦点环，在白底上仍然可见。
+pub fn tab_focus_ring(ui: &egui::Ui, resp: &Response, chip: Rect, radius: f32, active: bool) {
+    let pal = crate::theme::palette();
+    if active && pal.theme == crate::theme::AppTheme::HighContrast {
+        if resp.has_focus() {
+            ui.painter().rect_stroke(chip.shrink(1.0), radius,
+                Stroke::new(crate::tokens::stroke::FOCUS, pal.page_bg), egui::StrokeKind::Inside);
+        }
+    } else {
+        focus_ring(ui, resp, chip, radius);
+    }
+}
+
+/// 按实际字重测量标签，溢出布局与最终绘制共用同一份字形。
 pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Galley>, f32) {
     let font = if emphasized {
         medium_in(ui.ctx(), 12.5)
@@ -1243,12 +1263,12 @@ pub fn layout_tab(ui: &egui::Ui, name: &str, emphasized: bool) -> (Arc<egui::Gal
 
 pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool, green: bool) -> Response {
     let (galley, width) = layout;
-    let text_w = galley.size().x;
     let pal = crate::theme::palette();
     let dark = ui.visuals().dark_mode || pal.theme.is_dark();
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, TAB_H), Sense::click());
+    let pill = rect.shrink2(Vec2::new(2.0, 3.0));
+    let (selected_fill, selected_ink) = active_tab_colors(pal);
     if green {
-        let pill = rect.shrink2(Vec2::new(2.0, 3.0));
         let fill = if resp.hovered() {
             if dark {
                 pal.pressed
@@ -1269,17 +1289,15 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
                 egui::StrokeKind::Inside,
             );
         }
-    } else if resp.hovered() && !active {
-        ui.painter().rect_filled(
-            rect.shrink2(Vec2::new(2.0, 3.0)),
-            5.0,
-            pal.hover_on_page,
-        );
+    } else if active {
+        ui.painter().rect_filled(pill, 5.0, selected_fill);
+    } else if resp.hovered() {
+        ui.painter().rect_filled(pill, 5.0, pal.hover_on_page);
     }
     let col = if green {
         pal.accent
     } else if active {
-        pal.text
+        selected_ink
     } else {
         pal.text_weak
     };
@@ -1287,14 +1305,6 @@ pub fn tab_ex(ui: &mut egui::Ui, layout: (Arc<egui::Galley>, f32), active: bool,
         .anchor_size(rect.center(), galley.size())
         .min;
     ui.painter().galley_with_override_text_color(pos, galley, col);
-    if active && !green {
-        let bar_w = (text_w + 4.0).max(16.0);
-        let bar = egui::Rect::from_center_size(
-            egui::pos2(rect.center().x, rect.bottom() - 2.0),
-            Vec2::new(bar_w, 2.6),
-        );
-        ui.painter().rect_filled(bar, 1.5, pal.accent);
-    }
     resp
 }
 
@@ -1901,35 +1911,29 @@ pub fn sheet_tab(
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     a11y_role(&resp, name, egui::accesskit::Role::Tab, Some(active || grouped));
     let chip = rect.shrink2(Vec2::new(1.0, 3.0));
-    if active {
-        ui.painter().rect_filled(chip, 4.0, pal.card_bg);
-        if pal.theme == crate::theme::AppTheme::HighContrast {
-            ui.painter().rect_stroke(chip, 4.0, Stroke::new(1.0, pal.card_border), egui::StrokeKind::Inside);
-        }
-        let bar = Rect::from_min_max(
-            egui::pos2(chip.left() + 6.0, chip.bottom() - 2.5),
-            egui::pos2(chip.right() - 6.0, chip.bottom()),
-        );
-        ui.painter().rect_filled(bar, 1.0, pal.accent);
+    let (fill, text_color) = if active {
+        active_tab_colors(pal)
     } else if grouped {
-        ui.painter().rect_filled(chip, 4.0, pal.accent_tint);
-        ui.painter().rect_stroke(chip, 4.0, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(chip, 4.0, pal.hover_on_page);
+        (pal.accent_tint, pal.accent_hover)
+    } else {
+        (if resp.hovered() { pal.hover_on_page } else { Color32::TRANSPARENT }, pal.text_weak)
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(chip, 4.0, fill);
     }
 
     let color_offset = if let Some([r, g, b]) = color {
         let swatch = Rect::from_center_size(egui::pos2(rect.left() + 10.0, rect.center().y), Vec2::splat(8.0));
-        ui.painter().rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, pal.text_weak), egui::StrokeKind::Inside);
+        let edge = if active && pal.theme == crate::theme::AppTheme::HighContrast { text_color } else { pal.text_weak };
+        ui.painter().rect(swatch, 2.0, Color32::from_rgb(r, g, b), Stroke::new(1.0, edge), egui::StrokeKind::Inside);
         5.0
     } else {
         0.0
     };
     let text_pos = Align2::CENTER_CENTER.anchor_size(rect.center() + Vec2::new(color_offset, 0.0), galley.size()).min;
-    let text_color = if active || grouped { pal.text } else { pal.text_weak };
     let elided = galley.elided;
     ui.painter().galley_with_override_text_color(text_pos, galley, text_color);
-    focus_ring(ui, &resp, chip, 4.0);
+    tab_focus_ring(ui, &resp, chip, 4.0, active);
     if elided {
         resp.on_hover_text(name)
     } else {
@@ -2468,7 +2472,7 @@ pub fn spin(ui: &mut egui::Ui, v: &mut f64, min: f64, max: f64, step: f64, width
     changed
 }
 
-/// 对话框标签页（现代 Excel 365 / WPS 扁平下划线胶囊页签）
+/// 对话框标签页使用底色和字重标记当前页。
 pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
     if tabs.is_empty() {
         return;
@@ -2502,9 +2506,8 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
     // 每格向下取整，预留行末间隙，避免逐控件像素取整将末页签挤入下一行。
     let slot = (width / tabs.len() as f32 - gap).floor();
     let tab_h = 32.0;
-    let rule = ui.painter().add(egui::Shape::Noop);
     let mut clicked = None;
-    let row = ui.horizontal_wrapped(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(gap, 0.0);
         for (i, t) in tabs.iter().enumerate() {
             let on = *sel as usize == i;
@@ -2529,17 +2532,13 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                 .anchor_size(rect.center(), galley.size())
                 .min;
             if on {
+                let (fill, ink) = active_tab_colors(pal);
                 ui.painter().rect_filled(
                     rect.shrink2(Vec2::new(1.0, 3.0)),
                     6.0,
-                    pal.accent_tint,
+                    fill,
                 );
-                let bar = egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + 8.0, rect.bottom() - 2.5),
-                    Vec2::new((rect.width() - 16.0).max(12.0), 2.5),
-                );
-                ui.painter().rect_filled(bar, 1.25, pal.accent);
-                ui.painter().galley_with_override_text_color(pos, galley, pal.accent);
+                ui.painter().galley_with_override_text_color(pos, galley, ink);
             } else {
                 if resp.hovered() {
                     ui.painter().rect_filled(
@@ -2554,7 +2553,7 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
                     if resp.hovered() { pal.text } else { pal.text_weak },
                 );
             }
-            focus_ring(ui, &resp, rect.shrink2(Vec2::new(0.0, 2.0)), 6.0);
+            tab_focus_ring(ui, &resp, rect.shrink2(Vec2::new(1.0, 3.0)), 6.0, on);
             a11y_role(&resp, t, egui::accesskit::Role::Tab, Some(on));
             if resp.clicked() {
                 clicked = Some(i as u8);
@@ -2566,10 +2565,6 @@ pub fn dialog_tabs(ui: &mut egui::Ui, sel: &mut u8, tabs: &[&str]) {
         ui.memory_mut(|m| m.request_focus(active_id));
         ui.ctx().request_repaint();
     }
-    let r = row.response.rect;
-    ui.painter().set(rule, egui::Shape::hline(
-        r.left()..=r.left() + width, r.bottom() - 0.5, Stroke::new(1.0, pal.card_border),
-    ));
     ui.add_space(6.0);
 }
 

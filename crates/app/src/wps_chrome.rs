@@ -471,20 +471,28 @@ mod sheet_tab_tests {
         app.new_document();
         app.wb.sheets = ["一月", "二月", "三月"].map(sheetcore::Sheet::new).into();
         app.selected_sheets.extend([0, 1]);
+        app.wb.sheets[0].tab_color = Some([255, 255, 255]);
         app.wb.sheets[1].tab_color = Some([230, 81, 0]);
-        let out = frame(&ctx, &mut app, Vec::new());
-        let rect = |name| text_rect(&out, name).unwrap().0;
-        let has_fill = |text: Rect, fill, min_width| {
-            out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                if r.fill == fill && r.rect.width() >= min_width && r.rect.x_range().contains(text.center().x)))
-        };
-        let pal = crate::theme::palette();
-        assert!(has_fill(rect("一月"), pal.accent, 20.0), "active tab has the underline");
-        assert!(!has_fill(rect("二月"), pal.accent, 20.0));
-        assert!(has_fill(rect("二月"), pal.accent_tint, 20.0), "group member has its own surface");
-        assert!(!has_fill(rect("三月"), pal.accent_tint, 20.0));
-        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-            if r.fill == Color32::from_rgb(230, 81, 0))));
+        for theme in crate::theme::AppTheme::ALL {
+            crate::theme::apply_app_theme(&ctx, theme);
+            let pal = crate::theme::palette();
+            let (active_fill, active_ink) = ui_kit::active_tab_colors(pal);
+            let out = frame(&ctx, &mut app, Vec::new());
+            let tab = |name| text_rect(&out, name).unwrap().0;
+            let has_face = |name, color| out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                if r.fill == color && r.rect.contains_rect(tab(name)) && r.rect.height() <= tokens::size::SHEET_TAB_H));
+            assert!(has_face("一月", active_fill));
+            assert!(has_face("二月", pal.accent_tint));
+            assert!(!has_face("三月", active_fill) && !has_face("三月", pal.accent_tint));
+            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+                if t.galley.job.text == "一月" && t.override_text_color == Some(active_ink))));
+            assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                if r.fill == pal.accent && r.rect.width() > 12.0 && r.rect.height() < 4.0)));
+            for color in [Color32::WHITE, Color32::from_rgb(230, 81, 0)] {
+                assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                    if r.fill == color && r.rect.size() == Vec2::splat(8.0))));
+            }
+        }
     }
 
     #[test]
@@ -1017,11 +1025,6 @@ impl SheetApp {
                             Stroke::new(1.0, pal.card_border),
                             egui::StrokeKind::Inside,
                         );
-                        painter.rect_filled(
-                            Rect::from_min_max(egui::pos2(hb.left() + 8.0, hb.top()), egui::pos2(hb.right() - 8.0, hb.top() + 2.5)),
-                            1.5,
-                            pal.accent,
-                        );
                     } else if hresp.hovered() {
                         painter.rect_filled(hb, 4.0, if hresp.is_pointer_button_down_on() { pal.pressed } else { hover });
                     }
@@ -1092,11 +1095,6 @@ impl SheetApp {
                                 pal.card_bg,
                                 Stroke::new(1.0, pal.card_border),
                                 egui::StrokeKind::Inside,
-                            );
-                            painter.rect_filled(
-                                Rect::from_min_max(egui::pos2(tab.left() + 8.0, tab.top()), egui::pos2(tab.right() - 8.0, tab.top() + 2.5)),
-                                1.5,
-                                pal.accent,
                             );
                         } else if tr.hovered() || cr.hovered() {
                             painter.rect_filled(tab, rad, hover);

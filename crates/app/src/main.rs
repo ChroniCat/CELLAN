@@ -9679,6 +9679,7 @@ impl SheetApp {
                                 for index in rows {
                                     let entry = &hits[index];
                                     let selected = index == self.palette_idx;
+                                    let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
                                     let path = entry.path();
                                     let (rect, resp) = ui.allocate_exact_size(
                                         Vec2::new(ui.available_width(), row_height),
@@ -9688,15 +9689,8 @@ impl SheetApp {
                                         ui.painter().rect_filled(
                                             rect,
                                             4.0,
-                                            if selected { pal.accent_tint } else { pal.hover },
+                                            if selected { selected_fill } else { pal.hover },
                                         );
-                                    }
-                                    if selected {
-                                        let bar = Rect::from_center_size(
-                                            rect.left_center() + Vec2::new(2.0, 0.0),
-                                            Vec2::new(3.0, 16.0),
-                                        );
-                                        ui.painter().rect_filled(bar, 1.5, pal.accent);
                                     }
                                     let path_font = FontId::proportional(11.5);
                                     let path_width = ui
@@ -9713,18 +9707,18 @@ impl SheetApp {
                                         ui.painter(),
                                         label_rect,
                                         &entry.label,
-                                        ui_kit::medium_in(ctx, 12.5),
-                                        pal.text,
+                                        if selected { ui_kit::medium_in(ctx, 12.5) } else { FontId::proportional(12.5) },
+                                        if selected { selected_ink } else { pal.text },
                                     );
                                     paint_fitted_label(
                                         ui.painter(),
                                         path_rect,
                                         &path,
                                         path_font,
-                                        pal.text_weak,
+                                        if selected && pal.theme == theme::AppTheme::HighContrast { selected_ink } else { pal.text_weak },
                                     );
                                     ui_kit::a11y_name(&resp, &entry.label, true, Some(selected));
-                                    ui_kit::focus_ring(ui, &resp, rect, 4.0);
+                                    ui_kit::tab_focus_ring(ui, &resp, rect, 4.0, selected);
                                     if resp.gained_focus() && !down && !up {
                                         self.palette_idx = index;
                                     }
@@ -22918,6 +22912,23 @@ fn clear_selection(&mut self) {
                     pill_font.clone(),
                     pal.info_fg,
                 );
+                if let Some(revision) = option_env!("CELLAN_RELEASE_COMMIT") {
+                    let popup = ui.id().with("about_build_revision");
+                    let badge = ui.interact(vpill, popup.with("badge"), Sense::click());
+                    let detail = format!("构建提交 {}", &revision[..12]);
+                    ui_kit::a11y_name(&badge, "显示构建信息", true, None);
+                    ui_kit::focus_ring(ui, &badge, vpill, 10.0);
+                    if badge.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(popup));
+                    }
+                    if ui.memory(|m| m.is_popup_open(popup)) {
+                        egui::popup_below_widget(ui, popup, &badge, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            ui.label(&detail);
+                        });
+                    } else {
+                        badge.on_hover_text(detail);
+                    }
+                }
 
                 p.text(
                     egui::pos2(hero.left() + 66.0, hero.center().y + 13.0),
@@ -24062,16 +24073,17 @@ fn clear_selection(&mut self) {
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         ui.spacing_mut().interact_size.y = tokens::size::BTN_H;
                         let pal = theme::palette();
-                        ui.visuals_mut().selection.bg_fill = pal.accent_tint;
-                        ui.visuals_mut().selection.stroke.color = pal.text;
+                        let (fill, ink) = ui_kit::active_tab_colors(pal);
+                        ui.visuals_mut().selection.bg_fill = fill;
+                        ui.visuals_mut().selection.stroke.color = ink;
                         for i in matches {
                             let name = &self.wb.sheets[i].name;
                             let active = i == self.sheet_idx;
-                            let row = ui.selectable_label(active, name).on_hover_text(name);
+                            let mut label = egui::RichText::new(name);
                             if active {
-                                let edge = row.rect.shrink2(Vec2::new(1.0, 4.0));
-                                ui.painter().line_segment([edge.left_top(), edge.left_bottom()], Stroke::new(2.0, pal.accent));
+                                label = label.color(ink);
                             }
+                            let row = ui.selectable_label(active, label).on_hover_text(name);
                             if row.clicked() {
                                 pick = Some(i);
                             }
@@ -26239,6 +26251,7 @@ fn clear_selection(&mut self) {
                     ("关闭", 6),
                 ];
                 let mut y = nav.top() + 56.0;
+                let (selected_fill, selected_ink) = ui_kit::active_tab_colors(bs_pal);
                 for (label, page) in items {
                     let r = Rect::from_min_size(
                         egui::pos2(nav.left() + 10.0, y),
@@ -26246,19 +26259,9 @@ fn clear_selection(&mut self) {
                     );
                     let resp = ui.interact(r, egui::Id::new(("bs_nav", page)), Sense::click());
                     let active = self.backstage_page == page;
+                    ui_kit::a11y_name(&resp, label, true, Some(active));
                     if active {
-                        ui.painter().rect(
-                            r,
-                            6.0,
-                            bs_pal.card_bg,
-                            Stroke::new(1.0, bs_pal.card_border),
-                            egui::StrokeKind::Inside,
-                        );
-                        ui.painter().rect_filled(
-                            Rect::from_min_size(egui::pos2(r.left() + 4.0, r.center().y - 8.0), Vec2::new(3.0, 16.0)),
-                            1.5,
-                            bs_pal.accent,
-                        );
+                        ui.painter().rect_filled(r, 6.0, selected_fill);
                     } else if resp.hovered() {
                         ui.painter().rect_filled(r, 6.0, bs_pal.hover_on_page);
                     }
@@ -26267,7 +26270,7 @@ fn clear_selection(&mut self) {
                             ui.painter(),
                             Rect::from_center_size(egui::pos2(r.left() + 20.0, r.center().y), Vec2::splat(15.0)),
                             0,
-                            bs_home_col,
+                            if active { selected_ink } else { bs_home_col },
                         );
                         ui_kit::paint_medium(
                             ui.painter(),
@@ -26275,7 +26278,7 @@ fn clear_selection(&mut self) {
                             Align2::LEFT_CENTER,
                             label,
                             12.5,
-                            bs_home_col,
+                            if active { selected_ink } else { bs_home_col },
                         );
                     } else {
                         ui.painter().text(
@@ -26283,9 +26286,10 @@ fn clear_selection(&mut self) {
                             Align2::LEFT_CENTER,
                             label,
                             if active { ui_kit::medium_in(ctx, 12.5) } else { FontId::proportional(12.5) },
-                            bs_pal.text,
+                            if active { selected_ink } else { bs_pal.text },
                         );
                     }
+                    ui_kit::tab_focus_ring(ui, &resp, r, 6.0, active);
                     if resp.clicked() {
                         if page == 7 {
                             action = Some(7);
@@ -36911,6 +36915,7 @@ impl SheetApp {
         let head_bg = grid_pal.header_bg;
         let head_fg = grid_pal.header_text;
         let head_sel = grid_pal.header_sel;
+        let selected_head_fg = if grid_pal.theme == theme::AppTheme::HighContrast { grid_pal.accent } else { grid_pal.text };
         let header_a11y = self.show_headings && ui_kit::is_accesskit_active(ctx);
         // 合批网格线与表头分隔线进单一 Mesh，消除 ~120 个独立 line_segment 图元三角化开销
         let mut grid_mesh = egui::Mesh::default();
@@ -36939,13 +36944,13 @@ impl SheetApp {
             .filter
             .as_ref()
             .map(|f| (f.range.0, f.range.2));
-        let row_num_fg = |r: u32| -> Color32 {
+        let row_num_fg = |r: u32, selected: bool| -> Color32 {
             if let Some((r1, r2)) = filter_rows {
                 if r >= r1 && r <= r2 {
                     return grid_pal.info_fg;
                 }
             }
-            head_fg
+            if selected { selected_head_fg } else { head_fg }
         };
 
         self.cf_inputs
@@ -36954,7 +36959,6 @@ impl SheetApp {
         let head_font = FontId::new(12.0, family_named("latin"));
         // 列标题
         // Excel：选区覆盖到的列在列头上整块加深（不是只有活动格那一列）。
-        // 绿线统一放在表头分界线之后画，才不会被 1px 的边框盖住。
         let col_groups = &outline.cols;
         let mut pending_col_toggle: Vec<(u32, u32)> = Vec::new();
         let (mut sr1, mut sc1, mut sr2, mut sc2) = self.sel_rect();
@@ -36995,7 +36999,7 @@ impl SheetApp {
                     Align2::CENTER_CENTER,
                     col_label(c),
                     head_font.clone(),
-                    head_fg,
+                    if (sc1..=sc2).contains(&c) { selected_head_fg } else { head_fg },
                 );
                 col_outline_button(
                     ui,
@@ -37059,7 +37063,7 @@ impl SheetApp {
                                     Align2::CENTER_CENTER,
                                     col_label(c),
                                     FontId::new(12.0, family_named("latin")),
-                                    head_fg,
+                                    if (sc1..=sc2).contains(&c) { selected_head_fg } else { head_fg },
                                 );
                     col_outline_button(
                         ui,
@@ -37110,7 +37114,7 @@ impl SheetApp {
                     Align2::CENTER_CENTER,
                     (r + 1).to_string(),
                     FontId::new(12.0, family_named("latin")),
-                    row_num_fg(r),
+                    row_num_fg(r, (sr1..=sr2).contains(&r)),
                 );
             }
             if y >= origin.y + hh {
@@ -37239,7 +37243,7 @@ impl SheetApp {
                                     Align2::CENTER_CENTER,
                                     (r + 1).to_string(),
                                     FontId::new(12.0, family_named("latin")),
-                                    row_num_fg(r),
+                                    row_num_fg(r, (sr1..=sr2).contains(&r)),
                                 );
                     // 分级显示：明细在下方时按钮画在组最后一行下面那行，在上方时画在上面那行
                     let (sum_below, symbols_on) = {
@@ -37351,36 +37355,6 @@ impl SheetApp {
         if dumping {
             dump.push(format!("head_sel cols={sc1}..{sc2} rows={sr1}..{sr2}"));
         }
-        // 选中行列头的 2px 绿线：Excel 画在表头最外沿，盖住分界线
-        if self.show_headings {
-            let x_min = if sc1 < fx { origin.x + head_w } else { body_x };
-            let x0 = px_of(sc1).max(x_min);
-            let x1 = px_of(sc2 + 1).min(origin.x + avail.x);
-            if x1 > x0 {
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        egui::pos2(x0, origin.y + hh - 2.0),
-                        egui::pos2(x1, origin.y + hh),
-                    ),
-                    0.0,
-                    grid_pal.accent,
-                );
-            }
-            let y_min = if sr1 < fy { origin.y + hh } else { body_y };
-            let y0 = py_of(sr1).max(y_min);
-            let y1 = py_of(sr2 + 1).min(origin.y + avail.y);
-            if y1 > y0 {
-                painter.rect_filled(
-                    Rect::from_min_max(
-                        egui::pos2(origin.x + head_w - 2.0, y0),
-                        egui::pos2(origin.x + head_w, y1),
-                    ),
-                    0.0,
-                    grid_pal.accent,
-                );
-            }
-        }
-
         // 条件格式叠加：精确收敛到当前可视行列（含冻结区）并按 (doc_gen, 视口边界) 缓存，
         // 大表统计量通过 `refresh_responsive` 后台异步刷新，单格编辑不再整屏清空条件格式与排版缓存。
         let si = self.sheet_idx;
@@ -44972,6 +44946,7 @@ fn elide(s: &str, max_chars: usize) -> String {
         let mut open_ai_from_home = false;
         let mut open_members_from_home = false;
         let mut y = rail.top() + 14.0;
+        let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
         for (label, kind) in items {
             let row = Rect::from_min_size(
                 egui::pos2(rail.left() + 12.0, y),
@@ -44981,26 +44956,7 @@ fn elide(s: &str, max_chars: usize) -> String {
             let active = kind == 0;
             ui_kit::a11y_name(&r, label, true, Some(active));
             if active {
-                p.rect_filled(
-                    row.translate(Vec2::new(0.0, 1.0)),
-                    8.0,
-                    Color32::from_black_alpha(7),
-                );
-                p.rect(
-                    row,
-                    8.0,
-                    pal.card_bg,
-                    egui::Stroke::new(1.0, pal.card_border),
-                    egui::StrokeKind::Inside,
-                );
-                p.rect_filled(
-                    Rect::from_min_size(
-                        egui::pos2(row.left() + 4.0, row.center().y - 8.0),
-                        Vec2::new(3.0, 16.0),
-                    ),
-                    1.5,
-                    pal.accent,
-                );
+                p.rect_filled(row, 8.0, selected_fill);
             } else if r.hovered() {
                 p.rect_filled(row, 8.0, pal.hover_on_page);
             }
@@ -45012,7 +44968,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                 Vec2::splat(16.0),
             );
             let ic_col = if active {
-                pal.accent
+                selected_ink
             } else if r.hovered() {
                 pal.text
             } else {
@@ -45032,7 +44988,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     egui::Align2::LEFT_CENTER,
                     label,
                     12.5,
-                    pal.text,
+                    selected_ink,
                 );
             } else {
                 p.text(
@@ -45043,7 +44999,7 @@ fn elide(s: &str, max_chars: usize) -> String {
                     pal.text,
                 );
             }
-            ui_kit::focus_ring(ui, &r, row, 8.0);
+            ui_kit::tab_focus_ring(ui, &r, row, 8.0, active);
             if r.clicked() {
                 match kind {
                     3 => open_ai_from_home = true,
@@ -50239,8 +50195,12 @@ impl eframe::App for SheetApp {
                     egui::pos2(rect.right() - 28.0, rect.bottom() - 4.0),
                 );
                 if locked_by_other.is_none() && self.editing.as_ref().is_some_and(|ed| ed.spot == EditSpot::FormulaBar) {
-                    painter.hline(ed_rect.x_range(), ed_rect.bottom(),
-                        Stroke::new(if fx_pal.theme == theme::AppTheme::HighContrast { 2.0 } else { 1.5 }, fx_pal.accent));
+                    let border = if fx_pal.theme == theme::AppTheme::HighContrast {
+                        Stroke::new(1.5, fx_pal.text)
+                    } else {
+                        Stroke::NONE
+                    };
+                    painter.rect(ed_rect, 3.0, fx_pal.hover, border, egui::StrokeKind::Inside);
                 }
                 if let Some(holder) = &locked_by_other {
                     painter.rect(

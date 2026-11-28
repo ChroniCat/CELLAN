@@ -584,19 +584,20 @@ impl SheetApp {
                                     ui.allocate_ui_with_layout(Vec2::new(120.0, 0.0), layout, |ui| {
                                         ui.set_min_height(248.0);
                                         ui.spacing_mut().item_spacing.y = 2.0;
-                                        ui.visuals_mut().selection.bg_fill = pal.accent_tint;
-                                        ui.visuals_mut().selection.stroke.color = pal.text;
+                                        let (fill, ink) = ui_kit::active_tab_colors(pal);
+                                        ui.visuals_mut().selection.bg_fill = fill;
+                                        ui.visuals_mut().selection.stroke.color = ink;
                                         let cats = [
                                             "常规", "数值", "货币", "会计专用", "日期", "时间",
                                             "百分比", "分数", "科学记数", "文本", "特殊", "自定义",
                                         ];
                                         for (idx, name) in cats.iter().enumerate() {
                                             let sel = !format_mixed && self.fmt_num_cat == idx as u8;
-                                            let r = ui.selectable_label(sel, *name);
+                                            let mut label = egui::RichText::new(*name);
                                             if sel {
-                                                let edge = r.rect.shrink2(Vec2::new(1.0, 4.0));
-                                                ui.painter().line_segment([edge.left_top(), edge.left_bottom()], Stroke::new(2.0, pal.accent));
+                                                label = label.color(ink);
                                             }
+                                            let r = ui.selectable_label(sel, label);
                                             if r.clicked() {
                                                 self.fmt_num_cat = idx as u8;
                                                 let next_fmt = category_code_sample(
