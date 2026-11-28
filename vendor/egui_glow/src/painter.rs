@@ -20,6 +20,120 @@ pub use glow::Context;
 
 const VERT_SRC: &str = include_str!("shader/vertex.glsl");
 const FRAG_SRC: &str = include_str!("shader/fragment.glsl");
+const FRAG_CLEARTYPE_SRC: &str = include_str!("shader/fragment_cleartype.glsl");
+
+struct ClearTypeProgram {
+    program: glow::Program,
+    u_screen_size: glow::UniformLocation,
+    u_sampler: glow::UniformLocation,
+    u_cleartype_params: glow::UniformLocation,
+}
+
+fn supports_cleartype_dual_source(
+    gl_major: u32,
+    gl_minor: u32,
+    shader_version: ShaderVersion,
+    supported_extensions: &std::collections::HashSet<String>,
+) -> bool {
+    !cfg!(target_arch = "wasm32")
+        && !shader_version.is_embedded()
+        && (gl_major > 3
+            || (gl_major == 3 && gl_minor >= 3)
+            || supported_extensions
+                .iter()
+                .any(|ext| ext.ends_with("ARB_blend_func_extended")))
+}
+
+unsafe fn try_compile_cleartype_program(
+    gl: &glow::Context,
+    shader_prefix: &str,
+    dithering: bool,
+    srgb_textures: bool,
+    a_pos_loc: u32,
+    a_tc_loc: u32,
+    a_srgba_loc: u32,
+) -> Option<ClearTypeProgram> {
+    let result: Result<ClearTypeProgram, String> = (|| unsafe {
+        let vert = compile_shader(
+            gl,
+            glow::VERTEX_SHADER,
+            &format!(
+                "#version 330\n#define NEW_SHADER_INTERFACE 1\n{}\n{}",
+                shader_prefix, VERT_SRC
+            ),
+        )?;
+        let frag = match compile_shader(
+            gl,
+            glow::FRAGMENT_SHADER,
+            &format!(
+                "#version 330\n#define DITHERING {}\n#define SRGB_TEXTURES {}\n{}\n{}",
+                dithering as i32, srgb_textures as i32, shader_prefix, FRAG_CLEARTYPE_SRC
+            ),
+        ) {
+            Ok(s) => s,
+            Err(err) => {
+                gl.delete_shader(vert);
+                return Err(err);
+            }
+        };
+        let program = match gl.create_program() {
+            Ok(p) => p,
+            Err(err) => {
+                gl.delete_shader(vert);
+                gl.delete_shader(frag);
+                return Err(err);
+            }
+        };
+        gl.attach_shader(program, vert);
+        gl.attach_shader(program, frag);
+        // Bind vertex attributes to the exact same VAO slots used by the standard program.
+        gl.bind_attrib_location(program, a_pos_loc, "a_pos");
+        gl.bind_attrib_location(program, a_tc_loc, "a_tc");
+        gl.bind_attrib_location(program, a_srgba_loc, "a_srgba");
+        gl.link_program(program);
+        gl.detach_shader(program, vert);
+        gl.detach_shader(program, frag);
+        gl.delete_shader(vert);
+        gl.delete_shader(frag);
+
+        if !gl.get_program_link_status(program) {
+            let log = gl.get_program_info_log(program);
+            gl.delete_program(program);
+            return Err(log);
+        }
+        let u_screen_size = gl.get_uniform_location(program, "u_screen_size");
+        let u_sampler = gl.get_uniform_location(program, "u_sampler");
+        let u_cleartype_params = gl.get_uniform_location(program, "u_cleartype_params");
+        let (Some(u_screen_size), Some(u_sampler), Some(u_cleartype_params)) =
+            (u_screen_size, u_sampler, u_cleartype_params)
+        else {
+            gl.delete_program(program);
+            return Err("missing ClearType shader uniform".to_owned());
+        };
+        if gl.get_error() != glow::NO_ERROR {
+            gl.delete_program(program);
+            return Err("GL error while creating ClearType program".to_owned());
+        }
+        Ok(ClearTypeProgram {
+            program,
+            u_screen_size,
+            u_sampler,
+            u_cleartype_params,
+        })
+    })();
+
+    match result {
+        Ok(ct) => Some(ct),
+        Err(err) => {
+            log::debug!("OpenGL ClearType dual-source program unavailable: {err}");
+            // Drain any leftover GL errors so standard painter initialization stays clean.
+            unsafe {
+                while gl.get_error() != glow::NO_ERROR {}
+            }
+            None
+        }
+    }
+}
 
 trait TextureFilterExt {
     fn glow_code(&self, mipmap: Option<egui::TextureFilter>) -> u32;
@@ -87,6 +201,7 @@ pub struct Painter {
     program: glow::Program,
     u_screen_size: glow::UniformLocation,
     u_sampler: glow::UniformLocation,
+    cleartype_program: Option<ClearTypeProgram>,
     is_webgl_1: bool,
     vao: crate::vao::VertexArrayObject,
     srgb_textures: bool,
@@ -256,6 +371,27 @@ impl Painter {
 
             let element_array_buffer = gl.create_buffer()?;
 
+            let gl_ver = gl.version();
+            let cleartype_program = if supports_cleartype_dual_source(
+                gl_ver.major,
+                gl_ver.minor,
+                shader_version,
+                supported_extensions,
+            ) {
+                try_compile_cleartype_program(
+                    &gl,
+                    shader_prefix,
+                    dithering,
+                    srgb_textures,
+                    a_pos_loc,
+                    a_tc_loc,
+                    a_srgba_loc,
+                )
+            } else {
+                None
+            };
+            egui::epaint::text::set_dual_source_blending_supported(cleartype_program.is_some());
+
             crate::check_for_gl_error_even_in_release!(&gl, "after Painter::new");
 
             Ok(Self {
@@ -264,6 +400,7 @@ impl Painter {
                 program,
                 u_screen_size,
                 u_sampler,
+                cleartype_program,
                 is_webgl_1,
                 vao,
                 srgb_textures,
@@ -410,6 +547,14 @@ impl Painter {
 
         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
 
+        let width_in_points = screen_size_px[0] as f32 / pixels_per_point;
+        let height_in_points = screen_size_px[1] as f32 / pixels_per_point;
+        let subpixel_active = self.cleartype_program.is_some()
+            && egui::epaint::text::cleartype_subpixel_active();
+        let (ct_gamma, ct_contrast) = egui::epaint::text::cleartype_blend_params();
+        let mut cleartype_bound = false;
+        let mut cleartype_uniforms_uploaded = false;
+
         for egui::ClippedPrimitive {
             clip_rect,
             primitive,
@@ -419,11 +564,64 @@ impl Painter {
 
             match primitive {
                 Primitive::Mesh(mesh) => {
+                    let want_cleartype =
+                        subpixel_active && mesh.texture_id == egui::TextureId::Managed(0);
+                    if want_cleartype != cleartype_bound {
+                        unsafe {
+                            if want_cleartype {
+                                if let Some(ct) = self.cleartype_program.as_ref() {
+                                    self.gl.use_program(Some(ct.program));
+                                    if !cleartype_uniforms_uploaded {
+                                        self.gl.uniform_2_f32(
+                                            Some(&ct.u_screen_size),
+                                            width_in_points,
+                                            height_in_points,
+                                        );
+                                        self.gl.uniform_1_i32(Some(&ct.u_sampler), 0);
+                                        self.gl.uniform_2_f32(
+                                            Some(&ct.u_cleartype_params),
+                                            ct_gamma,
+                                            ct_contrast,
+                                        );
+                                        cleartype_uniforms_uploaded = true;
+                                    }
+                                    self.gl.blend_func_separate(
+                                        glow::ONE,
+                                        glow::ONE_MINUS_SRC1_COLOR,
+                                        glow::ONE_MINUS_DST_ALPHA,
+                                        glow::ONE,
+                                    );
+                                    cleartype_bound = true;
+                                }
+                            } else {
+                                self.gl.use_program(Some(self.program));
+                                self.gl.blend_func_separate(
+                                    glow::ONE,
+                                    glow::ONE_MINUS_SRC_ALPHA,
+                                    glow::ONE_MINUS_DST_ALPHA,
+                                    glow::ONE,
+                                );
+                                cleartype_bound = false;
+                            }
+                        }
+                    }
                     self.paint_mesh(mesh);
                 }
                 Primitive::Callback(callback) => {
                     if callback.rect.is_positive() {
                         profiling::scope!("callback");
+
+                        if cleartype_bound {
+                            unsafe {
+                                self.gl.use_program(Some(self.program));
+                                self.gl.blend_func_separate(
+                                    glow::ONE,
+                                    glow::ONE_MINUS_SRC_ALPHA,
+                                    glow::ONE_MINUS_DST_ALPHA,
+                                    glow::ONE,
+                                );
+                            }
+                        }
 
                         let info = egui::PaintCallbackInfo {
                             viewport: callback.rect,
@@ -452,12 +650,23 @@ impl Painter {
 
                         // Restore state:
                         unsafe { self.prepare_painting(screen_size_px, pixels_per_point) };
+                        cleartype_bound = false;
+                        cleartype_uniforms_uploaded = false;
                     }
                 }
             }
         }
 
         unsafe {
+            if cleartype_bound {
+                self.gl.use_program(Some(self.program));
+                self.gl.blend_func_separate(
+                    glow::ONE,
+                    glow::ONE_MINUS_SRC_ALPHA,
+                    glow::ONE_MINUS_DST_ALPHA,
+                    glow::ONE,
+                );
+            }
             self.vao.unbind(&self.gl);
             self.gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
 
@@ -719,6 +928,9 @@ impl Painter {
     unsafe fn destroy_gl(&self) {
         unsafe {
             self.gl.delete_program(self.program);
+            if let Some(ct) = self.cleartype_program.as_ref() {
+                self.gl.delete_program(ct.program);
+            }
             for tex in self.textures.values() {
                 self.gl.delete_texture(*tex);
             }
@@ -808,5 +1020,34 @@ fn set_clip_rect(
             clip_max_x - clip_min_x,
             clip_max_y - clip_min_y,
         );
+    }
+}
+
+#[cfg(test)]
+mod cleartype_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn cleartype_support_detection_matrix() {
+        let no_ext = HashSet::new();
+        let mut with_ext = HashSet::new();
+        with_ext.insert("GL_ARB_blend_func_extended".to_owned());
+
+        assert!(!supports_cleartype_dual_source(2, 1, ShaderVersion::Gl120, &no_ext));
+        assert!(!supports_cleartype_dual_source(3, 2, ShaderVersion::Gl140, &no_ext));
+        assert!(supports_cleartype_dual_source(3, 2, ShaderVersion::Gl140, &with_ext));
+        assert!(supports_cleartype_dual_source(3, 3, ShaderVersion::Gl140, &no_ext));
+        assert!(supports_cleartype_dual_source(4, 6, ShaderVersion::Gl140, &no_ext));
+        assert!(!supports_cleartype_dual_source(3, 0, ShaderVersion::Es300, &with_ext));
+        assert!(!supports_cleartype_dual_source(4, 0, ShaderVersion::Es100, &with_ext));
+    }
+
+    #[test]
+    fn cleartype_fragment_shader_dual_source_contract() {
+        assert!(FRAG_CLEARTYPE_SRC.contains("layout(location = 0, index = 0) out vec4 f_color;"));
+        assert!(FRAG_CLEARTYPE_SRC.contains("layout(location = 0, index = 1) out vec4 f_mask;"));
+        assert!(FRAG_CLEARTYPE_SRC.contains("uniform vec2 u_cleartype_params;"));
+        assert!(FRAG_CLEARTYPE_SRC.contains("lessThanEqual(tex.rgb, vec3(0.0))"));
     }
 }

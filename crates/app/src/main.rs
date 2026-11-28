@@ -52935,13 +52935,25 @@ fn main() -> eframe::Result<()> {
     {
         opts.wgpu_options.present_mode = eframe::wgpu::PresentMode::AutoVsync;
         opts.wgpu_options.desired_maximum_frame_latency = Some(1);
-        #[cfg(windows)]
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = opts.wgpu_options.wgpu_setup
         {
             // Windows 默认直接走 DX12，跳过 Vulkan/GL 适配层探测；用户显式指定 WGPU_BACKEND 时尊重覆盖。
+            #[cfg(windows)]
             if std::env::var_os("WGPU_BACKEND").is_none() {
                 setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
             }
+            // 请求硬件 Dual-Source Blending（启用 DirectWrite ClearType 3×1 亚像素渲染）
+            let prev_desc = setup.device_descriptor.clone();
+            setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+                let mut desc = prev_desc(adapter);
+                if adapter
+                    .features()
+                    .contains(eframe::wgpu::Features::DUAL_SOURCE_BLENDING)
+                {
+                    desc.required_features |= eframe::wgpu::Features::DUAL_SOURCE_BLENDING;
+                }
+                desc
+            });
         }
     }
     let env_fp = ui_prefs::gpu_env_fingerprint();
@@ -53592,5 +53604,570 @@ mod wave5_ui_tests {
         assert_eq!(app.wb.sheet(0).value(0, 0), Value::Number(999.0));
         assert_eq!(app.wb.sheet(0).value(1, 2), Value::Empty);
         assert_eq!(app.wb.sheet(0).style_of(0, 0), target_sid);
+    }
+
+    #[cfg(any(feature = "wgpu", all(feature = "glow", windows)))]
+    static CLEARTYPE_GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn wgpu_cleartype_dual_source_pipeline_and_render_smoke() {
+        let _serial = CLEARTYPE_GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::Arc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ThreadWaker(std::thread::Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        fn block_on<F: Future>(fut: F) -> F::Output {
+            let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            let mut fut = Box::pin(fut);
+            loop {
+                match Pin::as_mut(&mut fut).poll(&mut cx) {
+                    Poll::Ready(v) => return v,
+                    Poll::Pending => std::thread::park(),
+                }
+            }
+        }
+
+        struct ResetClearTypeGuard;
+        impl Drop for ResetClearTypeGuard {
+            fn drop(&mut self) {
+                egui::epaint::text::set_cleartype_state(false, 1.8, 0.5);
+            }
+        }
+        let _guard = ResetClearTypeGuard;
+
+        let instance = eframe::wgpu::Instance::new(&eframe::wgpu::InstanceDescriptor {
+            backends: eframe::wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let all_adapters = instance.enumerate_adapters(eframe::wgpu::Backends::all());
+        for a in &all_adapters {
+            let info = a.get_info();
+            eprintln!(
+                "[wgpu-cleartype-test] enum adapter={:?} backend={:?} type={:?} dual_source={}",
+                info.name,
+                info.backend,
+                info.device_type,
+                a.features()
+                    .contains(eframe::wgpu::Features::DUAL_SOURCE_BLENDING)
+            );
+        }
+        let adapter = all_adapters
+            .into_iter()
+            .find(|a| {
+                a.features()
+                    .contains(eframe::wgpu::Features::DUAL_SOURCE_BLENDING)
+            })
+            .or_else(|| {
+                block_on(instance.request_adapter(&eframe::wgpu::RequestAdapterOptions {
+                    power_preference: eframe::wgpu::PowerPreference::default(),
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+            })
+            .or_else(|| {
+                block_on(instance.request_adapter(&eframe::wgpu::RequestAdapterOptions {
+                    power_preference: eframe::wgpu::PowerPreference::default(),
+                    compatible_surface: None,
+                    force_fallback_adapter: true,
+                }))
+            });
+        let Some(adapter) = adapter else {
+            panic!("expected at least one wgpu adapter for ClearType pipeline verification");
+        };
+        let info = adapter.get_info();
+        eprintln!(
+            "[wgpu-cleartype-test] adapter={:?} backend={:?} dual_source={}",
+            info.name,
+            info.backend,
+            adapter
+                .features()
+                .contains(eframe::wgpu::Features::DUAL_SOURCE_BLENDING)
+        );
+
+        // 1. Device WITHOUT DUAL_SOURCE_BLENDING cleanly reports unsupported and builds standard pipeline.
+        {
+            let (device, _queue) = block_on(adapter.request_device(
+                &eframe::wgpu::DeviceDescriptor {
+                    label: Some("cleartype_fallback_device"),
+                    required_features: eframe::wgpu::Features::empty(),
+                    required_limits: adapter.limits(),
+                    memory_hints: Default::default(),
+                },
+                None,
+            ))
+            .expect("create device without dual-source blending");
+            let _renderer = eframe::egui_wgpu::Renderer::new(
+                &device,
+                eframe::wgpu::TextureFormat::Bgra8Unorm,
+                None,
+                1,
+                false,
+            );
+            assert!(
+                !egui::epaint::text::dual_source_blending_supported(),
+                "fallback device without DUAL_SOURCE_BLENDING must report unsupported"
+            );
+        }
+
+        // 2. Device WITH DUAL_SOURCE_BLENDING compiles both gamma & linear ClearType WGSL shaders
+        //    and blends an asymmetric RGB subpixel mask independently per channel.
+        if !adapter
+            .features()
+            .contains(eframe::wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(
+            &eframe::wgpu::DeviceDescriptor {
+                label: Some("cleartype_dual_source_device"),
+                required_features: eframe::wgpu::Features::DUAL_SOURCE_BLENDING,
+                required_limits: adapter.limits(),
+                memory_hints: Default::default(),
+            },
+            None,
+        ))
+        .expect("create device with DUAL_SOURCE_BLENDING");
+
+        // Verify linear (sRGB) framebuffer pipeline compiles cleanly too.
+        let _linear_renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            eframe::wgpu::TextureFormat::Bgra8UnormSrgb,
+            None,
+            1,
+            false,
+        );
+        assert!(egui::epaint::text::dual_source_blending_supported());
+
+        // Now render with the preferred non-sRGB gamma framebuffer format.
+        let mut renderer = eframe::egui_wgpu::Renderer::new(
+            &device,
+            eframe::wgpu::TextureFormat::Bgra8Unorm,
+            None,
+            1,
+            false,
+        );
+        assert!(egui::epaint::text::dual_source_blending_supported());
+
+        // Font atlas (Managed(0)): texel (0,0) = solid white, texel (1,0) = subpixel RGB (255, 128, 0)
+        let atlas = egui::ColorImage {
+            size: [2, 1],
+            pixels: vec![
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255),
+                egui::Color32::from_rgba_unmultiplied(255, 128, 0, 255),
+            ],
+        };
+        let delta = egui::epaint::ImageDelta::full(
+            egui::ImageData::Color(Arc::new(atlas)),
+            egui::TextureOptions::NEAREST,
+        );
+        renderer.update_texture(&device, &queue, egui::TextureId::Managed(0), &delta);
+        egui::epaint::text::set_cleartype_state(true, 1.8, 0.5);
+
+        let quad = |x0: f32, x1: f32, u: f32, color: egui::Color32| {
+            let uv = egui::pos2(u, 0.5);
+            let mut m = egui::Mesh::with_texture(egui::TextureId::Managed(0));
+            m.vertices = vec![
+                egui::epaint::Vertex { pos: egui::pos2(x0, 0.0), uv, color },
+                egui::epaint::Vertex { pos: egui::pos2(x1, 0.0), uv, color },
+                egui::epaint::Vertex { pos: egui::pos2(x1, 4.0), uv, color },
+                egui::epaint::Vertex { pos: egui::pos2(x0, 4.0), uv, color },
+            ];
+            m.indices = vec![0, 1, 2, 0, 2, 3];
+            egui::ClippedPrimitive {
+                clip_rect: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(8.0, 4.0)),
+                primitive: egui::epaint::Primitive::Mesh(m),
+            }
+        };
+        // Left half (x 0..4): black text with subpixel mask (255,128,0) on white bg.
+        // Right half (x 4..8): solid red-orange semi-transparent shape (tex=white).
+        let jobs = vec![
+            quad(0.0, 4.0, 0.75, egui::Color32::from_rgba_premultiplied(0, 0, 0, 255)),
+            quad(4.0, 8.0, 0.25, egui::Color32::from_rgba_premultiplied(128, 64, 0, 128)),
+        ];
+        let screen = eframe::egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [8, 4],
+            pixels_per_point: 1.0,
+        };
+
+        let target = device.create_texture(&eframe::wgpu::TextureDescriptor {
+            label: Some("cleartype_test_target"),
+            size: eframe::wgpu::Extent3d {
+                width: 8,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: eframe::wgpu::TextureDimension::D2,
+            format: eframe::wgpu::TextureFormat::Bgra8Unorm,
+            usage: eframe::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | eframe::wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&eframe::wgpu::TextureViewDescriptor::default());
+        let readback = device.create_buffer(&eframe::wgpu::BufferDescriptor {
+            label: Some("cleartype_test_readback"),
+            size: 256 * 4,
+            usage: eframe::wgpu::BufferUsages::COPY_DST | eframe::wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&eframe::wgpu::CommandEncoderDescriptor::default());
+        let _ = renderer.update_buffers(&device, &queue, &mut encoder, &jobs, &screen);
+        {
+            let rpass = encoder.begin_render_pass(&eframe::wgpu::RenderPassDescriptor {
+                label: Some("cleartype_test_pass"),
+                color_attachments: &[Some(eframe::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: eframe::wgpu::Operations {
+                        load: eframe::wgpu::LoadOp::Clear(eframe::wgpu::Color::WHITE),
+                        store: eframe::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut rpass = rpass.forget_lifetime();
+            renderer.render(&mut rpass, &jobs, &screen);
+        }
+        encoder.copy_texture_to_buffer(
+            eframe::wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: eframe::wgpu::Origin3d::ZERO,
+                aspect: eframe::wgpu::TextureAspect::All,
+            },
+            eframe::wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: eframe::wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(4),
+                },
+            },
+            eframe::wgpu::Extent3d {
+                width: 8,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(eframe::wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        device.poll(eframe::wgpu::Maintain::Wait);
+        rx.recv().unwrap().expect("map readback buffer");
+        let data = slice.get_mapped_range();
+
+        // Bgra8Unorm layout: [B, G, R, A] at row 1, col 1 (subpixel glyph) and row 1, col 5 (solid shape).
+        let row1 = 256usize;
+        let sub_b = data[row1 + 4];
+        let sub_g = data[row1 + 5];
+        let sub_r = data[row1 + 6];
+        let solid_b = data[row1 + 5 * 4];
+        let solid_g = data[row1 + 5 * 4 + 1];
+        let solid_r = data[row1 + 5 * 4 + 2];
+        eprintln!(
+            "[wgpu-cleartype-test] subpixel_rgb=({sub_r},{sub_g},{sub_b}) solid_rgb=({solid_r},{solid_g},{solid_b})"
+        );
+        assert!(sub_r <= 2, "full red subpixel mask must ink red channel to ~0, got {sub_r}");
+        assert!(
+            (105..=125).contains(&sub_g),
+            "half green subpixel mask with enhanced contrast must blend to ~115, got {sub_g}"
+        );
+        assert!(sub_b >= 253, "zero blue subpixel mask must leave white bg untouched, got {sub_b}");
+
+        // Premultiplied (128, 64, 0, a=128/255) over white (255,255,255):
+        // R ≈ 128 + 127 = 255, G ≈ 64 + 127 = 191, B ≈ 0 + 127 = 127
+        assert!(solid_r >= 250, "solid semi-transparent R mismatch: {solid_r}");
+        assert!((186..=196).contains(&solid_g), "solid semi-transparent G mismatch: {solid_g}");
+        assert!((123..=132).contains(&solid_b), "solid semi-transparent B mismatch: {solid_b}");
+    }
+
+    #[cfg(all(feature = "glow", windows))]
+    #[test]
+    fn glow_cleartype_dual_source_pipeline_and_render_smoke() {
+        let _serial = CLEARTYPE_GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        use eframe::glow::HasContext as _;
+        use std::ffi::CString;
+        use std::sync::Arc;
+        use windows_sys::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_POPUP,
+        };
+
+        #[repr(C)]
+        struct PixelFormatDescriptor {
+            n_size: u16,
+            n_version: u16,
+            dw_flags: u32,
+            i_pixel_type: u8,
+            c_color_bits: u8,
+            c_red_bits: u8,
+            c_red_shift: u8,
+            c_green_bits: u8,
+            c_green_shift: u8,
+            c_blue_bits: u8,
+            c_blue_shift: u8,
+            c_alpha_bits: u8,
+            c_alpha_shift: u8,
+            c_accum_bits: u8,
+            c_accum_red_bits: u8,
+            c_accum_green_bits: u8,
+            c_accum_blue_bits: u8,
+            c_accum_alpha_bits: u8,
+            c_depth_bits: u8,
+            c_stencil_bits: u8,
+            c_aux_buffers: u8,
+            i_layer_type: u8,
+            b_reserved: u8,
+            dw_layer_mask: u32,
+            dw_visible_mask: u32,
+            dw_damage_mask: u32,
+        }
+        const PFD_DRAW_TO_WINDOW: u32 = 0x0000_0004;
+        const PFD_SUPPORT_OPENGL: u32 = 0x0000_0020;
+        const PFD_TYPE_RGBA: u8 = 0;
+
+        #[link(name = "gdi32")]
+        unsafe extern "system" {
+            fn ChoosePixelFormat(
+                hdc: *mut std::ffi::c_void,
+                ppfd: *const PixelFormatDescriptor,
+            ) -> i32;
+            fn SetPixelFormat(
+                hdc: *mut std::ffi::c_void,
+                format: i32,
+                ppfd: *const PixelFormatDescriptor,
+            ) -> i32;
+        }
+        #[link(name = "opengl32")]
+        unsafe extern "system" {
+            fn wglCreateContext(hdc: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn wglMakeCurrent(
+                hdc: *mut std::ffi::c_void,
+                hglrc: *mut std::ffi::c_void,
+            ) -> i32;
+            fn wglDeleteContext(hglrc: *mut std::ffi::c_void) -> i32;
+            fn wglGetProcAddress(name: *const u8) -> *const std::ffi::c_void;
+        }
+
+        struct ResetClearTypeGuard;
+        impl Drop for ResetClearTypeGuard {
+            fn drop(&mut self) {
+                egui::epaint::text::set_cleartype_state(false, 1.8, 0.5);
+            }
+        }
+        let _guard = ResetClearTypeGuard;
+
+        unsafe {
+            let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
+            let title: Vec<u16> = "cellan_gl_ct\0".encode_utf16().collect();
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                16,
+                16,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null(), "CreateWindowExW failed");
+            let hdc = GetDC(hwnd);
+            assert!(!hdc.is_null(), "GetDC failed");
+
+            let mut pfd: PixelFormatDescriptor = std::mem::zeroed();
+            pfd.n_size = std::mem::size_of::<PixelFormatDescriptor>() as u16;
+            assert_eq!(pfd.n_size, 40);
+            pfd.n_version = 1;
+            pfd.dw_flags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+            pfd.i_pixel_type = PFD_TYPE_RGBA;
+            pfd.c_color_bits = 32;
+            pfd.c_alpha_bits = 8;
+            let pf = ChoosePixelFormat(hdc, &pfd);
+            assert!(pf != 0 && SetPixelFormat(hdc, pf, &pfd) != 0, "SetPixelFormat failed");
+
+            let hglrc = wglCreateContext(hdc);
+            assert!(!hglrc.is_null(), "wglCreateContext failed");
+            assert!(wglMakeCurrent(hdc, hglrc) != 0, "wglMakeCurrent failed");
+
+            let opengl32 = LoadLibraryA(c"opengl32.dll".as_ptr().cast());
+            let gl = Arc::new(eframe::glow::Context::from_loader_function(|name| {
+                let Ok(cstr) = CString::new(name) else {
+                    return std::ptr::null();
+                };
+                let p = wglGetProcAddress(cstr.as_ptr().cast());
+                if !p.is_null() {
+                    return p;
+                }
+                if !opengl32.is_null() {
+                    if let Some(f) = GetProcAddress(opengl32, cstr.as_ptr().cast()) {
+                        return f as *const std::ffi::c_void;
+                    }
+                }
+                std::ptr::null()
+            }));
+
+            let ver = gl.version();
+            let renderer_str = gl.get_parameter_string(eframe::glow::RENDERER);
+            eprintln!(
+                "[glow-cleartype-test] gl={}.{} renderer={:?}",
+                ver.major, ver.minor, renderer_str
+            );
+
+            let mut painter =
+                eframe::egui_glow::Painter::new(gl.clone(), "", None, false)
+                    .expect("create egui_glow::Painter");
+            let supported = egui::epaint::text::dual_source_blending_supported();
+            eprintln!("[glow-cleartype-test] dual_source_supported={supported}");
+
+            if ver.major > 3 || (ver.major == 3 && ver.minor >= 3) {
+                assert!(
+                    supported,
+                    "OpenGL {}.{} must compile and enable ClearType dual-source program",
+                    ver.major, ver.minor
+                );
+
+                // Offscreen 8x4 RGBA8 FBO
+                let fbo = gl.create_framebuffer().unwrap();
+                let tex = gl.create_texture().unwrap();
+                gl.bind_texture(eframe::glow::TEXTURE_2D, Some(tex));
+                gl.tex_image_2d(
+                    eframe::glow::TEXTURE_2D,
+                    0,
+                    eframe::glow::RGBA8 as i32,
+                    8,
+                    4,
+                    0,
+                    eframe::glow::RGBA,
+                    eframe::glow::UNSIGNED_BYTE,
+                    eframe::glow::PixelUnpackData::Slice(None),
+                );
+                gl.bind_framebuffer(eframe::glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(
+                    eframe::glow::FRAMEBUFFER,
+                    eframe::glow::COLOR_ATTACHMENT0,
+                    eframe::glow::TEXTURE_2D,
+                    Some(tex),
+                    0,
+                );
+                assert_eq!(
+                    gl.check_framebuffer_status(eframe::glow::FRAMEBUFFER),
+                    eframe::glow::FRAMEBUFFER_COMPLETE
+                );
+
+                painter.clear([8, 4], [1.0, 1.0, 1.0, 1.0]);
+
+                let atlas = egui::ColorImage {
+                    size: [2, 1],
+                    pixels: vec![
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255),
+                        egui::Color32::from_rgba_unmultiplied(255, 128, 0, 255),
+                    ],
+                };
+                let mut textures_delta = egui::TexturesDelta::default();
+                textures_delta.set.push((
+                    egui::TextureId::Managed(0),
+                    egui::epaint::ImageDelta::full(
+                        egui::ImageData::Color(Arc::new(atlas)),
+                        egui::TextureOptions::NEAREST,
+                    ),
+                ));
+                egui::epaint::text::set_cleartype_state(true, 1.8, 0.5);
+
+                let quad = |x0: f32, x1: f32, u: f32, color: egui::Color32| {
+                    let uv = egui::pos2(u, 0.5);
+                    let mut m = egui::Mesh::with_texture(egui::TextureId::Managed(0));
+                    m.vertices = vec![
+                        egui::epaint::Vertex { pos: egui::pos2(x0, 0.0), uv, color },
+                        egui::epaint::Vertex { pos: egui::pos2(x1, 0.0), uv, color },
+                        egui::epaint::Vertex { pos: egui::pos2(x1, 4.0), uv, color },
+                        egui::epaint::Vertex { pos: egui::pos2(x0, 4.0), uv, color },
+                    ];
+                    m.indices = vec![0, 1, 2, 0, 2, 3];
+                    egui::ClippedPrimitive {
+                        clip_rect: egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(8.0, 4.0),
+                        ),
+                        primitive: egui::epaint::Primitive::Mesh(m),
+                    }
+                };
+                let jobs = vec![
+                    quad(0.0, 4.0, 0.75, egui::Color32::from_rgba_premultiplied(0, 0, 0, 255)),
+                    quad(
+                        4.0,
+                        8.0,
+                        0.25,
+                        egui::Color32::from_rgba_premultiplied(128, 64, 0, 128),
+                    ),
+                ];
+
+                painter.paint_and_update_textures([8, 4], 1.0, &jobs, &textures_delta);
+                assert_eq!(gl.get_error(), eframe::glow::NO_ERROR, "GL error after ClearType draw");
+
+                let img = painter.read_screen_rgba([8, 4]);
+                let sub = img.pixels[8 + 1];
+                let solid = img.pixels[8 + 5];
+                eprintln!(
+                    "[glow-cleartype-test] subpixel_rgb=({},{},{}) solid_rgb=({},{},{})",
+                    sub.r(),
+                    sub.g(),
+                    sub.b(),
+                    solid.r(),
+                    solid.g(),
+                    solid.b(),
+                );
+                assert!(sub.r() <= 2, "GL full red subpixel mismatch: {}", sub.r());
+                assert!(
+                    (105..=125).contains(&sub.g()),
+                    "GL half green subpixel mismatch: {}",
+                    sub.g()
+                );
+                assert!(sub.b() >= 253, "GL zero blue subpixel mismatch: {}", sub.b());
+                assert!(solid.r() >= 250, "GL solid R mismatch: {}", solid.r());
+                assert!((186..=196).contains(&solid.g()), "GL solid G mismatch: {}", solid.g());
+                assert!((123..=132).contains(&solid.b()), "GL solid B mismatch: {}", solid.b());
+
+                gl.bind_framebuffer(eframe::glow::FRAMEBUFFER, None);
+                gl.delete_framebuffer(fbo);
+                gl.delete_texture(tex);
+            }
+
+            painter.destroy();
+            assert_eq!(gl.get_error(), eframe::glow::NO_ERROR, "GL error after Painter::destroy");
+            wglMakeCurrent(std::ptr::null_mut(), std::ptr::null_mut());
+            wglDeleteContext(hglrc);
+            ReleaseDC(hwnd, hdc);
+            DestroyWindow(hwnd);
+        }
     }
 }
