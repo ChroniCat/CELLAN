@@ -471,26 +471,46 @@ mod sheet_tab_tests {
         app.new_document();
         app.wb.sheets = ["一月", "二月", "三月"].map(sheetcore::Sheet::new).into();
         app.selected_sheets.extend([0, 1]);
-        app.wb.sheets[0].tab_color = Some([255, 255, 255]);
         app.wb.sheets[1].tab_color = Some([230, 81, 0]);
-        for theme in crate::theme::AppTheme::ALL {
-            crate::theme::apply_app_theme(&ctx, theme);
-            let pal = crate::theme::palette();
-            let (active_fill, active_ink) = ui_kit::active_tab_colors(pal);
-            let out = frame(&ctx, &mut app, Vec::new());
-            let tab = |name| text_rect(&out, name).unwrap().0;
-            let has_face = |name, color| out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                if r.fill == color && r.rect.contains_rect(tab(name)) && r.rect.height() <= tokens::size::SHEET_TAB_H));
-            assert!(has_face("一月", active_fill));
-            assert!(has_face("二月", pal.accent_tint));
-            assert!(!has_face("三月", active_fill) && !has_face("三月", pal.accent_tint));
-            assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
-                if t.galley.job.text == "一月" && t.override_text_color == Some(active_ink))));
-            assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                if r.fill == pal.accent && r.rect.width() > 12.0 && r.rect.height() < 4.0)));
-            for color in [Color32::WHITE, Color32::from_rgb(230, 81, 0)] {
+        for active_custom in [None, Some([255, 255, 255])] {
+            app.wb.sheets[0].tab_color = active_custom;
+            for theme in crate::theme::AppTheme::ALL {
+                crate::theme::apply_app_theme(&ctx, theme);
+                let pal = crate::theme::palette();
+                let (active_fill, active_ink) = ui_kit::active_tab_colors(pal);
+                let out = frame(&ctx, &mut app, Vec::new());
+                let tab = |name| text_rect(&out, name).unwrap().0;
+                let has_face = |name, color| out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                    if r.fill == color && r.rect.contains_rect(tab(name)) && r.rect.height() <= tokens::size::SHEET_TAB_H));
+                assert!(has_face("一月", active_fill));
+                assert!(has_face("二月", pal.accent_tint));
+                assert!(!has_face("三月", active_fill) && !has_face("三月", pal.accent_tint));
+                assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Text(t)
+                    if t.galley.job.text == "一月" && t.override_text_color == Some(active_ink))));
+                let expected_bar = active_custom
+                    .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+                    .unwrap_or(pal.accent);
+                let t1 = tab("一月");
                 assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                    if r.fill == color && r.rect.size() == Vec2::splat(8.0))));
+                    if r.fill == expected_bar
+                        && r.rect.width() >= 14.0
+                        && r.rect.height() <= 2.5
+                        && r.rect.x_range().contains(t1.center().x))));
+                // Grouped inactive member must not get the active bottom bar.
+                let t2 = tab("二月");
+                assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                    if r.fill == pal.accent
+                        && r.rect.width() >= 14.0
+                        && r.rect.height() <= 2.5
+                        && r.rect.x_range().contains(t2.center().x))));
+                for color in active_custom
+                    .into_iter()
+                    .map(|[r, g, b]| Color32::from_rgb(r, g, b))
+                    .chain(std::iter::once(Color32::from_rgb(230, 81, 0)))
+                {
+                    assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                        if r.fill == color && r.rect.size() == Vec2::splat(8.0))));
+                }
             }
         }
     }
@@ -714,30 +734,82 @@ impl SheetApp {
                             if rec_entries.is_empty() {
                                 ui.label(egui::RichText::new("暂无最近打开的文件").size(12.0).color(pal.text_weak));
                             } else {
-                                for ent in rec_entries.into_iter().take(12) {
-                                    ui.horizontal(|ui| {
-                                        let label = format!("{}  ({})", ent.name, ent.short_dir);
-                                        let row_width = (ui.available_width() - 56.0).max(24.0);
-                                        let entry = egui::Button::new(label).frame(false).truncate();
-                                        if ui.add_sized([row_width, 27.0], entry).on_hover_text(ent.path.display().to_string()).clicked() {
-                                            act = Some(FileMenuAction::OpenPath(ent.path.clone()));
-                                        }
-                                        let pin_tip = if ent.pinned { "取消固定" } else { "固定到顶部" };
-                                        if ui
-                                            .small_button(if ent.pinned { "★" } else { "☆" })
-                                            .on_hover_text(pin_tip)
-                                            .clicked()
-                                        {
-                                            act = Some(FileMenuAction::TogglePinRecent(ent.path.clone()));
-                                        }
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text("从最近列表移除")
-                                            .clicked()
-                                        {
-                                            act = Some(FileMenuAction::RemoveRecent(ent.path.clone()));
-                                        }
-                                    });
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                for (idx, ent) in rec_entries.into_iter().take(12).enumerate() {
+                                    let row_w = ui.available_width();
+                                    let (row, _) = ui.allocate_exact_size(Vec2::new(row_w, 28.0), Sense::hover());
+                                    let rm_btn = Rect::from_center_size(
+                                        egui::pos2(row.right() - 14.0, row.center().y),
+                                        Vec2::splat(22.0),
+                                    );
+                                    let pin_btn = Rect::from_center_size(
+                                        egui::pos2(row.right() - 38.0, row.center().y),
+                                        Vec2::splat(22.0),
+                                    );
+                                    let open_rect = Rect::from_min_max(
+                                        row.min,
+                                        egui::pos2((pin_btn.left() - 4.0).max(row.left() + 16.0), row.bottom()),
+                                    );
+                                    let open_resp = ui.interact(open_rect, ui.id().with(("recent_open", idx)), Sense::click());
+                                    let pin_resp = ui.interact(pin_btn, ui.id().with(("recent_pin", idx)), Sense::click());
+                                    let rm_resp = ui.interact(rm_btn, ui.id().with(("recent_rm", idx)), Sense::click());
+                                    if open_resp.is_pointer_button_down_on() {
+                                        ui.painter().rect_filled(row, 5.0, pal.pressed);
+                                    } else if open_resp.hovered() || pin_resp.hovered() || rm_resp.hovered() {
+                                        ui.painter().rect_filled(row, 5.0, pal.hover);
+                                    }
+                                    let label = format!("{}  ({})", ent.name, ent.short_dir);
+                                    let text_rect = Rect::from_min_max(
+                                        egui::pos2(open_rect.left() + 8.0, open_rect.top()),
+                                        egui::pos2((open_rect.right() - 4.0).max(open_rect.left() + 8.0), open_rect.bottom()),
+                                    );
+                                    let mut job = egui::text::LayoutJob::simple_singleline(
+                                        label,
+                                        FontId::proportional(ui_kit::T_BODY),
+                                        pal.text,
+                                    );
+                                    job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width().max(1.0));
+                                    let galley = ui.painter().layout_job(job);
+                                    let tpos = Align2::LEFT_CENTER
+                                        .anchor_size(egui::pos2(text_rect.left(), text_rect.center().y), galley.size())
+                                        .min;
+                                    ui.painter_at(text_rect).galley(tpos, galley, pal.text);
+                                    ui_kit::focus_ring(ui, &open_resp, open_rect, 4.0);
+                                    ui_kit::a11y_name(&open_resp, &ent.name, true, None);
+                                    if open_resp.on_hover_text(ent.path.display().to_string()).clicked() {
+                                        act = Some(FileMenuAction::OpenPath(ent.path.clone()));
+                                    }
+
+                                    let pin_tip = if ent.pinned { "取消固定" } else { "固定到顶部" };
+                                    if pin_resp.hovered() {
+                                        ui.painter().rect_filled(pin_btn, 4.0, pal.pressed);
+                                    }
+                                    ui_icons::draw_mono(
+                                        ui.painter(),
+                                        Rect::from_center_size(pin_btn.center(), Vec2::splat(14.0)),
+                                        Icon::Pin,
+                                        if ent.pinned { pal.accent } else { pal.text_weak },
+                                    );
+                                    ui_kit::focus_ring(ui, &pin_resp, pin_btn, 4.0);
+                                    ui_kit::a11y_name(&pin_resp, pin_tip, true, Some(ent.pinned));
+                                    if pin_resp.on_hover_text(pin_tip).clicked() {
+                                        act = Some(FileMenuAction::TogglePinRecent(ent.path.clone()));
+                                    }
+
+                                    if rm_resp.hovered() {
+                                        ui.painter().rect_filled(rm_btn, 4.0, pal.err_bg);
+                                    }
+                                    ui_icons::draw_mono(
+                                        ui.painter(),
+                                        Rect::from_center_size(rm_btn.center(), Vec2::splat(12.0)),
+                                        Icon::Close,
+                                        if rm_resp.hovered() { pal.err_fg } else { pal.text_weak },
+                                    );
+                                    ui_kit::focus_ring(ui, &rm_resp, rm_btn, 4.0);
+                                    ui_kit::a11y_name(&rm_resp, "从最近列表移除", true, None);
+                                    if rm_resp.on_hover_text("从最近列表移除").clicked() {
+                                        act = Some(FileMenuAction::RemoveRecent(ent.path.clone()));
+                                    }
                                 }
                                 menu_sep_line(ui);
                                 if ui_kit::popup_item(ui, "清理已删除的本地文件记录", true, ui.available_width()).clicked() {
@@ -1380,9 +1452,15 @@ impl SheetApp {
                 }
                 let rect = ui.max_rect();
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                ui.painter().line_segment(
-                    [rect.left_top(), rect.right_top()],
-                    Stroke::new(1.0, pal.card_border),
+                let hairline = if pal.theme == crate::theme::AppTheme::HighContrast {
+                    1.0
+                } else {
+                    (1.0 / ctx.pixels_per_point()).min(1.0)
+                };
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.top() + hairline * 0.5,
+                    Stroke::new(hairline, pal.chrome_separator()),
                 );
                 let mut goto: Option<usize> = None;
                 let mut ren: Option<(usize, String)> = None;

@@ -138,15 +138,21 @@ static MAX_BTN_HOVERED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static RESIZE_EDGE_PX: AtomicI32 = AtomicI32::new(5);
 
-/// Let the desktop compositor draw the frame and choose the corner shape when
-/// the window is restored, snapped or maximized. Older Windows versions ignore
-/// unsupported attributes and keep their native frame.
+/// Convert an `egui::Color32` into a Win32 `COLORREF` (`0x00BBGGRR`) for DWM attributes.
 #[cfg(windows)]
-pub fn apply_frame_theme(dark: bool) {
+fn to_colorref(c: egui::Color32) -> u32 {
+    u32::from(c.r()) | (u32::from(c.g()) << 8) | (u32::from(c.b()) << 16)
+}
+
+/// Let the desktop compositor draw the frame, choose the corner shape, and tint
+/// the Win11 1px outer frame border subtly to match the active theme. Older Windows
+/// versions ignore unsupported attributes cleanly.
+#[cfg(windows)]
+pub fn apply_frame_theme(dark: bool, border: egui::Color32) {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-        DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     };
     let hwnd = SUBCLASSED_HWND.load(Ordering::Acquire) as HWND;
     if hwnd.is_null() {
@@ -158,9 +164,21 @@ pub fn apply_frame_theme(dark: bool) {
     ] {
         unsafe {
             DwmSetWindowAttribute(
-                hwnd, attribute as u32, (&value as *const i32).cast(), std::mem::size_of_val(&value) as u32,
+                hwnd,
+                attribute as u32,
+                (&value as *const i32).cast(),
+                std::mem::size_of_val(&value) as u32,
             );
         }
+    }
+    let border_ref = to_colorref(border);
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            (&border_ref as *const u32).cast(),
+            std::mem::size_of_val(&border_ref) as u32,
+        );
     }
 }
 
@@ -208,6 +226,13 @@ fn resize_hit(x: i32, y: i32, width: i32, height: i32, edge: i32) -> Option<u32>
         (_, _, _, true) => Some(HTBOTTOM),
         _ => None,
     }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn dwm_border_colorref_uses_bgr_byte_order() {
+    assert_eq!(to_colorref(egui::Color32::from_rgb(0xE0, 0xE3, 0xE8)), 0x00E8_E3E0);
+    assert_eq!(to_colorref(egui::Color32::from_rgb(0x38, 0x3E, 0x4A)), 0x004A_3E38);
 }
 
 #[cfg(all(windows, test))]

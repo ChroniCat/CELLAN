@@ -52,10 +52,10 @@ pub fn tab_file(app: &mut SheetApp, ui: &mut egui::Ui) {
     );
     if let Some(ch) = keytip_ch {
         let r = resp.rect;
-        let b = Rect::from_center_size(egui::pos2(r.center().x, r.top() + 6.0), Vec2::new(13.0, 11.0));
+        let b = Rect::from_center_size(egui::pos2(r.center().x, r.top() + 7.0), Vec2::new(15.0, 14.0));
         ui.painter().rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
         let mut buf = [0u8; 4];
-        ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.encode_utf8(&mut buf), FontId::proportional(8.5), Color32::WHITE);
+        ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.encode_utf8(&mut buf), FontId::proportional(11.0), Color32::WHITE);
     }
     if resp.clicked() {
         app.file_menu_anchor = Some(resp.rect.left_bottom());
@@ -131,10 +131,10 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         ui_kit::tab_focus_ring(ui, &resp, resp.rect.shrink2(Vec2::new(2.0, 3.0)), 5.0, active);
         if app.keytips && app.keytip_tab.is_none() {
             if let Some(ch) = tab.keytip.chars().next() {
-                let b = Rect::from_center_size(egui::pos2(resp.rect.center().x, resp.rect.top() + 6.0), Vec2::new(13.0, 11.0));
+                let b = Rect::from_center_size(egui::pos2(resp.rect.center().x, resp.rect.top() + 7.0), Vec2::new(15.0, 14.0));
                 ui.painter().rect_filled(b, 2.0, Color32::from_gray(68));
                 let mut buf = [0u8; 4];
-                ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.encode_utf8(&mut buf), FontId::proportional(8.5), Color32::WHITE);
+                ui.painter().text(b.center(), Align2::CENTER_CENTER, ch.encode_utf8(&mut buf), FontId::proportional(11.0), Color32::WHITE);
             }
         }
         if resp.clicked() {
@@ -167,8 +167,22 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
         ui.memory_mut(|m| m.toggle_popup(menu_id));
     }
     let (selected_fill, selected_ink) = ui_kit::active_tab_colors(pal);
+    let is_hc = pal.theme == crate::theme::AppTheme::HighContrast;
     if active_hidden.is_some() {
-        ui.painter().rect_filled(rect, 4.0, selected_fill);
+        if is_hc {
+            ui.painter().rect_filled(rect, 4.0, selected_fill);
+        } else {
+            ui.painter().rect(
+                rect,
+                4.0,
+                selected_fill,
+                egui::Stroke::new(1.0, pal.chrome_separator()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let bar_y = if is_hc { rect.bottom() + 1.0 } else { rect.bottom() - 1.5 };
+        let bar = Rect::from_center_size(egui::pos2(rect.center().x, bar_y), Vec2::new(16.0, 2.0));
+        ui.painter().rect_filled(bar, 1.0, pal.accent);
     } else if resp.hovered() || ui.memory(|m| m.is_popup_open(menu_id)) {
         ui.painter().rect_filled(rect, 4.0, pal.hover_on_page);
     }
@@ -176,13 +190,14 @@ pub fn tabs(app: &mut SheetApp, ui: &mut egui::Ui) {
     ui_kit::tab_focus_ring(ui, &resp, rect, 4.0, active_hidden.is_some());
     egui::popup_below_widget(ui, menu_id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
         ui.set_width(132.0);
-        ui.visuals_mut().selection.bg_fill = selected_fill;
-        ui.visuals_mut().selection.stroke.color = selected_ink;
+        let (popup_fill, popup_ink) = ui_kit::active_dialog_tab_colors(pal);
+        ui.visuals_mut().selection.bg_fill = popup_fill;
+        ui.visuals_mut().selection.stroke.color = popup_ink;
         for (i, tab) in hidden {
             let active = i == app.ribbon_tab;
             let mut label = egui::RichText::new(&tab.label);
             if active {
-                label = label.font(ui_kit::medium_in(ui.ctx(), 12.5)).color(selected_ink);
+                label = label.font(ui_kit::medium_in(ui.ctx(), 12.0)).color(popup_ink);
             }
             if ui.selectable_label(active, label).clicked() {
                 select_tab(app, i, false);
@@ -748,7 +763,7 @@ fn layout_text(ui: &egui::Ui, text: &str, size: f32) -> std::sync::Arc<egui::Gal
     let col = if ui.is_enabled() {
         ui_kit::text_color(ui.visuals())
     } else {
-        ui_kit::DISABLED
+        ui_kit::disabled_color(crate::theme::palette())
     };
     ui.painter()
         .layout_no_wrap(text.to_owned(), FontId::proportional(size), col)
@@ -765,10 +780,10 @@ fn draw_keytip(ui: &egui::Ui, key: &str, rect: Rect) {
     if crate::debug_flags::keytip_log() {
         eprintln!("[keytip] draw {key} at {rect:?}");
     }
-    let w = (key.chars().count() as f32 * 5.0 + 6.0).max(13.0);
+    let w = (key.chars().count() as f32 * 6.0 + 6.0).max(15.0);
     let b = Rect::from_min_size(
         egui::pos2(rect.right() - w - 2.0, rect.top() + 2.0),
-        Vec2::new(w, 11.0),
+        Vec2::new(w, 14.0),
     );
     ui.painter()
         .rect_filled(b, 2.0, Color32::from_rgb(68, 68, 68));
@@ -776,7 +791,7 @@ fn draw_keytip(ui: &egui::Ui, key: &str, rect: Rect) {
         b.center(),
         Align2::CENTER_CENTER,
         key,
-        FontId::proportional(8.5),
+        FontId::proportional(11.0),
         Color32::WHITE,
     );
 }
@@ -1120,7 +1135,8 @@ fn menu_a11y(
         if bg != Color32::TRANSPARENT {
             ui.painter().rect_filled(rect, 4.0, bg);
         }
-        let ink = if enabled { pal.text } else { pal.text_muted };
+        let dis = ui_kit::disabled_color(pal);
+        let ink = if enabled { pal.text } else { dis };
         let mut content = rect.shrink2(Vec2::new(if icon.is_some() { 6.0 } else { 8.0 }, 0.0));
         content.max.x = rect.right() - 14.0;
         if let Some(ic) = icon {
@@ -1137,7 +1153,7 @@ fn menu_a11y(
             ui.painter_at(content).galley(pos, galley, ink);
         }
         ui_kit::caret(ui, egui::pos2(rect.right() - 7.0, rect.center().y + 0.5),
-            if enabled { pal.text_weak } else { pal.text_muted });
+            if enabled { pal.text_weak } else { dis });
         attach_lazy_tip(r, st.tip.as_deref(), ctl)
     });
     if rc.a11y {
@@ -1156,7 +1172,8 @@ fn menu_a11y(
     }
 }
 
-/// Value choices share the ribbon surface at rest. High contrast retains its control outline.
+/// Value choices sit on a quiet, crisp resting input surface (`grid_bg` + soft 1px `chrome_separator`
+/// border) so combos and dropdowns read as clear controls without visual clutter.
 fn paint_value_selector(ui: &egui::Ui, resp: &egui::Response, popup: Option<&Popup>) {
     let rect = resp.rect;
     let open = popup.is_some_and(|p| matches!(p.kind, PopupKind::Items(_)) && p.pos.distance_sq(rect.left_bottom()) < 1.0);
@@ -1166,14 +1183,22 @@ fn paint_value_selector(ui: &egui::Ui, resp: &egui::Response, popup: Option<&Pop
     } else if resp.hovered() {
         pal.hover
     } else {
-        Color32::TRANSPARENT
+        pal.grid_bg
     };
-    let stroke = if pal.theme == crate::theme::AppTheme::HighContrast {
-        egui::Stroke::new(1.0, pal.card_border)
+    let border_col = if open || resp.has_focus() {
+        pal.accent
+    } else if resp.hovered() {
+        pal.card_border
     } else {
-        egui::Stroke::NONE
+        pal.chrome_separator()
     };
-    ui.painter().rect(rect, 4.0, bg, stroke, egui::StrokeKind::Inside);
+    ui.painter().rect(
+        rect,
+        4.0,
+        bg,
+        egui::Stroke::new(1.0, border_col),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn dropdown(
@@ -1206,15 +1231,16 @@ fn dropdown(
         let pos = Align2::LEFT_CENTER
             .anchor_size(egui::pos2(rect.left() + 7.0, rect.center().y), galley.size())
             .min;
+        let dis = ui_kit::disabled_color(pal);
         ui.painter().galley(
             pos,
             galley,
-            if enabled { pal.text } else { ui_kit::DISABLED },
+            if enabled { pal.text } else { dis },
         );
         ui_kit::caret(
             ui,
             egui::pos2(rect.right() - 8.0, rect.center().y),
-            if enabled { pal.text_weak } else { ui_kit::DISABLED },
+            if enabled { pal.text_weak } else { dis },
         );
         ui_kit::focus_ring(ui, &r, rect, 4.0);
         attach_lazy_tip(r, st.tip.as_deref(), c)
@@ -1268,17 +1294,18 @@ fn combo(
         let (rect, r) = ui.allocate_exact_size(Vec2::new(w, 22.0), Sense::click());
         let pal = crate::theme::palette();
         paint_value_selector(ui, &r, app.ribbon_popup.as_ref());
+        let dis = ui_kit::disabled_color(pal);
         ui.painter().text(
             egui::pos2(rect.left() + 7.0, rect.center().y),
             Align2::LEFT_CENTER,
             cur,
             FontId::proportional(12.0),
-            if enabled { pal.text } else { ui_kit::DISABLED },
+            if enabled { pal.text } else { dis },
         );
         ui_kit::caret(
             ui,
             egui::pos2(rect.right() - 8.0, rect.center().y),
-            if enabled { pal.text_weak } else { ui_kit::DISABLED },
+            if enabled { pal.text_weak } else { dis },
         );
         ui_kit::focus_ring(ui, &r, rect, 4.0);
         attach_lazy_tip(r, st.tip.as_deref(), c)
@@ -1542,8 +1569,9 @@ fn popup_menu_row(
     icon_gutter: bool,
 ) -> egui::Response {
     let pal = crate::theme::palette();
-    let ink = if enabled { pal.text } else { pal.text_muted };
-    let secondary = if enabled { pal.text_weak } else { pal.text_muted };
+    let dis = ui_kit::disabled_color(pal);
+    let ink = if enabled { pal.text } else { dis };
+    let secondary = if enabled { pal.text_weak } else { dis };
     let sc_g = (!shortcut.is_empty()).then(|| ui.painter().layout_no_wrap(
         shortcut.to_owned(), FontId::proportional(11.0), secondary,
     ));
@@ -1581,7 +1609,7 @@ fn popup_menu_row(
                 egui::pos2(rect.left() + 15.0, rect.center().y),
                 Vec2::splat(16.0),
             );
-            crate::ui_icons::draw_excel(ui.painter(), ir, ic, pal.text_muted, enabled);
+            crate::ui_icons::draw_excel(ui.painter(), ir, ic, dis, enabled);
         }
     }
     let lpos = Align2::LEFT_CENTER
@@ -1673,7 +1701,7 @@ fn paste_visual_grid(
                     ui.painter(),
                     Rect::from_center_size(tr.center(), Vec2::splat(19.0)),
                     ic,
-                    ui_kit::DISABLED,
+                    ui_kit::disabled_color(pal),
                     paste_on,
                 );
                 ui_kit::a11y_name(&resp, &format!("快捷：{tip}"), paste_on, None);
@@ -1951,7 +1979,11 @@ fn popup(app: &mut SheetApp, ui: &mut egui::Ui) {
                                         sw.center(),
                                         Align2::CENTER_CENTER,
                                         "Aa",
-                                        FontId::proportional(if bold { 11.0 } else { 10.5 }),
+                                        if bold {
+                                            ui_kit::ui_bold_in(ui.ctx(), 11.0)
+                                        } else {
+                                            FontId::proportional(11.0)
+                                        },
                                         fg,
                                     );
                                     ui.painter().text(
@@ -2084,11 +2116,19 @@ fn font_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
     {
         let pal = crate::theme::palette();
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
+        let hovered = ui.rect_contains_pointer(crect);
+        let stroke_col = if focused || app.font_menu {
+            pal.accent
+        } else if hovered {
+            pal.card_border
+        } else {
+            pal.chrome_separator()
+        };
         ui.painter().rect(
             crect,
-            5.0,
-            pal.card_bg,
-            egui::Stroke::new(1.0, pal.card_border),
+            4.0,
+            if hovered && !focused && !app.font_menu { pal.hover } else { pal.grid_bg },
+            egui::Stroke::new(1.0, stroke_col),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
@@ -2214,11 +2254,20 @@ fn size_combo(app: &mut SheetApp, ui: &mut egui::Ui, rc: RibbonFrameCtx<'_>, wid
     {
         let pal = crate::theme::palette();
         let (crect, _) = ui.allocate_exact_size(Vec2::new(width, 24.0), Sense::hover());
+        let hovered = ui.rect_contains_pointer(crect);
+        let size_focused = ui.memory(|m| m.has_focus(sid));
+        let stroke_col = if size_focused || app.size_menu {
+            pal.accent
+        } else if hovered {
+            pal.card_border
+        } else {
+            pal.chrome_separator()
+        };
         ui.painter().rect(
             crect,
-            5.0,
-            pal.card_bg,
-            egui::Stroke::new(1.0, pal.card_border),
+            4.0,
+            if hovered && !size_focused && !app.size_menu { pal.hover } else { pal.grid_bg },
+            egui::Stroke::new(1.0, stroke_col),
             egui::StrokeKind::Inside,
         );
         let arrow_rect = Rect::from_min_max(
@@ -2368,13 +2417,14 @@ fn gallery(
         if rc.a11y {
             ui_kit::a11y_name(&resp, &it.label, enabled, None);
         }
+        let pal = crate::theme::palette();
         let (bg, fg, bold) = style_preview(&it.id);
         let bg = if resp.hovered() { bg.gamma_multiply(0.94) } else { bg };
         ui.painter().rect(
             r,
             2.0,
             bg,
-            egui::Stroke::new(1.0, ui_kit::BORDER),
+            egui::Stroke::new(1.0, pal.card_border),
             egui::StrokeKind::Inside,
         );
         // 像 Excel 的样式缩略图：一块样例底纹 + Aa + 两条模拟网格线
@@ -2382,15 +2432,14 @@ fn gallery(
             let band = Rect::from_min_max(r.min, egui::pos2(r.right(), r.top() + 6.0));
             ui.painter().rect_filled(band, 0.0, bg.gamma_multiply(0.85));
         }
-        let fs = if bold { 13.0 } else { 12.0 };
         let pos = egui::pos2(r.center().x, r.top() + 22.0);
-        let g = layout_text(ui, "Aa", fs);
-        let gp = Align2::CENTER_CENTER.anchor_size(pos, g.size()).min;
-        ui.painter().galley(gp, g.clone(), fg);
-        if bold {
-            ui.painter().galley(gp + Vec2::new(0.5, 0.0), g, fg);
-        }
-        let line = egui::Stroke::new(1.0, ui_kit::BORDER);
+        let font = if bold {
+            ui_kit::ui_bold_in(ui.ctx(), 13.0)
+        } else {
+            FontId::proportional(12.0)
+        };
+        ui.painter().text(pos, Align2::CENTER_CENTER, "Aa", font, fg);
+        let line = egui::Stroke::new(1.0, pal.chrome_separator());
         for k in 0..2 {
             let y = r.top() + 40.0 + k as f32 * 9.0;
             ui.painter().line_segment(
@@ -2402,8 +2451,8 @@ fn gallery(
             egui::pos2(r.center().x, r.bottom() - 8.0),
             Align2::CENTER_CENTER,
             &it.label,
-            FontId::proportional(9.0),
-            crate::theme::palette().text_weak,
+            FontId::proportional(11.0),
+            pal.text_weak,
         );
         if resp.clicked() && enabled {
             fire = Some(it.id.clone());
@@ -2718,10 +2767,10 @@ mod compact_tests {
                 let face = frame.shapes.iter().find_map(|shape| match &shape.shape {
                     egui::Shape::Rect(face) if face.rect == selector => Some(face),
                     _ => None,
-                });
-                let fill = face.map_or(Color32::TRANSPARENT, |f| f.fill);
-                assert_eq!(fill, if open { pal.pressed } else { Color32::TRANSPARENT });
-                assert_eq!(face.is_some_and(|f| !f.stroke.is_empty()), theme == AppTheme::HighContrast);
+                }).expect("value selector should paint a control surface");
+                assert_eq!(face.fill, if open { pal.pressed } else { pal.grid_bg });
+                let expected_stroke = if open { pal.accent } else { pal.chrome_separator() };
+                assert_eq!(face.stroke, egui::Stroke::new(1.0, expected_stroke));
             }
         }
         set_current_theme(original);
@@ -2942,8 +2991,8 @@ mod compact_tests {
                     assert!(out.platform_output.accesskit_update.unwrap().nodes.iter()
                         .any(|(_, node)| node.label() == Some(overflow_name.as_str())));
                 }
-                assert!(!out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
-                    if r.fill == pal.accent && r.rect.width() > 12.0 && r.rect.height() < 4.0)));
+                assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r)
+                    if r.fill == pal.accent && r.rect.width() >= 14.0 && r.rect.height() <= 2.5)));
             }
         }
     }
