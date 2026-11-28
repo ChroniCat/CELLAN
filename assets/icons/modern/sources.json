@@ -1,0 +1,1911 @@
+{
+  "lucide_version": "1.82.0",
+  "lucide_license": "ISC (Feather-derived icons: MIT)",
+  "icon_order": [
+    "Open",
+    "Save",
+    "SaveAs",
+    "Print",
+    "Undo",
+    "Redo",
+    "Paste",
+    "Cut",
+    "Copy",
+    "Brush",
+    "Fill",
+    "FontColor",
+    "AlignL",
+    "AlignC",
+    "AlignR",
+    "Top",
+    "Middle",
+    "Bottom",
+    "Wrap",
+    "Merge",
+    "Border",
+    "Currency",
+    "Percent",
+    "Comma",
+    "SortAsc",
+    "SortDesc",
+    "Filter",
+    "Find",
+    "Chart",
+    "Image",
+    "Table",
+    "Comment",
+    "Pivot",
+    "Link",
+    "Revision",
+    "Zoom",
+    "Calc",
+    "Sheet",
+    "Share",
+    "Fx",
+    "Sum",
+    "Grid",
+    "Home",
+    "Close",
+    "Plus",
+    "Refresh",
+    "DecInc",
+    "DecDec",
+    "FontGrow",
+    "FontShrink",
+    "TextDir",
+    "HeaderFooter",
+    "DocLink",
+    "GroupRows",
+    "UngroupRows",
+    "ShowDetail",
+    "HideDetail",
+    "Validation",
+    "SplitColumns",
+    "RemoveDup",
+    "Consolidate",
+    "ImportCsv",
+    "ImportBook",
+    "WhatIf",
+    "OutlineLevels",
+    "GoalSeek",
+    "Scenario",
+    "Eye",
+    "EyeOff",
+    "PageLayout",
+    "PageBreak",
+    "NormalView",
+    "ShowHeadings",
+    "FormulaBar",
+    "TextSpill",
+    "ViewPane",
+    "Pin",
+    "NewView",
+    "ZoomSelection",
+    "FormulaView",
+    "ErrorCheck",
+    "NameTag",
+    "WatchPane",
+    "Spelling",
+    "CommentPrev",
+    "CommentNext",
+    "ShowComment",
+    "A11y",
+    "Online",
+    "AutoShare",
+    "Help",
+    "About",
+    "Orientation",
+    "PaperSize",
+    "PrintGrid",
+    "PrintHeadings",
+    "PrintArea",
+    "PivotRefresh",
+    "PivotOptions",
+    "ChartList",
+    "FolderPlus",
+    "AppDefault",
+    "AppAdd",
+    "PdfExport",
+    "HostTakeover",
+    "UpdateCheck",
+    "FormatCells",
+    "TextVerticalDraw",
+    "TextBoxDraw",
+    "CalcSheet",
+    "SheetRef",
+    "FilterReapply",
+    "SortDialog",
+    "ShowChanges",
+    "SheetViewSwitch",
+    "Zoom100",
+    "ZoomDialog",
+    "ZoomIn",
+    "Unfreeze",
+    "TableToRange",
+    "SparkEdit",
+    "ChartEdit",
+    "RichText",
+    "Freeze",
+    "FreezeRow",
+    "FreezeCol",
+    "Lock",
+    "Cf",
+    "Eraser",
+    "ClearFmt",
+    "IndentInc",
+    "IndentDec",
+    "Symbol",
+    "ZhS",
+    "ZhT",
+    "TraceIn",
+    "TraceOut",
+    "SparkLine",
+    "SparkColumn",
+    "SparkLoss",
+    "TextBox",
+    "NewFile",
+    "Macro",
+    "MacroRun",
+    "Code",
+    "Compare",
+    "SyncScroll",
+    "InvalidCircle",
+    "PasteValues123",
+    "StrikeThrough",
+    "Spotlight",
+    "SplitPanes",
+    "HighlightDup",
+    "RejectDup",
+    "MergeSame",
+    "AiSparkle",
+    "InsertCell",
+    "DeleteCell",
+    "CellStyle",
+    "FnBook",
+    "Transpose",
+    "PasteLink",
+    "PastePic",
+    "NoBorder",
+    "ColWidth"
+  ],
+  "icons": {
+    "Open": {
+      "source": "lucide:folder-open",
+      "mono": "<path d=\"m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2\" />",
+      "soft": [
+        "WarnSoft",
+        "<path d=\"m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Save": {
+      "source": "lucide:save",
+      "mono": "<path d=\"M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z\" /> <path d=\"M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7\" /> <path d=\"M7 3v4a1 1 0 0 0 1 1h7\" />",
+      "soft": [
+        "InfoSoft",
+        "<path d=\"M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "SaveAs": {
+      "source": "lucide:save-pen",
+      "mono": "<path d=\"M13.33 13H8a1 1 0 00-1 1v7\" /> <path d=\"M14.363 17.634a2 2 0 00-.506.854l-.837 2.87a.5.5 0 00.62.62l2.87-.837a2 2 0 00.854-.506l4.013-4.009a1 1 0 10-3.004-3.004z\" /> <path d=\"M7 3v4a1 1 0 001 1h7\" /> <path d=\"M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h10.2a2 2 0 011.4.6l3.8 3.8a2 2 0 01.6 1.4v.3\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<path d=\"M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10.2a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4v2L14 17.5V21Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M13.33 13H8a1 1 0 0 0-1 1v7\" /><path d=\"M7 3v4a1 1 0 0 0 1 1h7\" /><path d=\"M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10.2a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4v.3\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M14.363 17.634a2 2 0 0 0-.506.854l-.837 2.87a.5.5 0 0 0 .62.62l2.87-.837a2 2 0 0 0 .854-.506l4.013-4.009a1 1 0 1 0-3.004-3.004z\" />"
+        ]
+      ]
+    },
+    "Print": {
+      "source": "lucide:printer",
+      "mono": "<path d=\"M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2\" /> <path d=\"M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6\" /> <rect x=\"6\" y=\"14\" width=\"12\" height=\"8\" rx=\"1\" />"
+    },
+    "Undo": {
+      "source": "lucide:undo-2",
+      "mono": "<path d=\"M9 14 4 9l5-5\" /> <path d=\"M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11\" />"
+    },
+    "Redo": {
+      "source": "lucide:redo-2",
+      "mono": "<path d=\"m15 14 5-5-5-5\" /> <path d=\"M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13\" />"
+    },
+    "Paste": {
+      "source": "lucide:clipboard-paste",
+      "mono": "<path d=\"M12 14h8\" /> <path d=\"M16 4h2a2 2 0 012 2v2.37\" /> <path d=\"m17 17 3-3-3-3\" /> <path d=\"M8 4H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2v-.37\" /> <rect x=\"8\" y=\"2\" width=\"8\" height=\"4\" rx=\"1\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<rect x=\"4.5\" y=\"4.5\" width=\"15\" height=\"17\" rx=\"1.8\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M16 4h2a2 2 0 0 1 2 2v2.37\" /><path d=\"M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-.37\" /><rect x=\"8\" y=\"2\" width=\"8\" height=\"4\" rx=\"1\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M12 14h8\" /><path d=\"m17 17 3-3-3-3\" />"
+        ]
+      ]
+    },
+    "Cut": {
+      "source": "lucide:scissors",
+      "mono": "<circle cx=\"6\" cy=\"6\" r=\"3\" /> <path d=\"M8.12 8.12 12 12\" /> <path d=\"M20 4 8.12 15.88\" /> <circle cx=\"6\" cy=\"18\" r=\"3\" /> <path d=\"M14.8 14.8 20 20\" />"
+    },
+    "Copy": {
+      "source": "lucide:copy",
+      "mono": "<rect width=\"14\" height=\"14\" x=\"8\" y=\"8\" rx=\"2\" ry=\"2\" /> <path d=\"M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2\" />"
+    },
+    "Brush": {
+      "source": "lucide:paintbrush",
+      "mono": "<path d=\"m14.622 17.897-10.68-2.913\" /> <path d=\"M18.376 2.622a1 1 0 1 1 3.002 3.002L17.36 9.643a.5.5 0 0 0 0 .707l.944.944a2.41 2.41 0 0 1 0 3.408l-.944.944a.5.5 0 0 1-.707 0L8.354 7.348a.5.5 0 0 1 0-.707l.944-.944a2.41 2.41 0 0 1 3.408 0l.944.944a.5.5 0 0 0 .707 0z\" /> <path d=\"M9 8c-1.804 2.71-3.97 3.46-6.583 3.948a.507.507 0 0 0-.302.819l7.32 8.883a1 1 0 0 0 1.185.204C12.735 20.405 16 16.792 16 15\" />",
+      "soft": [
+        "WarnSoft",
+        "<path d=\"M9 8c-1.804 2.71-3.97 3.46-6.583 3.948a.507.507 0 0 0-.302.819l7.32 8.883a1 1 0 0 0 1.185.204C12.735 20.405 16 16.792 16 15Z\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Fill": {
+      "source": "lucide:paint-bucket",
+      "mono": "<path d=\"M11 7 6 2\" /> <path d=\"M18.992 12H2.041\" /> <path d=\"M21.145 18.38A3.34 3.34 0 0 1 20 16.5a3.3 3.3 0 0 1-1.145 1.88c-.575.46-.855 1.02-.855 1.595A2 2 0 0 0 20 22a2 2 0 0 0 2-2.025c0-.58-.285-1.13-.855-1.595\" /> <path d=\"m8.5 4.5 2.148-2.148a1.205 1.205 0 0 1 1.704 0l7.296 7.296a1.205 1.205 0 0 1 0 1.704l-7.592 7.592a3.615 3.615 0 0 1-5.112 0l-3.888-3.888a3.615 3.615 0 0 1 0-5.112L5.67 7.33\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M21.145 18.38A3.34 3.34 0 0 1 20 16.5a3.3 3.3 0 0 1-1.145 1.88c-.575.46-.855 1.02-.855 1.595A2 2 0 0 0 20 22a2 2 0 0 0 2-2.025c0-.58-.285-1.13-.855-1.595Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M11 7 6 2\" /><path d=\"M18.992 12H2.041\" /><path d=\"m8.5 4.5 2.148-2.148a1.205 1.205 0 0 1 1.704 0l7.296 7.296a1.205 1.205 0 0 1 0 1.704l-7.592 7.592a3.615 3.615 0 0 1-5.112 0l-3.888-3.888a3.615 3.615 0 0 1 0-5.112L5.67 7.33\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M21.145 18.38A3.34 3.34 0 0 1 20 16.5a3.3 3.3 0 0 1-1.145 1.88c-.575.46-.855 1.02-.855 1.595A2 2 0 0 0 20 22a2 2 0 0 0 2-2.025c0-.58-.285-1.13-.855-1.595\" />"
+        ]
+      ]
+    },
+    "FontColor": {
+      "source": "custom:FontColor",
+      "mono": "<path d=\"M6 15.5 12 3.5l6 12\" /><path d=\"M8.1 11.5h7.8\" /><rect x=\"3.5\" y=\"18.2\" width=\"17\" height=\"3\" rx=\"1.4\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M6 15.5 12 3.5l6 12\" /><path d=\"M8.1 11.5h7.8\" />"
+        ],
+        [
+          "Err",
+          "<rect x=\"3.5\" y=\"18.2\" width=\"17\" height=\"3\" rx=\"1.4\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "AlignL": {
+      "source": "lucide:align-left",
+      "mono": "<path d=\"M21 5H3\" /> <path d=\"M15 12H3\" /> <path d=\"M17 19H3\" />"
+    },
+    "AlignC": {
+      "source": "lucide:align-center",
+      "mono": "<path d=\"M21 5H3\" /> <path d=\"M17 12H7\" /> <path d=\"M19 19H5\" />"
+    },
+    "AlignR": {
+      "source": "lucide:align-right",
+      "mono": "<path d=\"M21 5H3\" /> <path d=\"M21 12H9\" /> <path d=\"M21 19H7\" />"
+    },
+    "Top": {
+      "source": "lucide:arrow-up-to-line",
+      "mono": "<path d=\"M5 3h14\" /> <path d=\"m18 13-6-6-6 6\" /> <path d=\"M12 7v14\" />"
+    },
+    "Middle": {
+      "source": "custom:Middle",
+      "mono": "<path d=\"M4 12h16\" /><path d=\"M12 3v5.5\" /><path d=\"m9 5.5 3 3 3-3\" /><path d=\"M12 21v-5.5\" /><path d=\"m9 18.5 3-3 3 3\" />"
+    },
+    "Bottom": {
+      "source": "lucide:arrow-down-to-line",
+      "mono": "<path d=\"M12 17V3\" /> <path d=\"m6 11 6 6 6-6\" /> <path d=\"M19 21H5\" />"
+    },
+    "Wrap": {
+      "source": "lucide:wrap-text",
+      "mono": "<path d=\"m16 16-3 3 3 3\" /> <path d=\"M3 12h14.5a1 1 0 0 1 0 7H13\" /> <path d=\"M3 19h6\" /> <path d=\"M3 5h18\" />"
+    },
+    "Merge": {
+      "source": "lucide:table-cells-merge",
+      "mono": "<path d=\"M12 21v-6\" /> <path d=\"M12 9V3\" /> <path d=\"M3 15h18\" /> <path d=\"M3 9h18\" /> <rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" />"
+    },
+    "Border": {
+      "source": "lucide:grid-2x2",
+      "mono": "<path d=\"M12 3v18\" /> <path d=\"M3 12h18\" /> <rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\" />"
+    },
+    "Currency": {
+      "source": "lucide:japanese-yen",
+      "mono": "<path d=\"M12 12v8\" /> <path d=\"m6 4 6 8 6-8\" /> <path d=\"M8 13h8\" /> <path d=\"M8 17h8\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"M12 9.5V21m0-11.5L6 3m6 6.5L18 3\" /><path d=\"M6 15h12\" /><path d=\"M6 11h12\" />"
+        ]
+      ]
+    },
+    "Percent": {
+      "source": "lucide:percent",
+      "mono": "<line x1=\"19\" x2=\"5\" y1=\"5\" y2=\"19\" /> <circle cx=\"6.5\" cy=\"6.5\" r=\"2.5\" /> <circle cx=\"17.5\" cy=\"17.5\" r=\"2.5\" />",
+      "layers": [
+        [
+          "Accent",
+          "<line x1=\"19\" x2=\"5\" y1=\"5\" y2=\"19\" /><circle cx=\"6.5\" cy=\"6.5\" r=\"2.5\" /><circle cx=\"17.5\" cy=\"17.5\" r=\"2.5\" />"
+        ]
+      ]
+    },
+    "Comma": {
+      "source": "custom:Comma",
+      "mono": "<path d=\"M13.5 9.8a2.1 2.1 0 1 1-4.2 0 2.1 2.1 0 0 1 4.2 0Z\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M13.2 10.6c.2 3.2-1.1 6-3.7 7.6\" stroke-width=\"2.15\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"M13.5 9.8a2.1 2.1 0 1 1-4.2 0 2.1 2.1 0 0 1 4.2 0Z\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M13.2 10.6c.2 3.2-1.1 6-3.7 7.6\" stroke-width=\"2.15\" />"
+        ]
+      ]
+    },
+    "SortAsc": {
+      "source": "lucide:arrow-down-a-z",
+      "mono": "<path d=\"m3 16 4 4 4-4\" /> <path d=\"M7 20V4\" /> <path d=\"M20 8h-5\" /> <path d=\"M15 10V6.5a2.5 2.5 0 0 1 5 0V10\" /> <path d=\"M15 14h5l-5 6h5\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"m3 16 4 4 4-4\" /><path d=\"M7 20V4\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M20 8h-5\" /><path d=\"M15 10V6.5a2.5 2.5 0 0 1 5 0V10\" /><path d=\"M15 14h5l-5 6h5\" />"
+        ]
+      ]
+    },
+    "SortDesc": {
+      "source": "lucide:arrow-down-z-a",
+      "mono": "<path d=\"m3 16 4 4 4-4\" /> <path d=\"M7 4v16\" /> <path d=\"M15 4h5l-5 6h5\" /> <path d=\"M15 20v-3.5a2.5 2.5 0 0 1 5 0V20\" /> <path d=\"M20 18h-5\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"m3 16 4 4 4-4\" /><path d=\"M7 4v16\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M15 4h5l-5 6h5\" /><path d=\"M15 20v-3.5a2.5 2.5 0 0 1 5 0V20\" /><path d=\"M20 18h-5\" />"
+        ]
+      ]
+    },
+    "Filter": {
+      "source": "lucide:funnel",
+      "mono": "<path d=\"M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z\" />"
+    },
+    "Find": {
+      "source": "lucide:search",
+      "mono": "<path d=\"m21 21-4.34-4.34\" /> <circle cx=\"11\" cy=\"11\" r=\"8\" />"
+    },
+    "Chart": {
+      "source": "custom:Chart",
+      "mono": "<path d=\"M3 3v16a2 2 0 0 0 2 2h16\" /><rect x=\"7\" y=\"12\" width=\"3\" height=\"6\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"12\" y=\"6\" width=\"3\" height=\"12\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"17\" y=\"9\" width=\"3\" height=\"9\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M3 3v16a2 2 0 0 0 2 2h16\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"7\" y=\"12\" width=\"3\" height=\"6\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"12\" y=\"6\" width=\"3\" height=\"12\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Warn",
+          "<rect x=\"17\" y=\"9\" width=\"3\" height=\"9\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "Image": {
+      "source": "lucide:image",
+      "mono": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\" /> <circle cx=\"9\" cy=\"9\" r=\"2\" /> <path d=\"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<path d=\"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21h13a2 2 0 0 0 2-2Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" ry=\"2\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21\" />"
+        ],
+        [
+          "Warn",
+          "<circle cx=\"9\" cy=\"9\" r=\"2\" />"
+        ]
+      ]
+    },
+    "Table": {
+      "source": "lucide:table",
+      "mono": "<path d=\"M12 3v18\" /> <rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" /> <path d=\"M3 9h18\" /> <path d=\"M3 15h18\" />",
+      "soft": [
+        "InfoSoft",
+        "<rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"5.5\" rx=\"1.5\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Comment": {
+      "source": "lucide:message-square-text",
+      "mono": "<path d=\"M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z\" /> <path d=\"M7 11h10\" /> <path d=\"M7 15h6\" /> <path d=\"M7 7h8\" />",
+      "soft": [
+        "WarnSoft",
+        "<path d=\"M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Pivot": {
+      "source": "custom:Pivot",
+      "mono": "<rect x=\"3\" y=\"3\" width=\"11\" height=\"10\" rx=\"1.8\" /><path d=\"M3 8h11\" /><path d=\"M8.5 3v10\" /><path d=\"M18 11v4a3 3 0 0 1-3 3h-4\" /><path d=\"m14 15-3 3 3 3\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"3.8\" width=\"9.4\" height=\"4.2\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"3\" width=\"11\" height=\"10\" rx=\"1.8\" /><path d=\"M3 8h11\" /><path d=\"M8.5 3v10\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M18 11v4a3 3 0 0 1-3 3h-4\" /><path d=\"m14 15-3 3 3 3\" />"
+        ]
+      ]
+    },
+    "Link": {
+      "source": "lucide:link-2",
+      "mono": "<path d=\"M9 17H7A5 5 0 0 1 7 7h2\" /> <path d=\"M15 7h2a5 5 0 1 1 0 10h-2\" /> <line x1=\"8\" x2=\"16\" y1=\"12\" y2=\"12\" />"
+    },
+    "Revision": {
+      "source": "lucide:file-pen-line",
+      "mono": "<path d=\"M14.364 13.634a2 2 0 0 0-.506.854l-.837 2.87a.5.5 0 0 0 .62.62l2.87-.837a2 2 0 0 0 .854-.506l4.013-4.009a1 1 0 0 0-3.004-3.004z\" /> <path d=\"M14.487 7.858A1 1 0 0 1 14 7V2\" /> <path d=\"M20 19.645V20a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l2.516 2.516\" /> <path d=\"M8 18h1\" />"
+    },
+    "Zoom": {
+      "source": "custom:Zoom",
+      "mono": "<circle cx=\"10.5\" cy=\"10.5\" r=\"7\" /><path d=\"m20.5 20.5-4.8-4.8\" /><path d=\"M8 8a3.8 3.8 0 0 1 5 0\" />"
+    },
+    "Calc": {
+      "source": "lucide:calculator",
+      "mono": "<rect width=\"16\" height=\"20\" x=\"4\" y=\"2\" rx=\"2\" /> <line x1=\"8\" x2=\"16\" y1=\"6\" y2=\"6\" /> <line x1=\"16\" x2=\"16\" y1=\"14\" y2=\"18\" /> <path d=\"M16 10h.01\" /> <path d=\"M12 10h.01\" /> <path d=\"M8 10h.01\" /> <path d=\"M12 14h.01\" /> <path d=\"M8 14h.01\" /> <path d=\"M12 18h.01\" /> <path d=\"M8 18h.01\" />"
+    },
+    "Sheet": {
+      "source": "lucide:file-spreadsheet",
+      "mono": "<path d=\"M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z\" /> <path d=\"M14 2v5a1 1 0 0 0 1 1h5\" /> <path d=\"M8 13h2\" /> <path d=\"M14 13h2\" /> <path d=\"M8 17h2\" /> <path d=\"M14 17h2\" />",
+      "soft": [
+        "AccentSoft",
+        "<path d=\"M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8l6 6v12a2 2 0 0 1-2 2z\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Share": {
+      "source": "lucide:share-2",
+      "mono": "<circle cx=\"18\" cy=\"5\" r=\"3\" /> <circle cx=\"6\" cy=\"12\" r=\"3\" /> <circle cx=\"18\" cy=\"19\" r=\"3\" /> <line x1=\"8.59\" x2=\"15.42\" y1=\"13.51\" y2=\"17.49\" /> <line x1=\"15.41\" x2=\"8.59\" y1=\"6.51\" y2=\"10.49\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<circle cx=\"18\" cy=\"5\" r=\"3\" fill=\"currentColor\" stroke=\"none\" /><circle cx=\"6\" cy=\"12\" r=\"3\" fill=\"currentColor\" stroke=\"none\" /><circle cx=\"18\" cy=\"19\" r=\"3\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<line x1=\"8.59\" x2=\"15.42\" y1=\"13.51\" y2=\"17.49\" /><line x1=\"15.41\" x2=\"8.59\" y1=\"6.51\" y2=\"10.49\" />"
+        ],
+        [
+          "Info",
+          "<circle cx=\"18\" cy=\"5\" r=\"3\" /><circle cx=\"6\" cy=\"12\" r=\"3\" /><circle cx=\"18\" cy=\"19\" r=\"3\" />"
+        ]
+      ]
+    },
+    "Fx": {
+      "source": "custom:Fx",
+      "mono": "<path d=\"M6 19.5c1.8 0 2.6-1 3-3.2l1.2-8.1c.4-2.5 1.4-3.7 3.3-3.7.7 0 1.2.2 1.5.5\" /><path d=\"M6.5 10.5h6.5\" /><path d=\"m14 12.5 5.5 7\" /><path d=\"m19.5 12.5-5.5 7\" />"
+    },
+    "Sum": {
+      "source": "lucide:sigma",
+      "mono": "<path d=\"M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2\" />"
+    },
+    "Grid": {
+      "source": "lucide:grid-3x3",
+      "mono": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" /> <path d=\"M3 9h18\" /> <path d=\"M3 15h18\" /> <path d=\"M9 3v18\" /> <path d=\"M15 3v18\" />"
+    },
+    "Home": {
+      "source": "lucide:house",
+      "mono": "<path d=\"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8\" /> <path d=\"M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\" />"
+    },
+    "Close": {
+      "source": "lucide:x",
+      "mono": "<path d=\"M18 6 6 18\" /> <path d=\"m6 6 12 12\" />"
+    },
+    "Plus": {
+      "source": "lucide:plus",
+      "mono": "<path d=\"M5 12h14\" /> <path d=\"M12 5v14\" />"
+    },
+    "Refresh": {
+      "source": "lucide:refresh-cw",
+      "mono": "<path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\" /> <path d=\"M21 3v5h-5\" /> <path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\" /> <path d=\"M8 16H3v5\" />"
+    },
+    "DecInc": {
+      "source": "custom:DecInc",
+      "mono": "<circle cx=\"4.2\" cy=\"15.5\" r=\"1.15\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"7.4\" y=\"6.5\" width=\"5.6\" height=\"10\" rx=\"2.8\" /><path d=\"M15.5 11.5h6\" /><path d=\"M18.5 8.5v6\" />",
+      "layers": [
+        [
+          "Text",
+          "<circle cx=\"4.2\" cy=\"15.5\" r=\"1.15\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"7.4\" y=\"6.5\" width=\"5.6\" height=\"10\" rx=\"2.8\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M15.5 11.5h6\" /><path d=\"M18.5 8.5v6\" />"
+        ]
+      ]
+    },
+    "DecDec": {
+      "source": "custom:DecDec",
+      "mono": "<circle cx=\"4.2\" cy=\"15.5\" r=\"1.15\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"7.4\" y=\"6.5\" width=\"5.6\" height=\"10\" rx=\"2.8\" /><path d=\"M15.5 11.5h6\" />",
+      "layers": [
+        [
+          "Text",
+          "<circle cx=\"4.2\" cy=\"15.5\" r=\"1.15\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"7.4\" y=\"6.5\" width=\"5.6\" height=\"10\" rx=\"2.8\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M15.5 11.5h6\" />"
+        ]
+      ]
+    },
+    "FontGrow": {
+      "source": "lucide:a-arrow-up",
+      "mono": "<path d=\"m14 11 4-4 4 4\" /> <path d=\"M18 16V7\" /> <path d=\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\" /> <path d=\"M3.304 13h6.392\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M3.5 13h6\" /><path d=\"m2 16 4.5-9 4.5 9\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M18 16V7\" /><path d=\"m14 11 4-4 4 4\" />"
+        ]
+      ]
+    },
+    "FontShrink": {
+      "source": "lucide:a-arrow-down",
+      "mono": "<path d=\"m14 12 4 4 4-4\" /> <path d=\"M18 16V7\" /> <path d=\"m2 16 4.039-9.69a.5.5 0 0 1 .923 0L11 16\" /> <path d=\"M3.304 13h6.392\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M3.5 13h6\" /><path d=\"m2 16 4.5-9 4.5 9\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M18 7v9\" /><path d=\"m14 12 4 4 4-4\" />"
+        ]
+      ]
+    },
+    "TextDir": {
+      "source": "custom:TextDir",
+      "mono": "<path d=\"M4.5 15.5 8.5 6.5l4 9\" /><path d=\"M6 12.5h5\" /><path d=\"M14.5 5.5h2.2a2.8 2.8 0 0 1 2.8 2.8V19\" /><path d=\"m16.5 16 3 3 3-3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M4.5 15.5 8.5 6.5l4 9\" /><path d=\"M6 12.5h5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M14.5 5.5h2.2a2.8 2.8 0 0 1 2.8 2.8V19\" /><path d=\"m16.5 16 3 3 3-3\" />"
+        ]
+      ]
+    },
+    "HeaderFooter": {
+      "source": "custom:HeaderFooter",
+      "mono": "<rect x=\"4\" y=\"2.5\" width=\"16\" height=\"19\" rx=\"2\" /><path d=\"M4 7h16\" /><path d=\"M4 17h16\" /><path d=\"M8 10.5h8\" /><path d=\"M8 13.5h5.5\" />",
+      "layers": [
+        [
+          "AccentSoft",
+          "<rect x=\"4.8\" y=\"3.2\" width=\"14.4\" height=\"3.6\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"4.8\" y=\"17.2\" width=\"14.4\" height=\"3.6\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"4\" y=\"2.5\" width=\"16\" height=\"19\" rx=\"2\" /><path d=\"M8 10.5h8\" /><path d=\"M8 13.5h5.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M4.5 7h15\" /><path d=\"M4.5 17h15\" />"
+        ]
+      ]
+    },
+    "DocLink": {
+      "source": "lucide:file-symlink",
+      "mono": "<path d=\"M4 11V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.706.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h7\" /> <path d=\"M14 2v5a1 1 0 0 0 1 1h5\" /> <path d=\"m10 18 3-3-3-3\" />"
+    },
+    "GroupRows": {
+      "source": "custom:GroupRows",
+      "mono": "<path d=\"M8.5 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2.5\" /><path d=\"M12 12h8\" /><path d=\"M16 8v8\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M8.5 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M12 12h8\" /><path d=\"M16 8v8\" />"
+        ]
+      ]
+    },
+    "UngroupRows": {
+      "source": "custom:UngroupRows",
+      "mono": "<path d=\"M8.5 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2.5\" /><path d=\"M12 12h8\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M8.5 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2.5\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M12 12h8\" />"
+        ]
+      ]
+    },
+    "ShowDetail": {
+      "source": "custom:ShowDetail",
+      "mono": "<path d=\"m3.5 9.5 3 3 3-3\" /><path d=\"M12 6.5h9\" /><path d=\"M12 12h9\" /><path d=\"M12 17.5h6.5\" />"
+    },
+    "HideDetail": {
+      "source": "custom:HideDetail",
+      "mono": "<path d=\"m5 9 3 3-3 3\" /><path d=\"M12 6.5h9\" /><path d=\"M12 12h9\" /><path d=\"M12 17.5h6.5\" />"
+    },
+    "Validation": {
+      "source": "lucide:grid-2x2-check",
+      "mono": "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" /> <path d=\"m16 19 2 2 4-4\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"m16 19 2 2 4-4\" />"
+        ]
+      ]
+    },
+    "SplitColumns": {
+      "source": "lucide:table-columns-split",
+      "mono": "<path d=\"M14 14v2\" /> <path d=\"M14 20v2\" /> <path d=\"M14 2v2\" /> <path d=\"M14 8v2\" /> <path d=\"M2 15h8\" /> <path d=\"M2 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H2\" /> <path d=\"M2 9h8\" /> <path d=\"M22 15h-4\" /> <path d=\"M22 3h-2a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h2\" /> <path d=\"M22 9h-4\" /> <path d=\"M5 3v18\" />"
+    },
+    "RemoveDup": {
+      "source": "custom:RemoveDup",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"4.5\" rx=\"1.4\" /><path d=\"M3 13.5h8.5\" /><path d=\"M3 18.5h8.5\" /><path d=\"m15 13.5 5.5 5.5\" /><path d=\"m20.5 13.5-5.5 5.5\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"4.5\" rx=\"1.4\" /><path d=\"M3 13.5h8.5\" /><path d=\"M3 18.5h8.5\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"m15 13.5 5.5 5.5\" /><path d=\"m20.5 13.5-5.5 5.5\" />"
+        ]
+      ]
+    },
+    "Consolidate": {
+      "source": "lucide:combine",
+      "mono": "<path d=\"M14 3a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1\" /> <path d=\"M19 3a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1\" /> <path d=\"m7 15 3 3\" /> <path d=\"m7 21 3-3H5a2 2 0 0 1-2-2v-2\" /> <rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\" /> <rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\" />"
+    },
+    "ImportCsv": {
+      "source": "lucide:file-input",
+      "mono": "<path d=\"M14 2v5a1 1 0 001 1h5\" /> <path d=\"M4 11V4a2 2 0 012-2h8a2.4 2.4 0 011.706.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2H6a2 2 0 01-2-2v-1\" /> <path d=\"M4 15h8\" /> <path d=\"m9 18 3-3-3-3\" />"
+    },
+    "ImportBook": {
+      "source": "custom:ImportBook",
+      "mono": "<path d=\"M12 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v4.5\" /><path d=\"M3 9.5h16\" /><path d=\"M9 4v16\" /><path d=\"M18 13v8\" /><path d=\"m15 18 3 3 3-3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M12 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v4.5\" /><path d=\"M3 9.5h16\" /><path d=\"M9 4v16\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M18 13v8\" /><path d=\"m15 18 3 3 3-3\" />"
+        ]
+      ]
+    },
+    "WhatIf": {
+      "source": "custom:WhatIf",
+      "mono": "<rect x=\"3\" y=\"6\" width=\"11\" height=\"12\" rx=\"1.8\" /><path d=\"M3 11h11\" /><path d=\"M8.5 6v12\" /><path d=\"M18.5 5.5v13\" /><path d=\"m16 8 2.5-2.5L21 8\" /><path d=\"m16 16 2.5 2.5L21 16\" />"
+    },
+    "OutlineLevels": {
+      "source": "lucide:list-tree",
+      "mono": "<path d=\"M8 5h13\" /> <path d=\"M13 12h8\" /> <path d=\"M13 19h8\" /> <path d=\"M3 10a2 2 0 0 0 2 2h3\" /> <path d=\"M3 5v12a2 2 0 0 0 2 2h3\" />"
+    },
+    "GoalSeek": {
+      "source": "lucide:target",
+      "mono": "<circle cx=\"12\" cy=\"12\" r=\"10\" /> <circle cx=\"12\" cy=\"12\" r=\"6\" /> <circle cx=\"12\" cy=\"12\" r=\"2\" />"
+    },
+    "Scenario": {
+      "source": "custom:Scenario",
+      "mono": "<path d=\"M11 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2\" /><path d=\"M3 9.5h12\" /><path d=\"M8.5 4v16\" /><path d=\"M15 11.5a1.5 1.5 0 0 1 1.5-1.5h3a1.5 1.5 0 0 1 1.5 1.5V21l-3-2-3 2z\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M11 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2\" /><path d=\"M3 9.5h12\" /><path d=\"M8.5 4v16\" />"
+        ],
+        [
+          "WarnSoft",
+          "<path d=\"M15 11.5a1.5 1.5 0 0 1 1.5-1.5h3a1.5 1.5 0 0 1 1.5 1.5V21l-3-2-3 2z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M15 11.5a1.5 1.5 0 0 1 1.5-1.5h3a1.5 1.5 0 0 1 1.5 1.5V21l-3-2-3 2z\" />"
+        ]
+      ]
+    },
+    "Eye": {
+      "source": "lucide:eye",
+      "mono": "<path d=\"M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0\" /> <circle cx=\"12\" cy=\"12\" r=\"3\" />"
+    },
+    "EyeOff": {
+      "source": "lucide:eye-off",
+      "mono": "<path d=\"M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49\" /> <path d=\"M14.084 14.158a3 3 0 0 1-4.242-4.242\" /> <path d=\"M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143\" /> <path d=\"m2 2 20 20\" />"
+    },
+    "PageLayout": {
+      "source": "lucide:layout-template",
+      "mono": "<rect width=\"18\" height=\"7\" x=\"3\" y=\"3\" rx=\"1\" /> <rect width=\"9\" height=\"7\" x=\"3\" y=\"14\" rx=\"1\" /> <rect width=\"5\" height=\"7\" x=\"16\" y=\"14\" rx=\"1\" />"
+    },
+    "PageBreak": {
+      "source": "custom:PageBreak",
+      "mono": "<path d=\"M5 9V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v4\" /><path d=\"M19 15v4a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-4\" /><path d=\"M3 12h3\" /><path d=\"M10.5 12h3\" /><path d=\"M18 12h3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M5 9V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v4\" /><path d=\"M19 15v4a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-4\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M3 12h3\" /><path d=\"M10.5 12h3\" /><path d=\"M18 12h3\" />"
+        ]
+      ]
+    },
+    "NormalView": {
+      "source": "lucide:table-2",
+      "mono": "<path d=\"M3 9h18\" /> <path d=\"M9 3v18\" /> <rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\" />"
+    },
+    "ShowHeadings": {
+      "source": "custom:ShowHeadings",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" /><path d=\"M3 9h18\" /><path d=\"M8.5 4v16\" /><path d=\"M14.5 9v11\" opacity=\"0.45\" /><path d=\"M8.5 14.5H21\" opacity=\"0.45\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"4.8\" width=\"16.4\" height=\"4.2\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"3.8\" y=\"9\" width=\"4.7\" height=\"10.2\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" /><path d=\"M3 9h18\" /><path d=\"M8.5 4v16\" />"
+        ]
+      ]
+    },
+    "FormulaBar": {
+      "source": "custom:FormulaBar",
+      "mono": "<rect x=\"2.5\" y=\"7\" width=\"19\" height=\"10\" rx=\"2.2\" /><path d=\"M9.5 7v10\" /><path d=\"M5.4 14.5c.8 0 1.1-.4 1.3-1.4l.4-2.8c.2-.9.6-1.3 1.3-1.3\" /><path d=\"M5.4 11.5h2.5\" /><path d=\"M12.5 12h6\" />"
+    },
+    "TextSpill": {
+      "source": "custom:TextSpill",
+      "mono": "<path d=\"M11 7.2V6a1.5 1.5 0 0 0-1.5-1.5H4.8A1.8 1.8 0 0 0 3 6.3v11.4a1.8 1.8 0 0 0 1.8 1.8h4.7A1.5 1.5 0 0 0 11 18v-1.2\" /><path d=\"M6.5 10h14\" /><path d=\"m18 7.5 2.5 2.5-2.5 2.5\" /><path d=\"M6.5 14.5h11\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M11 7.2V6a1.5 1.5 0 0 0-1.5-1.5H4.8A1.8 1.8 0 0 0 3 6.3v11.4a1.8 1.8 0 0 0 1.8 1.8h4.7A1.5 1.5 0 0 0 11 18v-1.2\" /><path d=\"M6.5 14.5h11\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M6.5 10h14\" /><path d=\"m18 7.5 2.5 2.5-2.5 2.5\" />"
+        ]
+      ]
+    },
+    "ViewPane": {
+      "source": "lucide:panel-left",
+      "mono": "<rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" /> <path d=\"M9 3v18\" />"
+    },
+    "Pin": {
+      "source": "lucide:pin",
+      "mono": "<path d=\"M12 17v5\" /> <path d=\"M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z\" />"
+    },
+    "NewView": {
+      "source": "lucide:copy-plus",
+      "mono": "<line x1=\"15\" x2=\"15\" y1=\"12\" y2=\"18\" /> <line x1=\"12\" x2=\"18\" y1=\"15\" y2=\"15\" /> <rect width=\"14\" height=\"14\" x=\"8\" y=\"8\" rx=\"2\" ry=\"2\" /> <path d=\"M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2\" />"
+    },
+    "ZoomSelection": {
+      "source": "lucide:scan-search",
+      "mono": "<path d=\"M3 7V5a2 2 0 0 1 2-2h2\" /> <path d=\"M17 3h2a2 2 0 0 1 2 2v2\" /> <path d=\"M21 17v2a2 2 0 0 1-2 2h-2\" /> <path d=\"M7 21H5a2 2 0 0 1-2-2v-2\" /> <circle cx=\"12\" cy=\"12\" r=\"3\" /> <path d=\"m16 16-1.9-1.9\" />"
+    },
+    "FormulaView": {
+      "source": "custom:FormulaView",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" /><path d=\"M7.5 16.5c1.1 0 1.6-.6 1.8-2l.7-5c.2-1.4.8-2 2-2\" /><path d=\"M7.5 11.2h4\" /><path d=\"m13.5 11.5 4 5\" /><path d=\"m17.5 11.5-4 5\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M7.5 16.5c1.1 0 1.6-.6 1.8-2l.7-5c.2-1.4.8-2 2-2\" /><path d=\"M7.5 11.2h4\" /><path d=\"m13.5 11.5 4 5\" /><path d=\"m17.5 11.5-4 5\" />"
+        ]
+      ]
+    },
+    "ErrorCheck": {
+      "source": "custom:ErrorCheck",
+      "mono": "<path d=\"M10.5 18H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v5\" /><path d=\"M12.5 4h3.7a1.8 1.8 0 0 1 1.8 1.8v3.7Z\" fill=\"currentColor\" stroke=\"none\" /><path d=\"m13.5 17 2.5 2.5L21 14\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M10.5 18H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h7.5\" /><path d=\"M18 9.2V11\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"M12 3.2h4.4a2.4 2.4 0 0 1 2.4 2.4V10Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"m13.5 17 2.5 2.5L21 14\" />"
+        ]
+      ]
+    },
+    "NameTag": {
+      "source": "lucide:tag",
+      "mono": "<path d=\"M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z\" /> <circle cx=\"7.5\" cy=\"7.5\" r=\".5\" fill=\"currentColor\" />"
+    },
+    "WatchPane": {
+      "source": "lucide:scan-eye",
+      "mono": "<path d=\"M3 7V5a2 2 0 0 1 2-2h2\" /> <path d=\"M17 3h2a2 2 0 0 1 2 2v2\" /> <path d=\"M21 17v2a2 2 0 0 1-2 2h-2\" /> <path d=\"M7 21H5a2 2 0 0 1-2-2v-2\" /> <circle cx=\"12\" cy=\"12\" r=\"1\" /> <path d=\"M18.944 12.33a1 1 0 0 0 0-.66 7.5 7.5 0 0 0-13.888 0 1 1 0 0 0 0 .66 7.5 7.5 0 0 0 13.888 0\" />"
+    },
+    "Spelling": {
+      "source": "lucide:spell-check",
+      "mono": "<path d=\"m20 15-5.5 5.5L12 18\" /> <path d=\"m4 16 6-12 5.115 10.23\" /> <path d=\"M6 12h8\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"m4 16 6-12 5.115 10.23\" /><path d=\"M6 12h8\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"m20 15-5.5 5.5L12 18\" />"
+        ]
+      ]
+    },
+    "CommentPrev": {
+      "source": "custom:CommentPrev",
+      "mono": "<path d=\"M21.5 15a2 2 0 0 1-2 2h-6l-3 3V17H9.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" /><path d=\"M11 9h7\" /><path d=\"M11 12.5h4.5\" /><path d=\"m4.8 8.2-2.6 2.8 2.6 2.8\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M21.5 15a2 2 0 0 1-2 2h-6l-3 3V17H9.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M21.5 15a2 2 0 0 1-2 2h-6l-3 3V17H9.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" /><path d=\"M11 9h7\" /><path d=\"M11 12.5h4.5\" /><path d=\"m4.8 8.2-2.6 2.8 2.6 2.8\" />"
+        ]
+      ]
+    },
+    "CommentNext": {
+      "source": "custom:CommentNext",
+      "mono": "<path d=\"M16.5 15a2 2 0 0 1-2 2h-5l-3 3V17H4.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" /><path d=\"M6 9h7\" /><path d=\"M6 12.5h4.5\" /><path d=\"m19.2 8.2 2.6 2.8-2.6 2.8\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M16.5 15a2 2 0 0 1-2 2h-5l-3 3V17H4.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M16.5 15a2 2 0 0 1-2 2h-5l-3 3V17H4.5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z\" /><path d=\"M6 9h7\" /><path d=\"M6 12.5h4.5\" /><path d=\"m19.2 8.2 2.6 2.8-2.6 2.8\" />"
+        ]
+      ]
+    },
+    "ShowComment": {
+      "source": "lucide:message-square-dot",
+      "mono": "<path d=\"M12.7 3H4a2 2 0 0 0-2 2v16.286a.71.71 0 0 0 1.212.502l2.202-2.202A2 2 0 0 1 6.828 19H20a2 2 0 0 0 2-2v-4.7\" /> <circle cx=\"19\" cy=\"6\" r=\"3\" />",
+      "soft": [
+        "WarnSoft",
+        "<path d=\"M12.7 3H4a2 2 0 0 0-2 2v16.286a.71.71 0 0 0 1.212.502l2.202-2.202A2 2 0 0 1 6.828 19H20a2 2 0 0 0 2-2v-4.7\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "A11y": {
+      "source": "lucide:accessibility",
+      "mono": "<circle cx=\"16\" cy=\"4\" r=\"1\" /> <path d=\"m18 19 1-7-6 1\" /> <path d=\"m5 8 3-3 5.5 3-2.36 3.5\" /> <path d=\"M4.24 14.5a5 5 0 0 0 6.88 6\" /> <path d=\"M13.76 17.5a5 5 0 0 0-6.88-6\" />",
+      "layers": [
+        [
+          "Info",
+          "<circle cx=\"16\" cy=\"4\" r=\"1\" /><path d=\"m18 19 1-7-6 1\" /><path d=\"m5 8 3-3 5.5 3-2.36 3.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M4.24 14.5a5 5 0 0 0 6.88 6\" /><path d=\"M13.76 17.5a5 5 0 0 0-6.88-6\" />"
+        ]
+      ]
+    },
+    "Online": {
+      "source": "custom:Online",
+      "mono": "<circle cx=\"8.5\" cy=\"7.5\" r=\"3\" /><path d=\"M3 19.5a5.5 5.5 0 0 1 11 0\" /><path d=\"M15.5 11a3.5 3.5 0 0 1 0-5\" /><path d=\"M18.5 13.5a7 7 0 0 0 0-10\" />",
+      "layers": [
+        [
+          "Text",
+          "<circle cx=\"8.5\" cy=\"7.5\" r=\"3\" /><path d=\"M3 19.5a5.5 5.5 0 0 1 11 0\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M15.5 11a3.5 3.5 0 0 1 0-5\" /><path d=\"M18.5 13.5a7 7 0 0 0 0-10\" />"
+        ]
+      ]
+    },
+    "AutoShare": {
+      "source": "custom:AutoShare",
+      "mono": "<circle cx=\"17\" cy=\"5.5\" r=\"2.5\" /><circle cx=\"6\" cy=\"11.5\" r=\"2.5\" /><circle cx=\"17\" cy=\"17.5\" r=\"2.5\" /><path d=\"m8.2 10.3 6.6-3.6\" /><path d=\"m8.2 12.7 6.6 3.6\" /><path d=\"M11 20.5a6.5 6.5 0 0 1-6.5-3\" /><path d=\"M4.5 17.5h3\" />",
+      "layers": [
+        [
+          "Info",
+          "<circle cx=\"17\" cy=\"5.5\" r=\"2.5\" /><circle cx=\"6\" cy=\"11.5\" r=\"2.5\" /><circle cx=\"17\" cy=\"17.5\" r=\"2.5\" /><path d=\"m8.2 10.3 6.6-3.6\" /><path d=\"m8.2 12.7 6.6 3.6\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M11 20.5a6.5 6.5 0 0 1-6.5-3\" /><path d=\"M4.5 17.5h3\" />"
+        ]
+      ]
+    },
+    "Help": {
+      "source": "lucide:circle-help",
+      "mono": "<circle cx=\"12\" cy=\"12\" r=\"10\" /> <path d=\"M9 9.5a3 2.5 0 016 0c0 2-2 2-3 3.5\" /> <path d=\"M12 17h.01\" />"
+    },
+    "About": {
+      "source": "lucide:info",
+      "mono": "<circle cx=\"12\" cy=\"12\" r=\"10\" /> <path d=\"M12 16v-4\" /> <path d=\"M12 8h.01\" />"
+    },
+    "Orientation": {
+      "source": "custom:Orientation",
+      "mono": "<rect x=\"4\" y=\"4\" width=\"10\" height=\"14.5\" rx=\"1.8\" /><path d=\"M7 8.5h4\" /><path d=\"M7 12h4\" /><path d=\"M17.5 18.5a6.5 6.5 0 0 0 2.5-9.5\" /><path d=\"M17 9h3V6\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"4\" y=\"4\" width=\"10\" height=\"14.5\" rx=\"1.8\" /><path d=\"M7 8.5h4\" /><path d=\"M7 12h4\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M17.5 18.5a6.5 6.5 0 0 0 2.5-9.5\" /><path d=\"M17 9h3V6\" />"
+        ]
+      ]
+    },
+    "PaperSize": {
+      "source": "custom:PaperSize",
+      "mono": "<rect x=\"4\" y=\"7\" width=\"12\" height=\"14\" rx=\"1.8\" /><path d=\"M4 3.5h12\" /><path d=\"M4 2.5v2\" /><path d=\"M16 2.5v2\" /><path d=\"M20 7v14\" /><path d=\"M19 7h2\" /><path d=\"M19 21h2\" />"
+    },
+    "PrintGrid": {
+      "source": "custom:PrintGrid",
+      "mono": "<path d=\"M6 9V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v5\" /><path d=\"M6 17H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2\" /><rect x=\"6.5\" y=\"13\" width=\"11\" height=\"8\" rx=\"1\" /><path d=\"M12 13v8\" /><path d=\"M6.5 17h11\" />"
+    },
+    "PrintHeadings": {
+      "source": "custom:PrintHeadings",
+      "mono": "<path d=\"M6 9V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v5\" /><path d=\"M6 17H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2\" /><rect x=\"6.5\" y=\"13\" width=\"11\" height=\"8\" rx=\"1\" /><path d=\"M6.5 16h11\" /><path d=\"M9.5 13v8\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"7\" y=\"13.5\" width=\"10\" height=\"2.4\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"7\" y=\"13.5\" width=\"2.5\" height=\"7\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M6 9V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v5\" /><path d=\"M6 17H4a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-2\" /><rect x=\"6.5\" y=\"13\" width=\"11\" height=\"8\" rx=\"1\" /><path d=\"M6.5 16h11\" /><path d=\"M9.5 13v8\" />"
+        ]
+      ]
+    },
+    "PrintArea": {
+      "source": "custom:PrintArea",
+      "mono": "<rect x=\"4\" y=\"2.5\" width=\"16\" height=\"19\" rx=\"2\" /><rect x=\"7.5\" y=\"6.5\" width=\"9\" height=\"11\" rx=\"1.2\" stroke-dasharray=\"2.4 2.1\" />",
+      "layers": [
+        [
+          "AccentSoft",
+          "<rect x=\"7.5\" y=\"6.5\" width=\"9\" height=\"11\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"4\" y=\"2.5\" width=\"16\" height=\"19\" rx=\"2\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"7.5\" y=\"6.5\" width=\"9\" height=\"11\" rx=\"1.2\" stroke-dasharray=\"2.4 2.1\" />"
+        ]
+      ]
+    },
+    "PivotRefresh": {
+      "source": "custom:PivotRefresh",
+      "mono": "<path d=\"M11 19H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v5\" /><path d=\"M3 8.5h15\" /><path d=\"M8.5 3v16\" /><path d=\"M21 16a4 4 0 1 1-1.2-2.8L21 14.5\" /><path d=\"M21 11.5v3h-3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M11 19H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v5\" /><path d=\"M3 8.5h15\" /><path d=\"M8.5 3v16\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M21 16a4 4 0 1 1-1.2-2.8L21 14.5\" /><path d=\"M21 11.5v3h-3\" />"
+        ]
+      ]
+    },
+    "PivotOptions": {
+      "source": "lucide:table-config",
+      "mono": "<path d=\"M10.6 21H5a2 2 0 01-2-2V5a2 2 0 012-2h14a2 2 0 012 2v5.6\" /> <path d=\"m14.305 19.53.923-.382\" /> <path d=\"M15 3v7.6\" /> <path d=\"m15.229 16.852-.924-.383\" /> <path d=\"m16.852 15.228-.383-.923\" /> <path d=\"m16.852 20.772-.383.924\" /> <path d=\"m19.148 15.228.383-.923\" /> <path d=\"m19.53 21.696-.382-.924\" /> <path d=\"m20.773 16.852.922-.383\" /> <path d=\"m20.773 19.148.922.383\" /> <path d=\"M9 3v18\" /> <circle cx=\"18\" cy=\"18\" r=\"3\" />"
+    },
+    "ChartList": {
+      "source": "custom:ChartList",
+      "mono": "<path d=\"M3 19h9\" /><path d=\"M4.5 19v-5\" /><path d=\"M7.5 19V9\" /><path d=\"M10.5 19v-7\" /><path d=\"M15 8h6\" /><path d=\"M15 12.5h6\" /><path d=\"M15 17h4.5\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M3 19h9\" /><path d=\"M15 8h6\" /><path d=\"M15 12.5h6\" /><path d=\"M15 17h4.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M4.5 19v-5\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M7.5 19V9\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M10.5 19v-7\" />"
+        ]
+      ]
+    },
+    "FolderPlus": {
+      "source": "lucide:folder-plus",
+      "mono": "<path d=\"M12 10v6\" /> <path d=\"M9 13h6\" /> <path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M12 10v6\" /><path d=\"M9 13h6\" />"
+        ]
+      ]
+    },
+    "AppDefault": {
+      "source": "lucide:file-cog",
+      "mono": "<path d=\"M15 8a1 1 0 0 1-1-1V2a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8z\" /> <path d=\"M20 8v12a2 2 0 0 1-2 2h-4.182\" /> <path d=\"m3.305 19.53.923-.382\" /> <path d=\"M4 10.592V4a2 2 0 0 1 2-2h8\" /> <path d=\"m4.228 16.852-.924-.383\" /> <path d=\"m5.852 15.228-.383-.923\" /> <path d=\"m5.852 20.772-.383.924\" /> <path d=\"m8.148 15.228.383-.923\" /> <path d=\"m8.53 21.696-.382-.924\" /> <path d=\"m9.773 16.852.922-.383\" /> <path d=\"m9.773 19.148.922.383\" /> <circle cx=\"7\" cy=\"18\" r=\"3\" />"
+    },
+    "AppAdd": {
+      "source": "lucide:file-plus-2",
+      "mono": "<path d=\"M11.35 22H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.706.706l3.588 3.588A2.4 2.4 0 0 1 20 8v5.35\" /> <path d=\"M14 2v5a1 1 0 0 0 1 1h5\" /> <path d=\"M14 19h6\" /> <path d=\"M17 16v6\" />"
+    },
+    "PdfExport": {
+      "source": "custom:PdfExport",
+      "mono": "<path d=\"M13 20H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h7l4 4v5.5\" /><path d=\"M13 2v4h4\" /><rect x=\"6.5\" y=\"13.5\" width=\"7\" height=\"3.2\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M18.5 13v8\" /><path d=\"m15.8 18.3 2.7 2.7 2.7-2.7\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M13 20H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h7l4 4v5.5\" /><path d=\"M13 2v4h4\" /><path d=\"M7.5 9.5h5\" />"
+        ],
+        [
+          "Err",
+          "<rect x=\"6.5\" y=\"13.8\" width=\"7\" height=\"3.2\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M18.5 13v8\" /><path d=\"m15.8 18.3 2.7 2.7 2.7-2.7\" />"
+        ]
+      ]
+    },
+    "HostTakeover": {
+      "source": "lucide:monitor-up",
+      "mono": "<path d=\"m9 10 3-3 3 3\" /> <path d=\"M12 13V7\" /> <rect width=\"20\" height=\"14\" x=\"2\" y=\"3\" rx=\"2\" /> <path d=\"M12 17v4\" /> <path d=\"M8 21h8\" />"
+    },
+    "UpdateCheck": {
+      "source": "lucide:refresh-ccw-dot",
+      "mono": "<path d=\"M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8\" /> <path d=\"M3 3v5h5\" /> <path d=\"M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16\" /> <path d=\"M16 16h5v5\" /> <circle cx=\"12\" cy=\"12\" r=\"1\" />"
+    },
+    "FormatCells": {
+      "source": "lucide:table-properties",
+      "mono": "<path d=\"M15 3v18\" /> <rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\" /> <path d=\"M21 9H3\" /> <path d=\"M21 15H3\" />"
+    },
+    "TextVerticalDraw": {
+      "source": "custom:TextVerticalDraw",
+      "mono": "<path d=\"M5.5 11 8.5 4l3 7\" /><path d=\"M6.6 8.8h3.8\" /><path d=\"M6.5 15h4\" /><path d=\"M6.5 19h4\" /><path d=\"M17 4.5v15\" /><path d=\"m14 16.5 3 3 3-3\" />"
+    },
+    "TextBoxDraw": {
+      "source": "lucide:square-pen",
+      "mono": "<path d=\"M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7\" /> <path d=\"M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z\" />"
+    },
+    "CalcSheet": {
+      "source": "custom:CalcSheet",
+      "mono": "<path d=\"M10.5 19H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v4\" /><path d=\"M3 8.5h15\" /><path d=\"M8.5 3v16\" /><rect x=\"13\" y=\"11\" width=\"8\" height=\"10\" rx=\"1.6\" /><path d=\"M15.5 14h3\" /><path d=\"M15.5 17.5h.01\" /><path d=\"M18.5 17.5h.01\" />"
+    },
+    "SheetRef": {
+      "source": "custom:SheetRef",
+      "mono": "<rect x=\"3\" y=\"3.5\" width=\"9\" height=\"8\" rx=\"1.6\" /><rect x=\"12\" y=\"12.5\" width=\"9\" height=\"8\" rx=\"1.6\" /><path d=\"M14.5 6.5h2a2 2 0 0 1 2 2v1.5\" /><path d=\"m16.5 8 2 2 2-2\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"3.5\" width=\"9\" height=\"8\" rx=\"1.6\" /><rect x=\"12\" y=\"12.5\" width=\"9\" height=\"8\" rx=\"1.6\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M14.5 6.5h2a2 2 0 0 1 2 2v1.5\" /><path d=\"m16.5 8 2 2 2-2\" />"
+        ]
+      ]
+    },
+    "FilterReapply": {
+      "source": "custom:FilterReapply",
+      "mono": "<path d=\"M3 4h14l-5.5 6.5v6l-3-1.8v-4.2z\" /><path d=\"M21 16.5a3.8 3.8 0 1 1-1.1-2.7L21 15\" /><path d=\"M21 12v3h-3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M3 4h14l-5.5 6.5v6l-3-1.8v-4.2z\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M21 16.5a3.8 3.8 0 1 1-1.1-2.7L21 15\" /><path d=\"M21 12v3h-3\" />"
+        ]
+      ]
+    },
+    "SortDialog": {
+      "source": "custom:SortDialog",
+      "mono": "<path d=\"M6.5 4.5v15\" /><path d=\"m4 7 2.5-2.5L9 7\" /><path d=\"m4 17 2.5 2.5L9 17\" /><path d=\"M12.5 7h8\" /><path d=\"M12.5 12h6.5\" /><path d=\"M12.5 17h4.5\" />"
+    },
+    "ShowChanges": {
+      "source": "lucide:file-diff",
+      "mono": "<path d=\"M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z\" /> <path d=\"M9 10h6\" /> <path d=\"M12 13V7\" /> <path d=\"M9 17h6\" />"
+    },
+    "SheetViewSwitch": {
+      "source": "lucide:layers",
+      "mono": "<path d=\"M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z\" /> <path d=\"M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12\" /> <path d=\"M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17\" />"
+    },
+    "Zoom100": {
+      "source": "custom:Zoom100",
+      "mono": "<circle cx=\"10.5\" cy=\"10.5\" r=\"7\" /><path d=\"m20.5 20.5-4.8-4.8\" /><rect x=\"7.8\" y=\"7.8\" width=\"5.4\" height=\"5.4\" rx=\"1\" />"
+    },
+    "ZoomDialog": {
+      "source": "custom:ZoomDialog",
+      "mono": "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.8\" /><path d=\"m20.2 20.2-4.6-4.6\" /><path d=\"M7.5 10.5h6\" /><circle cx=\"19.5\" cy=\"5.5\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" /><circle cx=\"19.5\" cy=\"10.5\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<circle cx=\"10.5\" cy=\"10.5\" r=\"6.8\" /><path d=\"m20.2 20.2-4.6-4.6\" /><path d=\"M7.5 10.5h6\" />"
+        ],
+        [
+          "Accent",
+          "<circle cx=\"19.5\" cy=\"5.5\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" /><circle cx=\"19.5\" cy=\"10.5\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "ZoomIn": {
+      "source": "lucide:zoom-in",
+      "mono": "<circle cx=\"11\" cy=\"11\" r=\"8\" /> <line x1=\"21\" x2=\"16.65\" y1=\"21\" y2=\"16.65\" /> <line x1=\"11\" x2=\"11\" y1=\"8\" y2=\"14\" /> <line x1=\"8\" x2=\"14\" y1=\"11\" y2=\"11\" />"
+    },
+    "Unfreeze": {
+      "source": "custom:Unfreeze",
+      "mono": "<path d=\"M8.5 3.5H19a2 2 0 0 1 2 2v10.5\" /><path d=\"M15.5 20.5H5a2 2 0 0 1-2-2V8\" /><path d=\"M13 8.5h8\" /><path d=\"M3 21 21 3\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M8.5 3.5H19a2 2 0 0 1 2 2v10.5\" /><path d=\"M15.5 20.5H5a2 2 0 0 1-2-2V8\" /><path d=\"M13 8.5h8\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"M3 21 21 3\" />"
+        ]
+      ]
+    },
+    "TableToRange": {
+      "source": "custom:TableToRange",
+      "mono": "<path d=\"M12 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6\" /><path d=\"M3 9.5h10\" /><path d=\"M9 4v17\" /><path d=\"M15 4h6v6\" /><path d=\"m21 4-7 7\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M12 4H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6\" /><path d=\"M3 9.5h10\" /><path d=\"M9 4v17\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M15 4h6v6\" /><path d=\"m21 4-7 7\" />"
+        ]
+      ]
+    },
+    "SparkEdit": {
+      "source": "custom:SparkEdit",
+      "mono": "<path d=\"M3 13c2-3 3.5-5 5.5-2s3.5-4.5 5.5-6\" /><path d=\"M3 16.5h7.5\" /><path d=\"m14.5 19.5 5-5a1.4 1.4 0 0 1 2 2l-5 5-2.8.8z\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"M3 13c2-3 3.5-5 5.5-2s3.5-4.5 5.5-6\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M3 16.5h7.5\" /><path d=\"m14.5 19.5 5-5a1.4 1.4 0 0 1 2 2l-5 5-2.8.8z\" />"
+        ]
+      ]
+    },
+    "ChartEdit": {
+      "source": "custom:ChartEdit",
+      "mono": "<path d=\"M3 17.5h8\" /><path d=\"M4.5 17.5v-4.5\" /><path d=\"M7.5 17.5V8\" /><path d=\"M10.5 17.5v-6\" /><path d=\"m14.5 19.5 5-5a1.4 1.4 0 0 1 2 2l-5 5-2.8.8z\" />",
+      "layers": [
+        [
+          "Accent",
+          "<path d=\"M4.5 17.5v-4.5\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M7.5 17.5V8\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M10.5 17.5v-6\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M3 17.5h8\" /><path d=\"m14.5 19.5 5-5a1.4 1.4 0 0 1 2 2l-5 5-2.8.8z\" />"
+        ]
+      ]
+    },
+    "RichText": {
+      "source": "custom:RichText",
+      "mono": "<path d=\"M7 13.5 12 3.5l5 10\" /><path d=\"M8.8 10h6.4\" /><path d=\"M4 17.5h16\" /><path d=\"M4 20.8h10\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M7 13.5 12 3.5l5 10\" /><path d=\"M8.8 10h6.4\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M4 17.5h16\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M4 20.8h10\" />"
+        ]
+      ]
+    },
+    "Freeze": {
+      "source": "custom:Freeze",
+      "mono": "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" /><path d=\"M3 9h17\" /><path d=\"M8.5 3.5v17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"4.2\" width=\"15.4\" height=\"4.8\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"3.8\" y=\"9\" width=\"4.7\" height=\"10.7\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M3 9h17\" /><path d=\"M8.5 3.5v17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />"
+        ]
+      ]
+    },
+    "FreezeRow": {
+      "source": "custom:FreezeRow",
+      "mono": "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" /><path d=\"M3 9h17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"4.2\" width=\"15.4\" height=\"4.8\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M3 9h17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />"
+        ]
+      ]
+    },
+    "FreezeCol": {
+      "source": "custom:FreezeCol",
+      "mono": "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" /><path d=\"M8.5 3.5v17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"4.2\" width=\"4.7\" height=\"15.5\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M11.5 20.5H5a2 2 0 0 1-2-2V5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v6\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M8.5 3.5v17\" /><path d=\"M17.5 13.5v7\" /><path d=\"m14.5 15.2 6 3.6\" /><path d=\"m20.5 15.2-6 3.6\" />"
+        ]
+      ]
+    },
+    "Lock": {
+      "source": "lucide:lock",
+      "mono": "<rect width=\"18\" height=\"11\" x=\"3\" y=\"11\" rx=\"2\" ry=\"2\" /> <path d=\"M7 11V7a5 5 0 0 1 10 0v4\" />",
+      "soft": [
+        "WarnSoft",
+        "<rect width=\"18\" height=\"11\" x=\"3\" y=\"11\" rx=\"2\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Cf": {
+      "source": "custom:Cf",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" /><rect x=\"6\" y=\"7\" width=\"12\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"6\" y=\"10.8\" width=\"8.5\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"6\" y=\"14.6\" width=\"5.2\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"6\" y=\"7\" width=\"12\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Warn",
+          "<rect x=\"6\" y=\"10.8\" width=\"8.5\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"6\" y=\"14.6\" width=\"5.2\" height=\"2.4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "Eraser": {
+      "source": "lucide:eraser",
+      "mono": "<path d=\"M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21\" /> <path d=\"m5.082 11.09 8.828 8.828\" />",
+      "soft": [
+        "ErrSoft",
+        "<path d=\"M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "ClearFmt": {
+      "source": "lucide:remove-formatting",
+      "mono": "<path d=\"M4 7V4h16v3\" /> <path d=\"M5 20h6\" /> <path d=\"M13 4 8 20\" /> <path d=\"m15 15 5 5\" /> <path d=\"m20 15-5 5\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M4 7V4h16v3\" /><path d=\"M5 20h6\" /><path d=\"M13 4 8 20\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"m15 15 5 5\" /><path d=\"m20 15-5 5\" />"
+        ]
+      ]
+    },
+    "IndentInc": {
+      "source": "lucide:indent-increase",
+      "mono": "<path d=\"M21 5H11\" /> <path d=\"M21 12H11\" /> <path d=\"M21 19H11\" /> <path d=\"m3 8 4 4-4 4\" />"
+    },
+    "IndentDec": {
+      "source": "lucide:indent-decrease",
+      "mono": "<path d=\"M21 5H11\" /> <path d=\"M21 12H11\" /> <path d=\"M21 19H11\" /> <path d=\"m7 8-4 4 4 4\" />"
+    },
+    "Symbol": {
+      "source": "lucide:omega",
+      "mono": "<path d=\"M3 20h4.5a.5.5 0 0 0 .5-.5v-.282a.52.52 0 0 0-.247-.437 8 8 0 1 1 8.494-.001.52.52 0 0 0-.247.438v.282a.5.5 0 0 0 .5.5H21\" />"
+    },
+    "ZhS": {
+      "source": "custom:ZhS",
+      "mono": "<path d=\"M4.62 6.58H8.92V7.94H4.62ZM10 6.59H15.2V7.94H10ZM4.6 5.44 6.15 5.86Q5.87 6.57 5.49 7.26Q5.1 7.96 4.66 8.56Q4.22 9.16 3.76 9.61Q3.61 9.47 3.37 9.3Q3.12 9.14 2.86 8.97Q2.59 8.8 2.4 8.72Q3.09 8.12 3.67 7.25Q4.25 6.37 4.6 5.44ZM10.25 5.48 11.82 5.84Q11.52 6.87 10.99 7.83Q10.46 8.79 9.88 9.43Q9.74 9.29 9.49 9.12Q9.24 8.96 8.98 8.79Q8.72 8.62 8.53 8.54Q9.1 7.98 9.56 7.16Q10.02 6.34 10.25 5.48ZM5.39 7.64 6.72 7.11Q7.03 7.54 7.33 8.07Q7.63 8.61 7.76 9.01L6.33 9.61Q6.22 9.22 5.94 8.66Q5.67 8.09 5.39 7.64ZM11.34 7.58 12.68 6.98Q13.03 7.43 13.39 7.98Q13.75 8.54 13.94 8.96L12.5 9.62Q12.36 9.21 12.02 8.63Q11.67 8.05 11.34 7.58ZM7.04 13.89H10.84V15.02H7.04ZM3.21 11.14H4.83V18.56H3.21ZM6.92 9.68H14.07V11.15H6.92ZM3.93 9.98 5.14 9.16Q5.57 9.51 6.01 9.99Q6.46 10.47 6.69 10.83L5.39 11.75Q5.19 11.37 4.77 10.87Q4.35 10.37 3.93 9.98ZM13.07 9.68H14.71V16.81Q14.71 17.41 14.57 17.73Q14.42 18.05 14.02 18.23Q13.63 18.38 13.05 18.42Q12.48 18.46 11.7 18.45Q11.64 18.14 11.5 17.74Q11.36 17.34 11.21 17.03Q11.52 17.04 11.84 17.06Q12.17 17.07 12.43 17.07Q12.7 17.06 12.8 17.06Q12.96 17.06 13.02 17Q13.07 16.95 13.07 16.81ZM7.79 13.18V15.77H10.16V13.18ZM6.39 11.96H11.63V16.99H6.39Z\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M16.2 12h5.3\" /><path d=\"m19 9.2 2.8 2.8-2.8 2.8\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M4.62 6.58H8.92V7.94H4.62ZM10 6.59H15.2V7.94H10ZM4.6 5.44 6.15 5.86Q5.87 6.57 5.49 7.26Q5.1 7.96 4.66 8.56Q4.22 9.16 3.76 9.61Q3.61 9.47 3.37 9.3Q3.12 9.14 2.86 8.97Q2.59 8.8 2.4 8.72Q3.09 8.12 3.67 7.25Q4.25 6.37 4.6 5.44ZM10.25 5.48 11.82 5.84Q11.52 6.87 10.99 7.83Q10.46 8.79 9.88 9.43Q9.74 9.29 9.49 9.12Q9.24 8.96 8.98 8.79Q8.72 8.62 8.53 8.54Q9.1 7.98 9.56 7.16Q10.02 6.34 10.25 5.48ZM5.39 7.64 6.72 7.11Q7.03 7.54 7.33 8.07Q7.63 8.61 7.76 9.01L6.33 9.61Q6.22 9.22 5.94 8.66Q5.67 8.09 5.39 7.64ZM11.34 7.58 12.68 6.98Q13.03 7.43 13.39 7.98Q13.75 8.54 13.94 8.96L12.5 9.62Q12.36 9.21 12.02 8.63Q11.67 8.05 11.34 7.58ZM7.04 13.89H10.84V15.02H7.04ZM3.21 11.14H4.83V18.56H3.21ZM6.92 9.68H14.07V11.15H6.92ZM3.93 9.98 5.14 9.16Q5.57 9.51 6.01 9.99Q6.46 10.47 6.69 10.83L5.39 11.75Q5.19 11.37 4.77 10.87Q4.35 10.37 3.93 9.98ZM13.07 9.68H14.71V16.81Q14.71 17.41 14.57 17.73Q14.42 18.05 14.02 18.23Q13.63 18.38 13.05 18.42Q12.48 18.46 11.7 18.45Q11.64 18.14 11.5 17.74Q11.36 17.34 11.21 17.03Q11.52 17.04 11.84 17.06Q12.17 17.07 12.43 17.07Q12.7 17.06 12.8 17.06Q12.96 17.06 13.02 17Q13.07 16.95 13.07 16.81ZM7.79 13.18V15.77H10.16V13.18ZM6.39 11.96H11.63V16.99H6.39Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M16.2 12h5.3\" /><path d=\"m19 9.2 2.8 2.8-2.8 2.8\" />"
+        ]
+      ]
+    },
+    "ZhT": {
+      "source": "custom:ZhT",
+      "mono": "<path d=\"M17.14 13.82 18.19 13.08Q18.67 13.36 19.22 13.71Q19.76 14.06 20.24 14.43Q20.72 14.8 21.03 15.12L19.9 15.95Q19.62 15.63 19.16 15.25Q18.7 14.87 18.17 14.49Q17.63 14.12 17.14 13.82ZM16.86 16.5 18.02 15.72Q18.53 15.91 19.12 16.16Q19.72 16.42 20.28 16.68Q20.84 16.95 21.23 17.19L19.98 18.05Q19.65 17.82 19.11 17.54Q18.58 17.26 17.99 16.98Q17.39 16.71 16.86 16.5ZM12.17 15.76 13.58 16.34Q13.16 16.68 12.58 17.01Q12.01 17.34 11.39 17.63Q10.78 17.91 10.2 18.11Q10.08 17.97 9.88 17.77Q9.67 17.56 9.45 17.36Q9.24 17.16 9.07 17.04Q9.92 16.83 10.77 16.49Q11.62 16.15 12.17 15.76ZM16.82 5.75 18.15 6.02Q17.87 7.08 17.34 8Q16.82 8.92 16.12 9.53Q16.02 9.4 15.83 9.22Q15.65 9.04 15.47 8.86Q15.28 8.68 15.13 8.57Q15.75 8.08 16.18 7.34Q16.6 6.61 16.82 5.75ZM19.24 7.26 20.56 7.46Q20.06 9.21 18.95 10.32Q17.83 11.43 16.23 12.07Q16.16 11.93 16.02 11.73Q15.87 11.53 15.71 11.33Q15.55 11.14 15.43 11.02Q16.91 10.52 17.89 9.61Q18.87 8.69 19.24 7.26ZM16.84 6.65H21.24V7.77H16.27ZM10.6 5.7 11.86 5.99Q11.54 6.74 11.01 7.4Q10.48 8.07 9.91 8.51Q9.79 8.4 9.58 8.27Q9.37 8.15 9.16 8.02Q8.95 7.89 8.8 7.82Q9.39 7.42 9.86 6.88Q10.34 6.33 10.6 5.7ZM10.8 6.33H15.44V7.29H10.32ZM17.32 7.64Q17.87 8.88 18.97 9.78Q20.06 10.68 21.6 11.07Q21.37 11.26 21.12 11.61Q20.87 11.97 20.72 12.23Q19.09 11.71 17.97 10.6Q16.84 9.49 16.2 7.94ZM10.2 7.69H11.41Q11.35 8.37 11.27 9.14Q11.18 9.91 11.09 10.63Q11 11.35 10.91 11.89H9.71Q9.8 11.34 9.9 10.61Q9.99 9.88 10.07 9.12Q10.15 8.36 10.2 7.69ZM10.54 7.69H14.25V8.52H10.54ZM10.26 11.07H15.35V11.89H10.26ZM11.7 8.91 12.1 8.43Q12.41 8.52 12.72 8.69Q13.04 8.85 13.22 9.03L12.79 9.55Q12.63 9.37 12.31 9.2Q11.99 9.03 11.7 8.91ZM11.55 10.42 11.97 9.95Q12.29 10.07 12.63 10.26Q12.97 10.46 13.17 10.64L12.73 11.15Q12.54 10.96 12.21 10.76Q11.87 10.56 11.55 10.42ZM9 9.32H10.64V9.41H14.1V9.32H15.76V10.22H14.1V10.12H10.64V10.22H9ZM13.77 7.69H14.97Q14.93 8.32 14.87 9.03Q14.81 9.74 14.75 10.39Q14.68 11.04 14.61 11.54H13.38Q13.46 11.03 13.54 10.37Q13.61 9.71 13.68 9Q13.74 8.29 13.77 7.69ZM10.31 15.97Q10.28 15.85 10.22 15.63Q10.16 15.4 10.1 15.15Q10.03 14.89 9.95 14.73Q10.32 14.69 10.73 14.59Q11.14 14.48 11.7 14.29Q12.01 14.2 12.61 13.99Q13.21 13.78 13.96 13.48Q14.72 13.17 15.53 12.79Q16.35 12.41 17.1 11.97L18.01 12.96Q16.4 13.78 14.67 14.4Q12.94 15.01 11.23 15.45V15.49Q11.23 15.49 11.09 15.54Q10.95 15.59 10.77 15.65Q10.59 15.72 10.45 15.81Q10.31 15.89 10.31 15.97ZM10.31 15.97 10.28 15.01 11.14 14.57 19.38 14.13Q19.41 14.38 19.46 14.7Q19.5 15.01 19.56 15.2Q17.61 15.32 16.2 15.41Q14.8 15.51 13.82 15.57Q12.85 15.64 12.23 15.69Q11.61 15.75 11.24 15.79Q10.87 15.84 10.66 15.88Q10.46 15.92 10.31 15.97ZM11.19 13.97Q11.16 13.85 11.1 13.64Q11.04 13.42 10.97 13.2Q10.9 12.98 10.83 12.82Q11.03 12.79 11.25 12.73Q11.46 12.67 11.71 12.58Q11.9 12.5 12.29 12.33Q12.69 12.17 13.17 11.91Q13.65 11.66 14.08 11.35L15.01 12.18Q14.32 12.54 13.52 12.86Q12.73 13.18 11.94 13.4V13.44Q11.94 13.44 11.83 13.49Q11.71 13.54 11.57 13.62Q11.42 13.7 11.31 13.8Q11.19 13.89 11.19 13.97ZM11.19 13.97 11.16 13.16 11.79 12.81 16.19 12.59Q16.12 12.81 16.08 13.08Q16.03 13.36 16 13.53Q14.53 13.62 13.63 13.68Q12.73 13.74 12.24 13.8Q11.75 13.85 11.53 13.89Q11.31 13.93 11.19 13.97ZM14.65 14.64H16.27V16.84Q16.27 17.38 16.13 17.66Q15.99 17.94 15.59 18.1Q15.19 18.25 14.67 18.27Q14.14 18.3 13.46 18.3Q13.4 17.98 13.24 17.61Q13.08 17.24 12.92 16.98Q13.21 16.99 13.52 17Q13.82 17 14.06 17Q14.3 16.99 14.4 16.99Q14.55 16.98 14.6 16.94Q14.65 16.9 14.65 16.79Z\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M7.8 12H2.5\" /><path d=\"M5 9.2 2.2 12 5 14.8\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M17.14 13.82 18.19 13.08Q18.67 13.36 19.22 13.71Q19.76 14.06 20.24 14.43Q20.72 14.8 21.03 15.12L19.9 15.95Q19.62 15.63 19.16 15.25Q18.7 14.87 18.17 14.49Q17.63 14.12 17.14 13.82ZM16.86 16.5 18.02 15.72Q18.53 15.91 19.12 16.16Q19.72 16.42 20.28 16.68Q20.84 16.95 21.23 17.19L19.98 18.05Q19.65 17.82 19.11 17.54Q18.58 17.26 17.99 16.98Q17.39 16.71 16.86 16.5ZM12.17 15.76 13.58 16.34Q13.16 16.68 12.58 17.01Q12.01 17.34 11.39 17.63Q10.78 17.91 10.2 18.11Q10.08 17.97 9.88 17.77Q9.67 17.56 9.45 17.36Q9.24 17.16 9.07 17.04Q9.92 16.83 10.77 16.49Q11.62 16.15 12.17 15.76ZM16.82 5.75 18.15 6.02Q17.87 7.08 17.34 8Q16.82 8.92 16.12 9.53Q16.02 9.4 15.83 9.22Q15.65 9.04 15.47 8.86Q15.28 8.68 15.13 8.57Q15.75 8.08 16.18 7.34Q16.6 6.61 16.82 5.75ZM19.24 7.26 20.56 7.46Q20.06 9.21 18.95 10.32Q17.83 11.43 16.23 12.07Q16.16 11.93 16.02 11.73Q15.87 11.53 15.71 11.33Q15.55 11.14 15.43 11.02Q16.91 10.52 17.89 9.61Q18.87 8.69 19.24 7.26ZM16.84 6.65H21.24V7.77H16.27ZM10.6 5.7 11.86 5.99Q11.54 6.74 11.01 7.4Q10.48 8.07 9.91 8.51Q9.79 8.4 9.58 8.27Q9.37 8.15 9.16 8.02Q8.95 7.89 8.8 7.82Q9.39 7.42 9.86 6.88Q10.34 6.33 10.6 5.7ZM10.8 6.33H15.44V7.29H10.32ZM17.32 7.64Q17.87 8.88 18.97 9.78Q20.06 10.68 21.6 11.07Q21.37 11.26 21.12 11.61Q20.87 11.97 20.72 12.23Q19.09 11.71 17.97 10.6Q16.84 9.49 16.2 7.94ZM10.2 7.69H11.41Q11.35 8.37 11.27 9.14Q11.18 9.91 11.09 10.63Q11 11.35 10.91 11.89H9.71Q9.8 11.34 9.9 10.61Q9.99 9.88 10.07 9.12Q10.15 8.36 10.2 7.69ZM10.54 7.69H14.25V8.52H10.54ZM10.26 11.07H15.35V11.89H10.26ZM11.7 8.91 12.1 8.43Q12.41 8.52 12.72 8.69Q13.04 8.85 13.22 9.03L12.79 9.55Q12.63 9.37 12.31 9.2Q11.99 9.03 11.7 8.91ZM11.55 10.42 11.97 9.95Q12.29 10.07 12.63 10.26Q12.97 10.46 13.17 10.64L12.73 11.15Q12.54 10.96 12.21 10.76Q11.87 10.56 11.55 10.42ZM9 9.32H10.64V9.41H14.1V9.32H15.76V10.22H14.1V10.12H10.64V10.22H9ZM13.77 7.69H14.97Q14.93 8.32 14.87 9.03Q14.81 9.74 14.75 10.39Q14.68 11.04 14.61 11.54H13.38Q13.46 11.03 13.54 10.37Q13.61 9.71 13.68 9Q13.74 8.29 13.77 7.69ZM10.31 15.97Q10.28 15.85 10.22 15.63Q10.16 15.4 10.1 15.15Q10.03 14.89 9.95 14.73Q10.32 14.69 10.73 14.59Q11.14 14.48 11.7 14.29Q12.01 14.2 12.61 13.99Q13.21 13.78 13.96 13.48Q14.72 13.17 15.53 12.79Q16.35 12.41 17.1 11.97L18.01 12.96Q16.4 13.78 14.67 14.4Q12.94 15.01 11.23 15.45V15.49Q11.23 15.49 11.09 15.54Q10.95 15.59 10.77 15.65Q10.59 15.72 10.45 15.81Q10.31 15.89 10.31 15.97ZM10.31 15.97 10.28 15.01 11.14 14.57 19.38 14.13Q19.41 14.38 19.46 14.7Q19.5 15.01 19.56 15.2Q17.61 15.32 16.2 15.41Q14.8 15.51 13.82 15.57Q12.85 15.64 12.23 15.69Q11.61 15.75 11.24 15.79Q10.87 15.84 10.66 15.88Q10.46 15.92 10.31 15.97ZM11.19 13.97Q11.16 13.85 11.1 13.64Q11.04 13.42 10.97 13.2Q10.9 12.98 10.83 12.82Q11.03 12.79 11.25 12.73Q11.46 12.67 11.71 12.58Q11.9 12.5 12.29 12.33Q12.69 12.17 13.17 11.91Q13.65 11.66 14.08 11.35L15.01 12.18Q14.32 12.54 13.52 12.86Q12.73 13.18 11.94 13.4V13.44Q11.94 13.44 11.83 13.49Q11.71 13.54 11.57 13.62Q11.42 13.7 11.31 13.8Q11.19 13.89 11.19 13.97ZM11.19 13.97 11.16 13.16 11.79 12.81 16.19 12.59Q16.12 12.81 16.08 13.08Q16.03 13.36 16 13.53Q14.53 13.62 13.63 13.68Q12.73 13.74 12.24 13.8Q11.75 13.85 11.53 13.89Q11.31 13.93 11.19 13.97ZM14.65 14.64H16.27V16.84Q16.27 17.38 16.13 17.66Q15.99 17.94 15.59 18.1Q15.19 18.25 14.67 18.27Q14.14 18.3 13.46 18.3Q13.4 17.98 13.24 17.61Q13.08 17.24 12.92 16.98Q13.21 16.99 13.52 17Q13.82 17 14.06 17Q14.3 16.99 14.4 16.99Q14.55 16.98 14.6 16.94Q14.65 16.9 14.65 16.79Z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M7.8 12H2.5\" /><path d=\"M5 9.2 2.2 12 5 14.8\" />"
+        ]
+      ]
+    },
+    "TraceIn": {
+      "source": "custom:TraceIn",
+      "mono": "<rect x=\"13\" y=\"6.5\" width=\"8\" height=\"11\" rx=\"1.8\" /><circle cx=\"4\" cy=\"12\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M5.5 12h5\" /><path d=\"m8 9.2 2.8 2.8L8 14.8\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"13.8\" y=\"7.3\" width=\"6.4\" height=\"9.4\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"13\" y=\"6.5\" width=\"8\" height=\"11\" rx=\"1.8\" />"
+        ],
+        [
+          "Info",
+          "<circle cx=\"4\" cy=\"12\" r=\"1.4\" fill=\"currentColor\" stroke=\"none\" /><path d=\"M5.5 12h5\" /><path d=\"m8 9.2 2.8 2.8L8 14.8\" />"
+        ]
+      ]
+    },
+    "TraceOut": {
+      "source": "custom:TraceOut",
+      "mono": "<rect x=\"3\" y=\"6.5\" width=\"8\" height=\"11\" rx=\"1.8\" /><path d=\"M13.5 12H20\" /><path d=\"m17.2 9.2 2.8 2.8-2.8 2.8\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"7.3\" width=\"6.4\" height=\"9.4\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"6.5\" width=\"8\" height=\"11\" rx=\"1.8\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M13.5 12H20\" /><path d=\"m17.2 9.2 2.8 2.8-2.8 2.8\" />"
+        ]
+      ]
+    },
+    "SparkLine": {
+      "source": "custom:SparkLine",
+      "mono": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" /><path d=\"M5.8 14.8c1.4-2.8 2.4-4.2 3.8-2.4 1.3 1.7 2.2 1.7 3.6-2.2 1.1-3 2.1-2.5 3.6.5\" /><circle cx=\"17.8\" cy=\"10.2\" r=\"1.35\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"5.8\" width=\"16.4\" height=\"12.4\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M5.8 14.8c1.4-2.8 2.4-4.2 3.8-2.4 1.3 1.7 2.2 1.7 3.6-2.2 1.1-3 2.1-2.5 3.6.5\" />"
+        ],
+        [
+          "Err",
+          "<circle cx=\"17.8\" cy=\"10.2\" r=\"1.35\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "SparkColumn": {
+      "source": "custom:SparkColumn",
+      "mono": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" /><rect x=\"6\" y=\"12\" width=\"2.2\" height=\"4.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"9.3\" y=\"8.4\" width=\"2.2\" height=\"8\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"12.6\" y=\"13.2\" width=\"2.2\" height=\"3.2\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"15.9\" y=\"9.8\" width=\"2.2\" height=\"6.6\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"6\" y=\"12\" width=\"2.2\" height=\"4.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"9.3\" y=\"8.4\" width=\"2.2\" height=\"8\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"12.6\" y=\"13.2\" width=\"2.2\" height=\"3.2\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"15.9\" y=\"9.8\" width=\"2.2\" height=\"6.6\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "SparkLoss": {
+      "source": "custom:SparkLoss",
+      "mono": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" /><path d=\"M5.5 12h13\" stroke-width=\"1.2\" /><rect x=\"6\" y=\"8.2\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"9.2\" y=\"12.4\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"12.5\" y=\"8.2\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"15.7\" y=\"12.4\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\" /><path d=\"M5.5 12h13\" stroke-width=\"1.2\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"6\" y=\"8.2\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"12.5\" y=\"8.2\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Err",
+          "<rect x=\"9.2\" y=\"12.4\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"15.7\" y=\"12.4\" width=\"2.3\" height=\"3.4\" rx=\"0.7\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "TextBox": {
+      "source": "lucide:square-dashed-text",
+      "mono": "<path d=\"M14 21h1\" /> <path d=\"M14 3h1\" /> <path d=\"M19 3a2 2 0 0 1 2 2\" /> <path d=\"M21 14v1\" /> <path d=\"M21 19a2 2 0 0 1-2 2\" /> <path d=\"M21 9v1\" /> <path d=\"M3 14v1\" /> <path d=\"M3 9v1\" /> <path d=\"M5 21a2 2 0 0 1-2-2\" /> <path d=\"M5 3a2 2 0 0 0-2 2\" /> <path d=\"M7 12h10\" /> <path d=\"M7 16h6\" /> <path d=\"M7 8h8\" /> <path d=\"M9 21h1\" /> <path d=\"M9 3h1\" />"
+    },
+    "NewFile": {
+      "source": "lucide:file-plus",
+      "mono": "<path d=\"M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z\" /> <path d=\"M14 2v5a1 1 0 0 0 1 1h5\" /> <path d=\"M9 15h6\" /> <path d=\"M12 18v-6\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z\" /><path d=\"M14 2v5a1 1 0 0 0 1 1h5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M9 15h6\" /><path d=\"M12 18v-6\" />"
+        ]
+      ]
+    },
+    "Macro": {
+      "source": "custom:Macro",
+      "mono": "<path d=\"M12 20H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h7l4 4v5.5\" /><path d=\"M13 2v4h4\" /><path d=\"M7.5 10h5\" /><path d=\"M7.5 13.5h3.5\" /><path d=\"M15.5 14.5v6l5-3z\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M12 20H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h7l4 4v5.5\" /><path d=\"M13 2v4h4\" /><path d=\"M7.5 10h5\" /><path d=\"M7.5 13.5h3.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M15.5 14.5v6l5-3z\" />"
+        ]
+      ]
+    },
+    "MacroRun": {
+      "source": "lucide:circle-play",
+      "mono": "<path d=\"M9 9.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997A1 1 0 0 1 9 14.996z\" /> <circle cx=\"12\" cy=\"12\" r=\"10\" />",
+      "layers": [
+        [
+          "AccentSoft",
+          "<circle cx=\"12\" cy=\"12\" r=\"10\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Accent",
+          "<circle cx=\"12\" cy=\"12\" r=\"10\" /><path d=\"M9 9.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997A1 1 0 0 1 9 14.996z\" />"
+        ]
+      ]
+    },
+    "Code": {
+      "source": "lucide:code-xml",
+      "mono": "<path d=\"m18 16 4-4-4-4\" /> <path d=\"m6 8-4 4 4 4\" /> <path d=\"m14.5 4-5 16\" />"
+    },
+    "Compare": {
+      "source": "custom:Compare",
+      "mono": "<rect x=\"2.5\" y=\"4\" width=\"5.5\" height=\"16\" rx=\"1.5\" /><rect x=\"16\" y=\"4\" width=\"5.5\" height=\"16\" rx=\"1.5\" /><path d=\"M9.8 9.2h4.4\" /><path d=\"m12.4 7.4 1.8 1.8-1.8 1.8\" /><path d=\"M14.2 14.8H9.8\" /><path d=\"m11.6 13-1.8 1.8 1.8 1.8\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"2.5\" y=\"4\" width=\"5.5\" height=\"16\" rx=\"1.5\" /><rect x=\"16\" y=\"4\" width=\"5.5\" height=\"16\" rx=\"1.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M9.8 9.2h4.4\" /><path d=\"m12.4 7.4 1.8 1.8-1.8 1.8\" /><path d=\"M14.2 14.8H9.8\" /><path d=\"m11.6 13-1.8 1.8 1.8 1.8\" />"
+        ]
+      ]
+    },
+    "SyncScroll": {
+      "source": "custom:SyncScroll",
+      "mono": "<rect x=\"2.5\" y=\"4\" width=\"5.2\" height=\"16\" rx=\"1.5\" /><rect x=\"16.3\" y=\"4\" width=\"5.2\" height=\"16\" rx=\"1.5\" /><path d=\"M12 6v12\" /><path d=\"m10 8 2-2 2 2\" /><path d=\"m10 16 2 2 2-2\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"2.5\" y=\"4\" width=\"5.2\" height=\"16\" rx=\"1.5\" /><rect x=\"16.3\" y=\"4\" width=\"5.2\" height=\"16\" rx=\"1.5\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M12 6v12\" /><path d=\"m10 8 2-2 2 2\" /><path d=\"m10 16 2 2 2-2\" />"
+        ]
+      ]
+    },
+    "InvalidCircle": {
+      "source": "custom:InvalidCircle",
+      "mono": "<circle cx=\"12\" cy=\"12\" r=\"8.5\" /><path d=\"M12 7.8v4.8\" /><circle cx=\"12\" cy=\"16\" r=\"1.05\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "ErrSoft",
+          "<circle cx=\"12\" cy=\"12\" r=\"8.5\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Err",
+          "<circle cx=\"12\" cy=\"12\" r=\"8.5\" /><path d=\"M12 7.8v4.8\" /><circle cx=\"12\" cy=\"16\" r=\"1.05\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "PasteValues123": {
+      "source": "custom:PasteValues123",
+      "mono": "<rect x=\"2.5\" y=\"4.5\" width=\"19\" height=\"15\" rx=\"2.4\" /><path d=\"M6.0 10.2 7.3 9v6\" /><path d=\"M10.4 10.4a1.6 1.6 0 0 1 3.1.5c0 .9-.7 1.5-1.5 2.1l-1.8 2h3.5\" /><path d=\"M16.1 9.8a1.6 1.6 0 0 1 2.8 1c0 .9-.7 1.3-1.5 1.3.9 0 1.6.6 1.6 1.5a1.7 1.7 0 0 1-3 1\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.2\" y=\"5.2\" width=\"17.6\" height=\"13.6\" rx=\"1.8\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"2.5\" y=\"4.5\" width=\"19\" height=\"15\" rx=\"2.4\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M6.0 10.2 7.3 9v6\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M10.4 10.4a1.6 1.6 0 0 1 3.1.5c0 .9-.7 1.5-1.5 2.1l-1.8 2h3.5\" /><path d=\"M16.1 9.8a1.6 1.6 0 0 1 2.8 1c0 .9-.7 1.3-1.5 1.3.9 0 1.6.6 1.6 1.5a1.7 1.7 0 0 1-3 1\" />"
+        ]
+      ]
+    },
+    "StrikeThrough": {
+      "source": "lucide:strikethrough",
+      "mono": "<path d=\"M16 4H9a3 3 0 0 0-2.83 4\" /> <path d=\"M14 12a4 4 0 0 1 0 8H6\" /> <line x1=\"4\" x2=\"20\" y1=\"12\" y2=\"12\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M16 4H9a3 3 0 0 0-2.83 4\" /><path d=\"M14 12a4 4 0 0 1 0 8H6\" />"
+        ],
+        [
+          "Err",
+          "<line x1=\"4\" x2=\"20\" y1=\"12\" y2=\"12\" />"
+        ]
+      ]
+    },
+    "Spotlight": {
+      "source": "custom:Spotlight",
+      "mono": "<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\" /><path d=\"M3 9.5h18\" /><path d=\"M3 14.5h18\" /><path d=\"M9.5 3v18\" /><path d=\"M14.5 3v18\" /><rect x=\"9.5\" y=\"9.5\" width=\"5\" height=\"5\" rx=\"0.8\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<rect x=\"3.8\" y=\"9.5\" width=\"16.4\" height=\"5\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"9.5\" y=\"3.8\" width=\"5\" height=\"16.4\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\" /><path d=\"M3 9.5h6.5\" /><path d=\"M14.5 9.5H21\" /><path d=\"M3 14.5h6.5\" /><path d=\"M14.5 14.5H21\" /><path d=\"M9.5 3v6.5\" /><path d=\"M9.5 14.5V21\" /><path d=\"M14.5 3v6.5\" /><path d=\"M14.5 14.5V21\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"9.5\" y=\"9.5\" width=\"5\" height=\"5\" rx=\"0.8\" />"
+        ]
+      ]
+    },
+    "SplitPanes": {
+      "source": "custom:SplitPanes",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" /><path d=\"M12 4v16\" stroke-width=\"2.2\" /><path d=\"M3 12h18\" stroke-width=\"2.2\" />",
+      "layers": [
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M12 4.8v14.4\" stroke-width=\"2.1\" /><path d=\"M3.8 12h16.4\" stroke-width=\"2.1\" />"
+        ]
+      ]
+    },
+    "HighlightDup": {
+      "source": "custom:HighlightDup",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"11\" height=\"8\" rx=\"1.8\" /><path d=\"M6 8h5\" /><rect x=\"10\" y=\"12\" width=\"11\" height=\"8\" rx=\"1.8\" /><path d=\"M13 16h5\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<rect x=\"3.6\" y=\"4.6\" width=\"9.8\" height=\"6.8\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "ErrSoft",
+          "<rect x=\"10.6\" y=\"12.6\" width=\"9.8\" height=\"6.8\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Warn",
+          "<rect x=\"3\" y=\"4\" width=\"11\" height=\"8\" rx=\"1.8\" /><path d=\"M6 8h5\" />"
+        ],
+        [
+          "Err",
+          "<rect x=\"10\" y=\"12\" width=\"11\" height=\"8\" rx=\"1.8\" /><path d=\"M13 16h5\" />"
+        ]
+      ]
+    },
+    "RejectDup": {
+      "source": "custom:RejectDup",
+      "mono": "<path d=\"M11 19H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v4.5\" /><path d=\"M6.5 8h7\" /><path d=\"M6.5 12h4.5\" /><circle cx=\"16.5\" cy=\"16.5\" r=\"4.5\" /><path d=\"m13.5 13.5 6 6\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M11 19H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v4.5\" /><path d=\"M6.5 8h7\" /><path d=\"M6.5 12h4.5\" />"
+        ],
+        [
+          "ErrSoft",
+          "<circle cx=\"16.5\" cy=\"16.5\" r=\"4.5\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Err",
+          "<circle cx=\"16.5\" cy=\"16.5\" r=\"4.5\" /><path d=\"m13.5 13.5 6 6\" />"
+        ]
+      ]
+    },
+    "MergeSame": {
+      "source": "custom:MergeSame",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"7.5\" height=\"16\" rx=\"1.8\" /><rect x=\"13.5\" y=\"4\" width=\"7.5\" height=\"6.5\" rx=\"1.6\" /><rect x=\"13.5\" y=\"13.5\" width=\"7.5\" height=\"6.5\" rx=\"1.6\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.6\" y=\"4.6\" width=\"6.3\" height=\"14.8\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "AccentSoft",
+          "<rect x=\"14.1\" y=\"4.6\" width=\"6.3\" height=\"5.3\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" /><rect x=\"14.1\" y=\"14.1\" width=\"6.3\" height=\"5.3\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"3\" y=\"4\" width=\"7.5\" height=\"16\" rx=\"1.8\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"13.5\" y=\"4\" width=\"7.5\" height=\"6.5\" rx=\"1.6\" /><rect x=\"13.5\" y=\"13.5\" width=\"7.5\" height=\"6.5\" rx=\"1.6\" />"
+        ]
+      ]
+    },
+    "AiSparkle": {
+      "source": "lucide:sparkles",
+      "mono": "<path d=\"M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z\" /> <path d=\"M20 2v4\" /> <path d=\"M22 4h-4\" /> <circle cx=\"4\" cy=\"20\" r=\"2\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<path d=\"M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M20 2v4\" /><path d=\"M22 4h-4\" /><circle cx=\"4\" cy=\"20\" r=\"2\" />"
+        ]
+      ]
+    },
+    "InsertCell": {
+      "source": "lucide:grid-2x2-plus",
+      "mono": "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" /> <path d=\"M16 19h6\" /> <path d=\"M19 22v-6\" />",
+      "layers": [
+        [
+          "AccentSoft",
+          "<rect x=\"3.6\" y=\"12\" width=\"8.4\" height=\"8.4\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" />"
+        ],
+        [
+          "Accent",
+          "<path d=\"M16 19h6\" /><path d=\"M19 22v-6\" />"
+        ]
+      ]
+    },
+    "DeleteCell": {
+      "source": "lucide:grid-2x2-x",
+      "mono": "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" /> <path d=\"m16.5 16.5 5 5\" /> <path d=\"m16.5 21.5 5-5\" />",
+      "layers": [
+        [
+          "ErrSoft",
+          "<rect x=\"3.6\" y=\"12\" width=\"8.4\" height=\"8.4\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<path d=\"M12 3v17a1 1 0 0 1-1 1H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6a1 1 0 0 1-1 1H3\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"m16.5 16.5 5 5\" /><path d=\"m16.5 21.5 5-5\" />"
+        ]
+      ]
+    },
+    "CellStyle": {
+      "source": "custom:CellStyle",
+      "mono": "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2.2\" /><path d=\"M3 8.8h18\" /><path d=\"M6.2 17 8.5 11.8 10.8 17\" /><path d=\"M7 15.3h3\" /><rect x=\"13.8\" y=\"12.2\" width=\"4.4\" height=\"4.4\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.8\" y=\"4.8\" width=\"16.4\" height=\"4\" rx=\"1.1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2.2\" /><path d=\"M6.2 17 8.5 11.8 10.8 17\" /><path d=\"M7 15.3h3\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M3.5 8.8h17\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"13.8\" y=\"12.2\" width=\"4.4\" height=\"4.4\" rx=\"1.2\" fill=\"currentColor\" stroke=\"none\" />"
+        ]
+      ]
+    },
+    "FnBook": {
+      "source": "lucide:book-open-text",
+      "mono": "<path d=\"M12 5v16\" /> <path d=\"M16 13h2\" /> <path d=\"M16 9h2\" /> <path d=\"M20.001 19A2 2 0 0022 17V5a2 2 0 00-1.999-2L16 3.002A5 5 0 0012 5a5 5 0 00-4-2H4a2 2 0 00-2 2v12a2 2 0 001.999 2H8a5 5 0 014 2 5 5 0 014-2z\" /> <path d=\"M6 13h2\" /> <path d=\"M6 9h2\" />",
+      "soft": [
+        "InfoSoft",
+        "<path d=\"M12 7v14\" /><path d=\"M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z\" fill=\"currentColor\" stroke=\"none\" />"
+      ]
+    },
+    "Transpose": {
+      "source": "custom:Transpose",
+      "mono": "<rect x=\"3\" y=\"3.5\" width=\"10\" height=\"4.8\" rx=\"1.4\" /><rect x=\"15.7\" y=\"11\" width=\"4.8\" height=\"10\" rx=\"1.4\" /><path d=\"M16 5.5h1.5a2 2 0 0 1 2 2V9\" /><path d=\"M6.5 11.5V16a2 2 0 0 0 2 2h4.5\" /><path d=\"m10.8 15.8 2.2 2.2-2.2 2.2\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"3.6\" y=\"4.1\" width=\"8.8\" height=\"3.6\" rx=\"0.9\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "AccentSoft",
+          "<rect x=\"16.3\" y=\"11.6\" width=\"3.6\" height=\"8.8\" rx=\"0.9\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"3\" y=\"3.5\" width=\"10\" height=\"4.8\" rx=\"1.4\" />"
+        ],
+        [
+          "Accent",
+          "<rect x=\"15.7\" y=\"11\" width=\"4.8\" height=\"10\" rx=\"1.4\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M6.5 11.5V16a2 2 0 0 0 2 2h4.5\" /><path d=\"m10.8 15.8 2.2 2.2-2.2 2.2\" />"
+        ]
+      ]
+    },
+    "PasteLink": {
+      "source": "custom:PasteLink",
+      "mono": "<rect x=\"7.5\" y=\"2.5\" width=\"6\" height=\"3.2\" rx=\"1\" /><path d=\"M9.5 19.5H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2.5\" /><path d=\"M13.5 4H16a2 2 0 0 1 2 2v4.5\" /><path d=\"M13.5 17.5h-1a2.5 2.5 0 0 1 0-5h1\" /><path d=\"M17.5 12.5h1a2.5 2.5 0 0 1 0 5h-1\" /><path d=\"M13.5 15h4\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M5 4h11a2 2 0 0 1 2 2v4.5h-6a4 4 0 0 0-3 6.5v2.5H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"7.5\" y=\"2.5\" width=\"6\" height=\"3.2\" rx=\"1\" /><path d=\"M9.5 19.5H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2.5\" /><path d=\"M13.5 4H16a2 2 0 0 1 2 2v4.5\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"M13.5 17.5h-1a2.5 2.5 0 0 1 0-5h1\" /><path d=\"M17.5 12.5h1a2.5 2.5 0 0 1 0 5h-1\" /><path d=\"M13.5 15h4\" />"
+        ]
+      ]
+    },
+    "PastePic": {
+      "source": "custom:PastePic",
+      "mono": "<rect x=\"7.5\" y=\"2.5\" width=\"6\" height=\"3.2\" rx=\"1\" /><path d=\"M8.5 19.5H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2.5\" /><path d=\"M13.5 4H16a2 2 0 0 1 2 2v2.5\" /><rect x=\"11\" y=\"11\" width=\"10\" height=\"9.5\" rx=\"1.6\" /><circle cx=\"14.2\" cy=\"14\" r=\"1.1\" fill=\"currentColor\" stroke=\"none\" /><path d=\"m21 17.8-2.6-2.5a1.2 1.2 0 0 0-1.7 0L12.5 20\" />",
+      "layers": [
+        [
+          "WarnSoft",
+          "<path d=\"M5 4h11a2 2 0 0 1 2 2v2.5H11v11H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Text",
+          "<rect x=\"7.5\" y=\"2.5\" width=\"6\" height=\"3.2\" rx=\"1\" /><path d=\"M8.5 19.5H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2.5\" /><path d=\"M13.5 4H16a2 2 0 0 1 2 2v2.5\" /><rect x=\"11\" y=\"11\" width=\"10\" height=\"9.5\" rx=\"1.6\" />"
+        ],
+        [
+          "Warn",
+          "<circle cx=\"14.2\" cy=\"14\" r=\"1.1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<path d=\"m21 17.8-2.6-2.5a1.2 1.2 0 0 0-1.7 0L12.5 20\" />"
+        ]
+      ]
+    },
+    "NoBorder": {
+      "source": "lucide:grid-3x3-off",
+      "mono": "<path d=\"M15 9.344V3\" /> <path d=\"m2 2 20 20\" /> <path d=\"M20.414 20.414A2 2 0 0119 21H5a2 2 0 01-2-2V5a2 2 0 01.586-1.414\" /> <path d=\"M20.656 15H21\" /> <path d=\"M21 9h-6.344\" /> <path d=\"M3 15h12v6\" /> <path d=\"M3 9h6v12\" /> <path d=\"M8.656 3H19a2 2 0 012 2v10.343\" /> <path d=\"M9 3v.344\" />",
+      "layers": [
+        [
+          "Text",
+          "<path d=\"M15 9.344V3\" /><path d=\"M20.414 20.414A2 2 0 0 1 19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 .586-1.414\" /><path d=\"M20.656 15H21\" /><path d=\"M21 9h-6.344\" /><path d=\"M3 15h12v6\" /><path d=\"M3 9h6v12\" /><path d=\"M8.656 3H19a2 2 0 0 1 2 2v10.343\" /><path d=\"M9 3v.344\" />"
+        ],
+        [
+          "Err",
+          "<path d=\"m2 2 20 20\" />"
+        ]
+      ]
+    },
+    "ColWidth": {
+      "source": "custom:ColWidth",
+      "mono": "<rect x=\"8.5\" y=\"3.5\" width=\"7\" height=\"17\" rx=\"1.6\" /><path d=\"M8.5 9h7\" /><path d=\"M8.5 15h7\" /><path d=\"M2.5 12h3.5\" /><path d=\"m4.5 9.8-2.2 2.2 2.2 2.2\" /><path d=\"M21.5 12H18\" /><path d=\"m19.5 9.8 2.2 2.2-2.2 2.2\" />",
+      "layers": [
+        [
+          "InfoSoft",
+          "<rect x=\"9.1\" y=\"4.1\" width=\"5.8\" height=\"15.8\" rx=\"1\" fill=\"currentColor\" stroke=\"none\" />"
+        ],
+        [
+          "Info",
+          "<rect x=\"8.5\" y=\"3.5\" width=\"7\" height=\"17\" rx=\"1.6\" /><path d=\"M8.5 9h7\" /><path d=\"M8.5 15h7\" />"
+        ],
+        [
+          "Warn",
+          "<path d=\"M2.5 12h3.5\" /><path d=\"m4.5 9.8-2.2 2.2 2.2 2.2\" /><path d=\"M21.5 12H18\" /><path d=\"m19.5 9.8 2.2 2.2-2.2 2.2\" />"
+        ]
+      ]
+    }
+  }
+}

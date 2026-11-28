@@ -1,6 +1,7 @@
 //! Excel 原始功能区图标（Office imageMso 导出，32px 与 16px 两套）。
-//! 正式版本已全面采用 `ui_icons` 矢量绘制；旧位图资源默认不打入二进制以瘦身体积，
-//! 如需对照位图与矢量，请以 `--features legacy_png_icons` 编译并配合 `SC_ICONS=bitmap` 使用。
+//! 正式版本已全面采用 `ui_icons` 现代超采样矢量图集（Lucide + 定制电子表格图标）；
+//! 旧位图资源默认不打入二进制以瘦身体积，如需对照，请以 `--features legacy_png_icons`
+//! 编译并配合 `SC_ICONS=bitmap` 使用。
 use crate::ui_icons::Icon;
 use eframe::egui;
 #[cfg(feature = "legacy_png_icons")]

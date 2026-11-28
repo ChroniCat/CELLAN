@@ -1,0 +1,1029 @@
+{
+  "lucide_version": "1.82.0",
+  "license": "ISC (Feather-derived icons: MIT)",
+  "mono_grid": {
+    "cols": 15,
+    "rows": 11,
+    "count": 165
+  },
+  "accent_grid": {
+    "cols": 12,
+    "rows": 18,
+    "count": 216
+  },
+  "files": {
+    "atlas_64.png": {
+      "bytes": 131947,
+      "cell_px": 64,
+      "stroke_width": 1.7
+    },
+    "atlas_32.png": {
+      "bytes": 59747,
+      "cell_px": 32,
+      "stroke_width": 1.95
+    },
+    "accent_64.png": {
+      "bytes": 83739,
+      "cell_px": 64,
+      "stroke_width": 1.7
+    },
+    "accent_32.png": {
+      "bytes": 41545,
+      "cell_px": 32,
+      "stroke_width": 1.95
+    }
+  },
+  "total_png_bytes": 316978,
+  "icons": [
+    {
+      "index": 0,
+      "name": "Open",
+      "source": "lucide:folder-open",
+      "has_color": true
+    },
+    {
+      "index": 1,
+      "name": "Save",
+      "source": "lucide:save",
+      "has_color": true
+    },
+    {
+      "index": 2,
+      "name": "SaveAs",
+      "source": "lucide:save-pen",
+      "has_color": true
+    },
+    {
+      "index": 3,
+      "name": "Print",
+      "source": "lucide:printer",
+      "has_color": false
+    },
+    {
+      "index": 4,
+      "name": "Undo",
+      "source": "lucide:undo-2",
+      "has_color": false
+    },
+    {
+      "index": 5,
+      "name": "Redo",
+      "source": "lucide:redo-2",
+      "has_color": false
+    },
+    {
+      "index": 6,
+      "name": "Paste",
+      "source": "lucide:clipboard-paste",
+      "has_color": true
+    },
+    {
+      "index": 7,
+      "name": "Cut",
+      "source": "lucide:scissors",
+      "has_color": false
+    },
+    {
+      "index": 8,
+      "name": "Copy",
+      "source": "lucide:copy",
+      "has_color": false
+    },
+    {
+      "index": 9,
+      "name": "Brush",
+      "source": "lucide:paintbrush",
+      "has_color": true
+    },
+    {
+      "index": 10,
+      "name": "Fill",
+      "source": "lucide:paint-bucket",
+      "has_color": true
+    },
+    {
+      "index": 11,
+      "name": "FontColor",
+      "source": "custom:FontColor",
+      "has_color": true
+    },
+    {
+      "index": 12,
+      "name": "AlignL",
+      "source": "lucide:align-left",
+      "has_color": false
+    },
+    {
+      "index": 13,
+      "name": "AlignC",
+      "source": "lucide:align-center",
+      "has_color": false
+    },
+    {
+      "index": 14,
+      "name": "AlignR",
+      "source": "lucide:align-right",
+      "has_color": false
+    },
+    {
+      "index": 15,
+      "name": "Top",
+      "source": "lucide:arrow-up-to-line",
+      "has_color": false
+    },
+    {
+      "index": 16,
+      "name": "Middle",
+      "source": "custom:Middle",
+      "has_color": false
+    },
+    {
+      "index": 17,
+      "name": "Bottom",
+      "source": "lucide:arrow-down-to-line",
+      "has_color": false
+    },
+    {
+      "index": 18,
+      "name": "Wrap",
+      "source": "lucide:wrap-text",
+      "has_color": false
+    },
+    {
+      "index": 19,
+      "name": "Merge",
+      "source": "lucide:table-cells-merge",
+      "has_color": false
+    },
+    {
+      "index": 20,
+      "name": "Border",
+      "source": "lucide:grid-2x2",
+      "has_color": false
+    },
+    {
+      "index": 21,
+      "name": "Currency",
+      "source": "lucide:japanese-yen",
+      "has_color": true
+    },
+    {
+      "index": 22,
+      "name": "Percent",
+      "source": "lucide:percent",
+      "has_color": true
+    },
+    {
+      "index": 23,
+      "name": "Comma",
+      "source": "custom:Comma",
+      "has_color": true
+    },
+    {
+      "index": 24,
+      "name": "SortAsc",
+      "source": "lucide:arrow-down-a-z",
+      "has_color": true
+    },
+    {
+      "index": 25,
+      "name": "SortDesc",
+      "source": "lucide:arrow-down-z-a",
+      "has_color": true
+    },
+    {
+      "index": 26,
+      "name": "Filter",
+      "source": "lucide:funnel",
+      "has_color": false
+    },
+    {
+      "index": 27,
+      "name": "Find",
+      "source": "lucide:search",
+      "has_color": false
+    },
+    {
+      "index": 28,
+      "name": "Chart",
+      "source": "custom:Chart",
+      "has_color": true
+    },
+    {
+      "index": 29,
+      "name": "Image",
+      "source": "lucide:image",
+      "has_color": true
+    },
+    {
+      "index": 30,
+      "name": "Table",
+      "source": "lucide:table",
+      "has_color": true
+    },
+    {
+      "index": 31,
+      "name": "Comment",
+      "source": "lucide:message-square-text",
+      "has_color": true
+    },
+    {
+      "index": 32,
+      "name": "Pivot",
+      "source": "custom:Pivot",
+      "has_color": true
+    },
+    {
+      "index": 33,
+      "name": "Link",
+      "source": "lucide:link-2",
+      "has_color": false
+    },
+    {
+      "index": 34,
+      "name": "Revision",
+      "source": "lucide:file-pen-line",
+      "has_color": false
+    },
+    {
+      "index": 35,
+      "name": "Zoom",
+      "source": "custom:Zoom",
+      "has_color": false
+    },
+    {
+      "index": 36,
+      "name": "Calc",
+      "source": "lucide:calculator",
+      "has_color": false
+    },
+    {
+      "index": 37,
+      "name": "Sheet",
+      "source": "lucide:file-spreadsheet",
+      "has_color": true
+    },
+    {
+      "index": 38,
+      "name": "Share",
+      "source": "lucide:share-2",
+      "has_color": true
+    },
+    {
+      "index": 39,
+      "name": "Fx",
+      "source": "custom:Fx",
+      "has_color": false
+    },
+    {
+      "index": 40,
+      "name": "Sum",
+      "source": "lucide:sigma",
+      "has_color": false
+    },
+    {
+      "index": 41,
+      "name": "Grid",
+      "source": "lucide:grid-3x3",
+      "has_color": false
+    },
+    {
+      "index": 42,
+      "name": "Home",
+      "source": "lucide:house",
+      "has_color": false
+    },
+    {
+      "index": 43,
+      "name": "Close",
+      "source": "lucide:x",
+      "has_color": false
+    },
+    {
+      "index": 44,
+      "name": "Plus",
+      "source": "lucide:plus",
+      "has_color": false
+    },
+    {
+      "index": 45,
+      "name": "Refresh",
+      "source": "lucide:refresh-cw",
+      "has_color": false
+    },
+    {
+      "index": 46,
+      "name": "DecInc",
+      "source": "custom:DecInc",
+      "has_color": true
+    },
+    {
+      "index": 47,
+      "name": "DecDec",
+      "source": "custom:DecDec",
+      "has_color": true
+    },
+    {
+      "index": 48,
+      "name": "FontGrow",
+      "source": "lucide:a-arrow-up",
+      "has_color": true
+    },
+    {
+      "index": 49,
+      "name": "FontShrink",
+      "source": "lucide:a-arrow-down",
+      "has_color": true
+    },
+    {
+      "index": 50,
+      "name": "TextDir",
+      "source": "custom:TextDir",
+      "has_color": true
+    },
+    {
+      "index": 51,
+      "name": "HeaderFooter",
+      "source": "custom:HeaderFooter",
+      "has_color": true
+    },
+    {
+      "index": 52,
+      "name": "DocLink",
+      "source": "lucide:file-symlink",
+      "has_color": false
+    },
+    {
+      "index": 53,
+      "name": "GroupRows",
+      "source": "custom:GroupRows",
+      "has_color": true
+    },
+    {
+      "index": 54,
+      "name": "UngroupRows",
+      "source": "custom:UngroupRows",
+      "has_color": true
+    },
+    {
+      "index": 55,
+      "name": "ShowDetail",
+      "source": "custom:ShowDetail",
+      "has_color": false
+    },
+    {
+      "index": 56,
+      "name": "HideDetail",
+      "source": "custom:HideDetail",
+      "has_color": false
+    },
+    {
+      "index": 57,
+      "name": "Validation",
+      "source": "lucide:grid-2x2-check",
+      "has_color": true
+    },
+    {
+      "index": 58,
+      "name": "SplitColumns",
+      "source": "lucide:table-columns-split",
+      "has_color": false
+    },
+    {
+      "index": 59,
+      "name": "RemoveDup",
+      "source": "custom:RemoveDup",
+      "has_color": true
+    },
+    {
+      "index": 60,
+      "name": "Consolidate",
+      "source": "lucide:combine",
+      "has_color": false
+    },
+    {
+      "index": 61,
+      "name": "ImportCsv",
+      "source": "lucide:file-input",
+      "has_color": false
+    },
+    {
+      "index": 62,
+      "name": "ImportBook",
+      "source": "custom:ImportBook",
+      "has_color": true
+    },
+    {
+      "index": 63,
+      "name": "WhatIf",
+      "source": "custom:WhatIf",
+      "has_color": false
+    },
+    {
+      "index": 64,
+      "name": "OutlineLevels",
+      "source": "lucide:list-tree",
+      "has_color": false
+    },
+    {
+      "index": 65,
+      "name": "GoalSeek",
+      "source": "lucide:target",
+      "has_color": false
+    },
+    {
+      "index": 66,
+      "name": "Scenario",
+      "source": "custom:Scenario",
+      "has_color": true
+    },
+    {
+      "index": 67,
+      "name": "Eye",
+      "source": "lucide:eye",
+      "has_color": false
+    },
+    {
+      "index": 68,
+      "name": "EyeOff",
+      "source": "lucide:eye-off",
+      "has_color": false
+    },
+    {
+      "index": 69,
+      "name": "PageLayout",
+      "source": "lucide:layout-template",
+      "has_color": false
+    },
+    {
+      "index": 70,
+      "name": "PageBreak",
+      "source": "custom:PageBreak",
+      "has_color": true
+    },
+    {
+      "index": 71,
+      "name": "NormalView",
+      "source": "lucide:table-2",
+      "has_color": false
+    },
+    {
+      "index": 72,
+      "name": "ShowHeadings",
+      "source": "custom:ShowHeadings",
+      "has_color": true
+    },
+    {
+      "index": 73,
+      "name": "FormulaBar",
+      "source": "custom:FormulaBar",
+      "has_color": false
+    },
+    {
+      "index": 74,
+      "name": "TextSpill",
+      "source": "custom:TextSpill",
+      "has_color": true
+    },
+    {
+      "index": 75,
+      "name": "ViewPane",
+      "source": "lucide:panel-left",
+      "has_color": false
+    },
+    {
+      "index": 76,
+      "name": "Pin",
+      "source": "lucide:pin",
+      "has_color": false
+    },
+    {
+      "index": 77,
+      "name": "NewView",
+      "source": "lucide:copy-plus",
+      "has_color": false
+    },
+    {
+      "index": 78,
+      "name": "ZoomSelection",
+      "source": "lucide:scan-search",
+      "has_color": false
+    },
+    {
+      "index": 79,
+      "name": "FormulaView",
+      "source": "custom:FormulaView",
+      "has_color": true
+    },
+    {
+      "index": 80,
+      "name": "ErrorCheck",
+      "source": "custom:ErrorCheck",
+      "has_color": true
+    },
+    {
+      "index": 81,
+      "name": "NameTag",
+      "source": "lucide:tag",
+      "has_color": false
+    },
+    {
+      "index": 82,
+      "name": "WatchPane",
+      "source": "lucide:scan-eye",
+      "has_color": false
+    },
+    {
+      "index": 83,
+      "name": "Spelling",
+      "source": "lucide:spell-check",
+      "has_color": true
+    },
+    {
+      "index": 84,
+      "name": "CommentPrev",
+      "source": "custom:CommentPrev",
+      "has_color": true
+    },
+    {
+      "index": 85,
+      "name": "CommentNext",
+      "source": "custom:CommentNext",
+      "has_color": true
+    },
+    {
+      "index": 86,
+      "name": "ShowComment",
+      "source": "lucide:message-square-dot",
+      "has_color": true
+    },
+    {
+      "index": 87,
+      "name": "A11y",
+      "source": "lucide:accessibility",
+      "has_color": true
+    },
+    {
+      "index": 88,
+      "name": "Online",
+      "source": "custom:Online",
+      "has_color": true
+    },
+    {
+      "index": 89,
+      "name": "AutoShare",
+      "source": "custom:AutoShare",
+      "has_color": true
+    },
+    {
+      "index": 90,
+      "name": "Help",
+      "source": "lucide:circle-help",
+      "has_color": false
+    },
+    {
+      "index": 91,
+      "name": "About",
+      "source": "lucide:info",
+      "has_color": false
+    },
+    {
+      "index": 92,
+      "name": "Orientation",
+      "source": "custom:Orientation",
+      "has_color": true
+    },
+    {
+      "index": 93,
+      "name": "PaperSize",
+      "source": "custom:PaperSize",
+      "has_color": false
+    },
+    {
+      "index": 94,
+      "name": "PrintGrid",
+      "source": "custom:PrintGrid",
+      "has_color": false
+    },
+    {
+      "index": 95,
+      "name": "PrintHeadings",
+      "source": "custom:PrintHeadings",
+      "has_color": true
+    },
+    {
+      "index": 96,
+      "name": "PrintArea",
+      "source": "custom:PrintArea",
+      "has_color": true
+    },
+    {
+      "index": 97,
+      "name": "PivotRefresh",
+      "source": "custom:PivotRefresh",
+      "has_color": true
+    },
+    {
+      "index": 98,
+      "name": "PivotOptions",
+      "source": "lucide:table-config",
+      "has_color": false
+    },
+    {
+      "index": 99,
+      "name": "ChartList",
+      "source": "custom:ChartList",
+      "has_color": true
+    },
+    {
+      "index": 100,
+      "name": "FolderPlus",
+      "source": "lucide:folder-plus",
+      "has_color": true
+    },
+    {
+      "index": 101,
+      "name": "AppDefault",
+      "source": "lucide:file-cog",
+      "has_color": false
+    },
+    {
+      "index": 102,
+      "name": "AppAdd",
+      "source": "lucide:file-plus-2",
+      "has_color": false
+    },
+    {
+      "index": 103,
+      "name": "PdfExport",
+      "source": "custom:PdfExport",
+      "has_color": true
+    },
+    {
+      "index": 104,
+      "name": "HostTakeover",
+      "source": "lucide:monitor-up",
+      "has_color": false
+    },
+    {
+      "index": 105,
+      "name": "UpdateCheck",
+      "source": "lucide:refresh-ccw-dot",
+      "has_color": false
+    },
+    {
+      "index": 106,
+      "name": "FormatCells",
+      "source": "lucide:table-properties",
+      "has_color": false
+    },
+    {
+      "index": 107,
+      "name": "TextVerticalDraw",
+      "source": "custom:TextVerticalDraw",
+      "has_color": false
+    },
+    {
+      "index": 108,
+      "name": "TextBoxDraw",
+      "source": "lucide:square-pen",
+      "has_color": false
+    },
+    {
+      "index": 109,
+      "name": "CalcSheet",
+      "source": "custom:CalcSheet",
+      "has_color": false
+    },
+    {
+      "index": 110,
+      "name": "SheetRef",
+      "source": "custom:SheetRef",
+      "has_color": true
+    },
+    {
+      "index": 111,
+      "name": "FilterReapply",
+      "source": "custom:FilterReapply",
+      "has_color": true
+    },
+    {
+      "index": 112,
+      "name": "SortDialog",
+      "source": "custom:SortDialog",
+      "has_color": false
+    },
+    {
+      "index": 113,
+      "name": "ShowChanges",
+      "source": "lucide:file-diff",
+      "has_color": false
+    },
+    {
+      "index": 114,
+      "name": "SheetViewSwitch",
+      "source": "lucide:layers",
+      "has_color": false
+    },
+    {
+      "index": 115,
+      "name": "Zoom100",
+      "source": "custom:Zoom100",
+      "has_color": false
+    },
+    {
+      "index": 116,
+      "name": "ZoomDialog",
+      "source": "custom:ZoomDialog",
+      "has_color": true
+    },
+    {
+      "index": 117,
+      "name": "ZoomIn",
+      "source": "lucide:zoom-in",
+      "has_color": false
+    },
+    {
+      "index": 118,
+      "name": "Unfreeze",
+      "source": "custom:Unfreeze",
+      "has_color": true
+    },
+    {
+      "index": 119,
+      "name": "TableToRange",
+      "source": "custom:TableToRange",
+      "has_color": true
+    },
+    {
+      "index": 120,
+      "name": "SparkEdit",
+      "source": "custom:SparkEdit",
+      "has_color": true
+    },
+    {
+      "index": 121,
+      "name": "ChartEdit",
+      "source": "custom:ChartEdit",
+      "has_color": true
+    },
+    {
+      "index": 122,
+      "name": "RichText",
+      "source": "custom:RichText",
+      "has_color": true
+    },
+    {
+      "index": 123,
+      "name": "Freeze",
+      "source": "custom:Freeze",
+      "has_color": true
+    },
+    {
+      "index": 124,
+      "name": "FreezeRow",
+      "source": "custom:FreezeRow",
+      "has_color": true
+    },
+    {
+      "index": 125,
+      "name": "FreezeCol",
+      "source": "custom:FreezeCol",
+      "has_color": true
+    },
+    {
+      "index": 126,
+      "name": "Lock",
+      "source": "lucide:lock",
+      "has_color": true
+    },
+    {
+      "index": 127,
+      "name": "Cf",
+      "source": "custom:Cf",
+      "has_color": true
+    },
+    {
+      "index": 128,
+      "name": "Eraser",
+      "source": "lucide:eraser",
+      "has_color": true
+    },
+    {
+      "index": 129,
+      "name": "ClearFmt",
+      "source": "lucide:remove-formatting",
+      "has_color": true
+    },
+    {
+      "index": 130,
+      "name": "IndentInc",
+      "source": "lucide:indent-increase",
+      "has_color": false
+    },
+    {
+      "index": 131,
+      "name": "IndentDec",
+      "source": "lucide:indent-decrease",
+      "has_color": false
+    },
+    {
+      "index": 132,
+      "name": "Symbol",
+      "source": "lucide:omega",
+      "has_color": false
+    },
+    {
+      "index": 133,
+      "name": "ZhS",
+      "source": "custom:ZhS",
+      "has_color": true
+    },
+    {
+      "index": 134,
+      "name": "ZhT",
+      "source": "custom:ZhT",
+      "has_color": true
+    },
+    {
+      "index": 135,
+      "name": "TraceIn",
+      "source": "custom:TraceIn",
+      "has_color": true
+    },
+    {
+      "index": 136,
+      "name": "TraceOut",
+      "source": "custom:TraceOut",
+      "has_color": true
+    },
+    {
+      "index": 137,
+      "name": "SparkLine",
+      "source": "custom:SparkLine",
+      "has_color": true
+    },
+    {
+      "index": 138,
+      "name": "SparkColumn",
+      "source": "custom:SparkColumn",
+      "has_color": true
+    },
+    {
+      "index": 139,
+      "name": "SparkLoss",
+      "source": "custom:SparkLoss",
+      "has_color": true
+    },
+    {
+      "index": 140,
+      "name": "TextBox",
+      "source": "lucide:square-dashed-text",
+      "has_color": false
+    },
+    {
+      "index": 141,
+      "name": "NewFile",
+      "source": "lucide:file-plus",
+      "has_color": true
+    },
+    {
+      "index": 142,
+      "name": "Macro",
+      "source": "custom:Macro",
+      "has_color": true
+    },
+    {
+      "index": 143,
+      "name": "MacroRun",
+      "source": "lucide:circle-play",
+      "has_color": true
+    },
+    {
+      "index": 144,
+      "name": "Code",
+      "source": "lucide:code-xml",
+      "has_color": false
+    },
+    {
+      "index": 145,
+      "name": "Compare",
+      "source": "custom:Compare",
+      "has_color": true
+    },
+    {
+      "index": 146,
+      "name": "SyncScroll",
+      "source": "custom:SyncScroll",
+      "has_color": true
+    },
+    {
+      "index": 147,
+      "name": "InvalidCircle",
+      "source": "custom:InvalidCircle",
+      "has_color": true
+    },
+    {
+      "index": 148,
+      "name": "PasteValues123",
+      "source": "custom:PasteValues123",
+      "has_color": true
+    },
+    {
+      "index": 149,
+      "name": "StrikeThrough",
+      "source": "lucide:strikethrough",
+      "has_color": true
+    },
+    {
+      "index": 150,
+      "name": "Spotlight",
+      "source": "custom:Spotlight",
+      "has_color": true
+    },
+    {
+      "index": 151,
+      "name": "SplitPanes",
+      "source": "custom:SplitPanes",
+      "has_color": true
+    },
+    {
+      "index": 152,
+      "name": "HighlightDup",
+      "source": "custom:HighlightDup",
+      "has_color": true
+    },
+    {
+      "index": 153,
+      "name": "RejectDup",
+      "source": "custom:RejectDup",
+      "has_color": true
+    },
+    {
+      "index": 154,
+      "name": "MergeSame",
+      "source": "custom:MergeSame",
+      "has_color": true
+    },
+    {
+      "index": 155,
+      "name": "AiSparkle",
+      "source": "lucide:sparkles",
+      "has_color": true
+    },
+    {
+      "index": 156,
+      "name": "InsertCell",
+      "source": "lucide:grid-2x2-plus",
+      "has_color": true
+    },
+    {
+      "index": 157,
+      "name": "DeleteCell",
+      "source": "lucide:grid-2x2-x",
+      "has_color": true
+    },
+    {
+      "index": 158,
+      "name": "CellStyle",
+      "source": "custom:CellStyle",
+      "has_color": true
+    },
+    {
+      "index": 159,
+      "name": "FnBook",
+      "source": "lucide:book-open-text",
+      "has_color": true
+    },
+    {
+      "index": 160,
+      "name": "Transpose",
+      "source": "custom:Transpose",
+      "has_color": true
+    },
+    {
+      "index": 161,
+      "name": "PasteLink",
+      "source": "custom:PasteLink",
+      "has_color": true
+    },
+    {
+      "index": 162,
+      "name": "PastePic",
+      "source": "custom:PastePic",
+      "has_color": true
+    },
+    {
+      "index": 163,
+      "name": "NoBorder",
+      "source": "lucide:grid-3x3-off",
+      "has_color": true
+    },
+    {
+      "index": 164,
+      "name": "ColWidth",
+      "source": "custom:ColWidth",
+      "has_color": true
+    }
+  ]
+}
