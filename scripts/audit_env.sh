@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 为一次审计/测试运行建立隔离环境（遵循 docs/excel-wps-audit-2026-11-12/hermes-deepseek.md §4）。
+# 为一次审计/测试运行建立隔离环境。
 #
 # 用法（在仓库根目录）：
 #   source scripts/audit_env.sh [标签]

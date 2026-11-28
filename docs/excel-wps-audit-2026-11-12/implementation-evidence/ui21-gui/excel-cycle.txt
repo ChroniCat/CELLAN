@@ -1,6 +1,0 @@
-OPEN Calculation=xlCalculationManual A1=7 B1=10 B2=6
-AFTER_CALC Calculation=xlCalculationManual B1=14 B2=8
-SAVED_XLS mode=xlCalculationManual B1=14
-SAVED_XLSX mode=xlCalculationManual B1=14
-REOPEN_XLS Calculation=xlCalculationManual A1=7 B1=14 B2=8
-REOPEN_XLSX Calculation=xlCalculationManual A1=7 B1=14 B2=8

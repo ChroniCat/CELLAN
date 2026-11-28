@@ -197,7 +197,7 @@ def main():
             }
         report[key]["peers"] = item
 
-    path = os.path.join(ROOT, "docs/excel-wps-audit-2026-11-12/implementation-evidence/qa09/report.json")
+    path = os.path.join(OUT, "report.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)

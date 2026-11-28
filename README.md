@@ -73,7 +73,6 @@
 | `assets/` | 矢量品牌标志（`logo.svg`）、多尺寸图标（`app.ico`）、实机截图与 SIL OFL 内嵌字体子集 |
 | `scripts/` | 一键签名发版脚本（`publish.ps1`）、PGO 采集与回归验收脚本 |
 | `packaging/` | 发行版构建指南、用户使用说明与第三方开源组件许可声明 |
-| `docs/` | 架构演进记录（[native-rewrite.md](docs/native-rewrite.md)）与 Excel/WPS 对标实测档案 |
 
 ---
 

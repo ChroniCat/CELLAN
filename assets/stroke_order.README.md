@@ -9,8 +9,7 @@
   （`work/probe/stroke_sort.ps1`），再按结果顺序写入本文件；
 - 这是我们自己观察到的排序事实，不含任何 Microsoft 数据文件；
 - 校验：`work/probe/stroke_parity_xl.ps1` 对 300 个 1–3 字随机串做同样的
-  Excel 排序，与本仓 `collate::cmp_stroke` 的结果 **300/300 完全一致**
-  （见 `docs/excel-wps-audit-2026-11-12/implementation-evidence/c20-stroke-1117.md`）。
+  Excel 排序，与本仓 `collate::cmp_stroke` 的结果 **300/300 完全一致**。
 
 重新生成（需要本机 Excel）：
 

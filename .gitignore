@@ -41,9 +41,6 @@
 !crates/core/tests/fixtures/real_excel.xls
 !crates/core/tests/fixtures/c11_external_3d.xlsx
 !crates/core/tests/fixtures/c114_ext_book2.xlsx
-!docs/excel-wps-audit-2026-11-12/implementation-evidence/c08-custom-props/*.xlsx
-!docs/excel-wps-audit-2026-11-12/implementation-evidence/ui10-*.xlsx
-!docs/excel-wps-audit-2026-11-12/implementation-evidence/ui18-*.xlsx
 !crates/core/tests/fixtures/qa01/*.xlsx
 !crates/core/tests/fixtures/qa02/*.xlsx
 !crates/core/tests/fixtures/qa02_cf_dv/*.xlsx
