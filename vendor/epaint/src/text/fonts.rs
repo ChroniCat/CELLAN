@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     mutex::{Mutex, MutexGuard},
     text::{
+        dwrite::{self, DWriteFace, TextBackendMode},
         font::{Font, FontImpl},
         Galley, LayoutJob,
     },
@@ -215,7 +216,7 @@ fn ab_glyph_font_from_font_data(name: &str, data: &FontData) -> ab_glyph::FontAr
 /// Often you would start with [`FontDefinitions::default()`] and then add/change the contents.
 ///
 /// This is how you install your own custom fonts:
-/// ```
+/// ```ignore
 /// # use {epaint::text::{FontDefinitions, FontFamily, FontData}};
 /// # struct FakeEguiCtx {};
 /// # impl FakeEguiCtx { fn set_fonts(&self, _: FontDefinitions) {} }
@@ -444,11 +445,15 @@ impl Fonts {
     pub fn begin_pass(&self, pixels_per_point: f32, max_texture_side: usize) {
         let mut fonts_and_cache = self.0.lock();
 
+        let desired_backend = dwrite::current_backend_mode();
         let pixels_per_point_changed = fonts_and_cache.fonts.pixels_per_point != pixels_per_point;
         let max_texture_side_changed = fonts_and_cache.fonts.max_texture_side != max_texture_side;
+        let backend_mode_changed = fonts_and_cache.fonts.backend_mode != desired_backend;
         let font_atlas_almost_full = fonts_and_cache.fonts.atlas.lock().fill_ratio() > 0.8;
-        let needs_recreate =
-            pixels_per_point_changed || max_texture_side_changed || font_atlas_almost_full;
+        let needs_recreate = pixels_per_point_changed
+            || max_texture_side_changed
+            || backend_mode_changed
+            || font_atlas_almost_full;
 
         if needs_recreate {
             let definitions = fonts_and_cache.fonts.definitions.clone();
@@ -457,6 +462,8 @@ impl Fonts {
                 fonts: FontsImpl::new(pixels_per_point, max_texture_side, definitions),
                 galley_cache: Default::default(),
             };
+        } else {
+            dwrite::publish_cleartype_state(fonts_and_cache.fonts.backend_mode);
         }
 
         fonts_and_cache.galley_cache.flush_cache();
@@ -623,6 +630,7 @@ impl FontsAndCache {
 pub struct FontsImpl {
     pixels_per_point: f32,
     max_texture_side: usize,
+    backend_mode: TextBackendMode,
     definitions: FontDefinitions,
     atlas: Arc<Mutex<TextureAtlas>>,
     font_impl_cache: FontImplCache,
@@ -642,18 +650,29 @@ impl FontsImpl {
             "pixels_per_point out of range: {pixels_per_point}"
         );
 
+        let backend_mode = dwrite::current_backend_mode();
+        dwrite::publish_cleartype_state(backend_mode);
+
         let texture_width = max_texture_side.at_most(16 * 1024);
         let initial_height = 32; // Keep initial font atlas small, so it is fast to upload to GPU. This will expand as needed anyways.
-        let atlas = TextureAtlas::new([texture_width, initial_height]);
+        let atlas = TextureAtlas::new_with_subpixel(
+            [texture_width, initial_height],
+            backend_mode == TextBackendMode::ClearTypeSubpixel,
+        );
 
         let atlas = Arc::new(Mutex::new(atlas));
 
-        let font_impl_cache =
-            FontImplCache::new(atlas.clone(), pixels_per_point, &definitions.font_data);
+        let font_impl_cache = FontImplCache::new(
+            atlas.clone(),
+            pixels_per_point,
+            &definitions.font_data,
+            backend_mode,
+        );
 
         Self {
             pixels_per_point,
             max_texture_side,
+            backend_mode,
             definitions,
             atlas,
             font_impl_cache,
@@ -796,7 +815,8 @@ impl GalleyCache {
 struct FontImplCache {
     atlas: Arc<Mutex<TextureAtlas>>,
     pixels_per_point: f32,
-    ab_glyph_fonts: BTreeMap<String, (FontTweak, ab_glyph::FontArc)>,
+    backend_mode: TextBackendMode,
+    ab_glyph_fonts: BTreeMap<String, (FontTweak, ab_glyph::FontArc, Option<Arc<DWriteFace>>)>,
 
     /// Map font pixel sizes and names to the cached [`FontImpl`].
     cache: ahash::HashMap<(u32, String), Arc<FontImpl>>,
@@ -807,19 +827,26 @@ impl FontImplCache {
         atlas: Arc<Mutex<TextureAtlas>>,
         pixels_per_point: f32,
         font_data: &BTreeMap<String, Arc<FontData>>,
+        backend_mode: TextBackendMode,
     ) -> Self {
         let ab_glyph_fonts = font_data
             .iter()
             .map(|(name, font_data)| {
                 let tweak = font_data.tweak;
                 let ab_glyph = ab_glyph_font_from_font_data(name, font_data);
-                (name.clone(), (tweak, ab_glyph))
+                let dwrite_face = if backend_mode != TextBackendMode::AbGlyph {
+                    DWriteFace::from_font_data(font_data)
+                } else {
+                    None
+                };
+                (name.clone(), (tweak, ab_glyph, dwrite_face))
             })
             .collect();
 
         Self {
             atlas,
             pixels_per_point,
+            backend_mode,
             ab_glyph_fonts,
             cache: Default::default(),
         }
@@ -828,12 +855,13 @@ impl FontImplCache {
     pub fn font_impl(&mut self, scale_in_points: f32, font_name: &str) -> Arc<FontImpl> {
         use ab_glyph::Font as _;
 
-        let (tweak, ab_glyph_font) = self
+        let (tweak, ab_glyph_font, dwrite_face) = self
             .ab_glyph_fonts
             .get(font_name)
             .unwrap_or_else(|| panic!("No font data found for {font_name:?}"))
             .clone();
 
+        let em_size_dips = scale_in_points * tweak.scale;
         let scale_in_pixels = self.pixels_per_point * scale_in_points;
 
         // Scale the font properly (see https://github.com/emilk/egui/issues/2068).
@@ -849,13 +877,16 @@ impl FontImplCache {
                 font_name.to_owned(),
             ))
             .or_insert_with(|| {
-                Arc::new(FontImpl::new(
+                Arc::new(FontImpl::new_with_backend(
                     self.atlas.clone(),
                     self.pixels_per_point,
                     font_name.to_owned(),
                     ab_glyph_font,
                     scale_in_pixels,
+                    em_size_dips,
                     tweak,
+                    dwrite_face,
+                    self.backend_mode,
                 ))
             })
             .clone()

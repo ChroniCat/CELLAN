@@ -76,9 +76,18 @@ pub struct TextureAtlas {
 
 impl TextureAtlas {
     pub fn new(size: [usize; 2]) -> Self {
+        Self::new_with_subpixel(size, false)
+    }
+
+    pub(crate) fn new_with_subpixel(size: [usize; 2], subpixel: bool) -> Self {
         assert!(size[0] >= 1024, "Tiny texture atlas");
+        let image = if subpixel {
+            FontImage::new_subpixel(size)
+        } else {
+            FontImage::new(size)
+        };
         let mut atlas = Self {
-            image: FontImage::new(size),
+            image,
             dirty: Rectu::EVERYTHING,
             cursor: (0, 0),
             row_height: 0,
@@ -89,7 +98,7 @@ impl TextureAtlas {
         // Make the top left pixel fully white for `WHITE_UV`, i.e. painting something with solid color:
         let (pos, image) = atlas.allocate((1, 1));
         assert_eq!(pos, (0, 0));
-        image[pos] = 1.0;
+        image.set_coverage_linear(pos, 1.0);
 
         // Allocate a series of anti-aliased discs used to render small filled circles:
         // TODO(emilk): these circles can be packed A LOT better.
@@ -111,8 +120,10 @@ impl TextureAtlas {
                     let distance_to_center = ((dx * dx + dy * dy) as f32).sqrt();
                     let coverage =
                         remap_clamp(distance_to_center, (r - 0.5)..=(r + 0.5), 1.0..=0.0);
-                    image[((x as i32 + hw + dx) as usize, (y as i32 + hw + dy) as usize)] =
-                        coverage;
+                    image.set_coverage_linear(
+                        ((x as i32 + hw + dx) as usize, (y as i32 + hw + dy) as usize),
+                        coverage,
+                    );
                 }
             }
             atlas.discs.push(PrerasterizedDisc {
@@ -175,7 +186,11 @@ impl TextureAtlas {
     /// The texture options suitable for a font texture
     #[inline]
     pub fn texture_options() -> crate::textures::TextureOptions {
-        crate::textures::TextureOptions::LINEAR
+        if crate::text::cleartype_subpixel_active() {
+            crate::textures::TextureOptions::NEAREST
+        } else {
+            crate::textures::TextureOptions::LINEAR
+        }
     }
 
     /// The full font atlas image.
@@ -186,7 +201,11 @@ impl TextureAtlas {
 
     /// Call to get the change to the image since last call.
     pub fn take_delta(&mut self) -> Option<ImageDelta> {
-        let texture_options = Self::texture_options();
+        let texture_options = if self.image.is_subpixel() {
+            crate::textures::TextureOptions::NEAREST
+        } else {
+            crate::textures::TextureOptions::LINEAR
+        };
 
         let dirty = std::mem::replace(&mut self.dirty, Rectu::NOTHING);
         if dirty == Rectu::NOTHING {
@@ -256,7 +275,8 @@ fn resize_to_min_height(image: &mut FontImage, required_height: usize) -> bool {
     }
 
     if image.width() * image.height() > image.pixels.len() {
-        image.pixels.resize(image.width() * image.height(), 0.0);
+        let new_len = image.width() * image.height();
+        image.resize_buffers(new_len);
         true
     } else {
         false

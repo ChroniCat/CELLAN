@@ -2024,9 +2024,11 @@ impl Tessellator {
         out.vertices.reserve(galley.num_vertices);
         out.indices.reserve(galley.num_indices);
 
+        let subpixel_active = crate::text::cleartype_subpixel_active();
+
         // The contents of the galley are already snapped to pixel coordinates,
         // but we need to make sure the galley ends up on the start of a physical pixel:
-        let galley_pos = if self.options.round_text_to_pixels {
+        let galley_pos = if self.options.round_text_to_pixels || subpixel_active {
             galley_pos.round_to_pixels(self.pixels_per_point)
         } else {
             *galley_pos
@@ -2103,6 +2105,39 @@ impl Tessellator {
                         }
                     }),
             );
+
+            // In ClearType 3x1 RGB subpixel mode with NEAREST sampling, snap every upright
+            // glyph quad's origin to exact physical integer pixels while preserving exact
+            // physical glyph width/height (`glyph_px / ppp`) for 1:1 texel-to-LCD alignment.
+            if subpixel_active && *angle == 0.0 {
+                let ppp = self.pixels_per_point;
+                let raw_verts = &row.visuals.mesh.vertices;
+                let glyph_range = &row.visuals.glyph_vertex_range;
+                let mut gi = glyph_range.start;
+                let mut oi = index_offset as usize + glyph_range.start;
+                while gi + 3 < glyph_range.end {
+                    let rv0 = raw_verts[gi];
+                    let rv1 = raw_verts[gi + 1];
+                    let rv2 = raw_verts[gi + 2];
+                    if (rv0.pos.x - rv2.pos.x).abs() < 1e-4 && (rv0.pos.y - rv1.pos.y).abs() < 1e-4
+                    {
+                        let min_px_x = ((galley_pos.x + rv0.pos.x) * ppp).round();
+                        let min_px_y = ((galley_pos.y + rv0.pos.y) * ppp).round();
+                        let w_px = (rv1.uv.x - rv0.uv.x).max(0.0);
+                        let h_px = (rv2.uv.y - rv0.uv.y).max(0.0);
+                        let min_x = min_px_x / ppp;
+                        let min_y = min_px_y / ppp;
+                        let max_x = (min_px_x + w_px) / ppp;
+                        let max_y = (min_px_y + h_px) / ppp;
+                        out.vertices[oi].pos = pos2(min_x, min_y);
+                        out.vertices[oi + 1].pos = pos2(max_x, min_y);
+                        out.vertices[oi + 2].pos = pos2(min_x, max_y);
+                        out.vertices[oi + 3].pos = pos2(max_x, max_y);
+                    }
+                    gi += 4;
+                    oi += 4;
+                }
+            }
 
             if *underline != Stroke::NONE {
                 self.tessellate_line_segment(

@@ -5,7 +5,10 @@ use emath::{vec2, GuiRounding, Vec2};
 
 use crate::{
     mutex::{Mutex, RwLock},
-    text::FontTweak,
+    text::{
+        dwrite::{DWriteFace, GlyphPixels, TextBackendMode},
+        FontTweak,
+    },
     TextureAtlas,
 };
 
@@ -67,6 +70,9 @@ impl Default for GlyphInfo {
 pub struct FontImpl {
     name: String,
     ab_glyph_font: ab_glyph::FontArc,
+    dwrite_face: Option<Arc<DWriteFace>>,
+    em_size_dips: f32,
+    backend_mode: TextBackendMode,
 
     /// Maximum character height
     scale_in_pixels: u32,
@@ -83,6 +89,7 @@ pub struct FontImpl {
 }
 
 impl FontImpl {
+    #[allow(dead_code)]
     pub fn new(
         atlas: Arc<Mutex<TextureAtlas>>,
         pixels_per_point: f32,
@@ -90,6 +97,36 @@ impl FontImpl {
         ab_glyph_font: ab_glyph::FontArc,
         scale_in_pixels: f32,
         tweak: FontTweak,
+    ) -> Self {
+        use ab_glyph::Font as _;
+        let units_per_em = ab_glyph_font.units_per_em().unwrap_or(1000.0);
+        let height_unscaled = ab_glyph_font.height_unscaled().max(1.0);
+        let em_size_dips =
+            (scale_in_pixels / pixels_per_point) * (units_per_em / height_unscaled) * tweak.scale;
+        Self::new_with_backend(
+            atlas,
+            pixels_per_point,
+            name,
+            ab_glyph_font,
+            scale_in_pixels,
+            em_size_dips,
+            tweak,
+            None,
+            TextBackendMode::AbGlyph,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_backend(
+        atlas: Arc<Mutex<TextureAtlas>>,
+        pixels_per_point: f32,
+        name: String,
+        ab_glyph_font: ab_glyph::FontArc,
+        scale_in_pixels: f32,
+        em_size_dips: f32,
+        tweak: FontTweak,
+        dwrite_face: Option<Arc<DWriteFace>>,
+        backend_mode: TextBackendMode,
     ) -> Self {
         assert!(scale_in_pixels > 0.0);
         assert!(pixels_per_point > 0.0);
@@ -123,6 +160,9 @@ impl FontImpl {
         Self {
             name,
             ab_glyph_font,
+            dwrite_face,
+            em_size_dips: em_size_dips.max(0.5),
+            backend_mode,
             scale_in_pixels,
             height_in_points: ascent - descent + line_gap,
             y_offset_in_points,
@@ -265,6 +305,77 @@ impl FontImpl {
 
     fn allocate_glyph(&self, glyph_id: ab_glyph::GlyphId) -> GlyphInfo {
         assert!(glyph_id.0 != 0);
+
+        // Windows DirectWrite TrueType-hinted ClearType 3x1 RGB / hinted grayscale path
+        if self.backend_mode != TextBackendMode::AbGlyph {
+            if let Some(dw) = &self.dwrite_face {
+                let want_subpixel = self.backend_mode == TextBackendMode::ClearTypeSubpixel;
+                if let Some(rast) = dw.rasterize_glyph(
+                    glyph_id.0,
+                    self.em_size_dips,
+                    self.pixels_per_point,
+                    want_subpixel,
+                ) {
+                    let uv_rect = if rast.width == 0 || rast.height == 0 {
+                        UvRect::default()
+                    } else if let Some(pixels) = rast.pixels {
+                        let glyph_pos = {
+                            let atlas = &mut self.atlas.lock();
+                            let (glyph_pos, image) = atlas.allocate((rast.width, rast.height));
+                            match pixels {
+                                GlyphPixels::SubpixelRgb(rgb) => {
+                                    for y in 0..rast.height {
+                                        let row_off = y * rast.width;
+                                        for x in 0..rast.width {
+                                            let px = glyph_pos.0 + x;
+                                            let py = glyph_pos.1 + y;
+                                            image.set_subpixel_rgb((px, py), rgb[row_off + x]);
+                                        }
+                                    }
+                                }
+                                GlyphPixels::Grayscale(gray) => {
+                                    for y in 0..rast.height {
+                                        let row_off = y * rast.width;
+                                        for x in 0..rast.width {
+                                            let v = gray[row_off + x];
+                                            if v > 0.0 {
+                                                let px = glyph_pos.0 + x;
+                                                let py = glyph_pos.1 + y;
+                                                image.set_coverage_linear((px, py), v);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            glyph_pos
+                        };
+
+                        let offset_in_pixels = vec2(rast.left as f32, rast.top as f32);
+                        let offset = offset_in_pixels / self.pixels_per_point
+                            + self.y_offset_in_points * Vec2::Y;
+                        UvRect {
+                            offset,
+                            size: vec2(rast.width as f32, rast.height as f32)
+                                / self.pixels_per_point,
+                            min: [glyph_pos.0 as u16, glyph_pos.1 as u16],
+                            max: [
+                                (glyph_pos.0 + rast.width) as u16,
+                                (glyph_pos.1 + rast.height) as u16,
+                            ],
+                        }
+                    } else {
+                        UvRect::default()
+                    };
+
+                    return GlyphInfo {
+                        id: glyph_id,
+                        advance_width: rast.advance_px / self.pixels_per_point,
+                        uv_rect,
+                    };
+                }
+            }
+        }
+
         use ab_glyph::{Font as _, ScaleFont};
 
         let glyph = glyph_id.with_scale_and_position(
@@ -286,7 +397,7 @@ impl FontImpl {
                         if 0.0 < v {
                             let px = glyph_pos.0 + x as usize;
                             let py = glyph_pos.1 + y as usize;
-                            image[(px, py)] = v;
+                            image.set_coverage_linear((px, py), v);
                         }
                     });
                     glyph_pos

@@ -2,6 +2,7 @@
 
 pub mod cleartype_api;
 pub mod cursor;
+pub(crate) mod dwrite;
 mod font;
 mod fonts;
 mod text_layout;

@@ -49,11 +49,6 @@ rustdoc-args = ["--generate-link-to-definition"]
 name = "epaint"
 path = "src/lib.rs"
 
-[[bench]]
-name = "benchmark"
-path = "benches/benchmark.rs"
-harness = false
-
 [dependencies.ab_glyph]
 version = "0.2.11"
 
@@ -113,10 +108,6 @@ features = [
     "rc",
 ]
 optional = true
-
-[dev-dependencies.criterion]
-version = "0.5.1"
-default-features = false
 
 [features]
 _override_unity = []

@@ -279,6 +279,14 @@ pub struct FontImage {
     ///
     /// Often you want to use [`Self::srgba_pixels`] instead.
     pub pixels: Vec<f32>,
+
+    /// Optional per-texel 3x1 RGB ClearType subpixel coverage (`[r, g, b]` in `0..=255`).
+    ///
+    /// When `Some`, `srgba_pixels` outputs linear RGB subpixel masks directly (with solid white
+    /// `[255, 255, 255, 255]` at `(0, 0)` and neutral `[a, a, a, a]` for discs/fallback glyphs)
+    /// for hardware dual-source ClearType blending.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub(crate) subpixel_rgb: Option<Vec<[u8; 3]>>,
 }
 
 impl FontImage {
@@ -286,6 +294,56 @@ impl FontImage {
         Self {
             size,
             pixels: vec![0.0; size[0] * size[1]],
+            subpixel_rgb: None,
+        }
+    }
+
+    pub(crate) fn new_subpixel(size: [usize; 2]) -> Self {
+        let len = size[0] * size[1];
+        Self {
+            size,
+            pixels: vec![0.0; len],
+            subpixel_rgb: Some(vec![[0, 0, 0]; len]),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_subpixel(&self) -> bool {
+        self.subpixel_rgb.is_some()
+    }
+
+    /// Write a neutral grayscale coverage value `[0.0..=1.0]` into both `pixels` and
+    /// (when active) `subpixel_rgb` as `[a, a, a]`.
+    #[inline]
+    pub(crate) fn set_coverage_linear(&mut self, (x, y): (usize, usize), coverage: f32) {
+        let [w, h] = self.size;
+        assert!(x < w && y < h);
+        let idx = y * w + x;
+        let clamped = coverage.clamp(0.0, 1.0);
+        self.pixels[idx] = clamped;
+        if let Some(rgb) = self.subpixel_rgb.as_mut() {
+            let a = fast_round(clamped * 255.0);
+            rgb[idx] = [a, a, a];
+        }
+    }
+
+    /// Write a 3x1 ClearType RGB subpixel coverage triplet `[r, g, b]` in `0..=255`.
+    #[inline]
+    pub(crate) fn set_subpixel_rgb(&mut self, (x, y): (usize, usize), rgb: [u8; 3]) {
+        let [w, h] = self.size;
+        assert!(x < w && y < h);
+        let idx = y * w + x;
+        let luma = (0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32) / 255.0;
+        self.pixels[idx] = luma.clamp(0.0, 1.0);
+        if let Some(buf) = self.subpixel_rgb.as_mut() {
+            buf[idx] = rgb;
+        }
+    }
+
+    pub(crate) fn resize_buffers(&mut self, new_len: usize) {
+        self.pixels.resize(new_len, 0.0);
+        if let Some(buf) = self.subpixel_rgb.as_mut() {
+            buf.resize(new_len, [0, 0, 0]);
         }
     }
 
@@ -309,11 +367,18 @@ impl FontImage {
         // TODO(emilk): this default coverage gamma is a magic constant, chosen by eye. I don't even know why we need it.
         // Maybe we need to implement the ideas in https://hikogui.org/2022/10/24/the-trouble-with-anti-aliasing.html
         let gamma = gamma.unwrap_or(0.55);
-        self.pixels.iter().map(move |coverage| {
-            let alpha = coverage.powf(gamma);
-            // We want to multiply with `vec4(alpha)` in the fragment shader:
-            let a = fast_round(alpha * 255.0);
-            Color32::from_rgba_premultiplied(a, a, a, a)
+        let subpixel_rgb = self.subpixel_rgb.as_deref();
+        (0..self.pixels.len()).map(move |idx| {
+            if let Some(rgb) = subpixel_rgb {
+                let [r, g, b] = rgb[idx];
+                let a = r.max(g).max(b);
+                Color32::from_rgba_premultiplied(r, g, b, a)
+            } else {
+                let alpha = self.pixels[idx].powf(gamma);
+                // We want to multiply with `vec4(alpha)` in the fragment shader:
+                let a = fast_round(alpha * 255.0);
+                Color32::from_rgba_premultiplied(a, a, a, a)
+            }
         })
     }
 
@@ -323,14 +388,26 @@ impl FontImage {
         assert!(y + h <= self.height());
 
         let mut pixels = Vec::with_capacity(w * h);
-        for y in y..y + h {
-            let offset = y * self.width() + x;
+        for row in y..y + h {
+            let offset = row * self.width() + x;
             pixels.extend(&self.pixels[offset..(offset + w)]);
         }
         assert_eq!(pixels.len(), w * h);
+
+        let subpixel_rgb = self.subpixel_rgb.as_ref().map(|src| {
+            let mut dst = Vec::with_capacity(w * h);
+            for row in y..y + h {
+                let offset = row * self.width() + x;
+                dst.extend_from_slice(&src[offset..(offset + w)]);
+            }
+            assert_eq!(dst.len(), w * h);
+            dst
+        });
+
         Self {
             size: [w, h],
             pixels,
+            subpixel_rgb,
         }
     }
 }
@@ -414,5 +491,121 @@ impl ImageDelta {
     /// If `false`, this is a partial (sub-region) update.
     pub fn is_whole(&self) -> bool {
         self.pos.is_none()
+    }
+}
+
+#[cfg(test)]
+mod cleartype_image_tests {
+    use super::*;
+    use crate::{
+        text::{
+            cleartype_subpixel_active, dual_source_blending_supported,
+            set_dual_source_blending_supported, FontDefinitions, FontId, Fonts, LayoutJob,
+        },
+        textures::TextureOptions,
+        TextureAtlas,
+    };
+
+    #[test]
+    fn font_image_subpixel_srgba_preserves_solid_white_and_rgb_masks() {
+        let mut atlas = TextureAtlas::new_with_subpixel([1024, 32], true);
+        let (pos, img) = atlas.allocate((2, 2));
+        img.set_subpixel_rgb((pos.0, pos.1), [240, 128, 32]);
+        img.set_subpixel_rgb((pos.0 + 1, pos.1), [12, 200, 255]);
+        img.set_coverage_linear((pos.0, pos.1 + 1), 0.5);
+
+        let full: Vec<Color32> = atlas.image().srgba_pixels(None).collect();
+        // Top-left (0, 0) WHITE_UV must remain exact Color32::WHITE [255, 255, 255, 255]
+        assert_eq!(full[0], Color32::WHITE);
+        assert_eq!(full[0].to_array(), [255, 255, 255, 255]);
+
+        // Subpixel texels output exact [r, g, b, max(r, g, b)] without grayscale gamma distortion
+        let w = atlas.image().width();
+        assert_eq!(
+            full[pos.1 * w + pos.0].to_array(),
+            [240, 128, 32, 240]
+        );
+        assert_eq!(
+            full[pos.1 * w + pos.0 + 1].to_array(),
+            [12, 200, 255, 255]
+        );
+        // Linear neutral coverage (used by discs / fallback glyphs) maps uniformly to [a, a, a, a]
+        let disc_px = full[(pos.1 + 1) * w + pos.0].to_array();
+        assert_eq!(disc_px[0], disc_px[1]);
+        assert_eq!(disc_px[1], disc_px[2]);
+        assert_eq!(disc_px[2], disc_px[3]);
+        assert!((126..=129).contains(&disc_px[0]), "got {disc_px:?}");
+
+        // Partial region extraction preserves subpixel RGB data and emits NEAREST TextureOptions
+        let region = atlas.image().region([pos.0, pos.1], [2, 2]);
+        let rpx: Vec<Color32> = region.srgba_pixels(None).collect();
+        assert_eq!(rpx[0].to_array(), [240, 128, 32, 240]);
+        assert_eq!(rpx[1].to_array(), [12, 200, 255, 255]);
+
+        let delta = atlas.take_delta().expect("initial full delta");
+        assert_eq!(delta.options, TextureOptions::NEAREST);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fonts_begin_pass_rebuilds_atlas_when_dual_source_flips_and_snaps_quads() {
+        let prev = dual_source_blending_supported();
+        set_dual_source_blending_supported(false);
+
+        let fonts = Fonts::new(1.0, 2048, FontDefinitions::default());
+        assert!(!cleartype_subpixel_active());
+        let d0 = fonts.font_image_delta().expect("initial grayscale delta");
+        assert_eq!(d0.options, TextureOptions::LINEAR);
+
+        // Simulate GPU backend enabling Dual-Source Blending before first frame
+        set_dual_source_blending_supported(true);
+        fonts.begin_pass(1.0, 2048);
+
+        let job = LayoutJob::simple(
+            "Hello 123".into(),
+            FontId::proportional(13.0),
+            Color32::BLACK,
+            f32::INFINITY,
+        );
+        let galley = fonts.layout_job(job);
+        let delta = fonts
+            .font_image_delta()
+            .expect("rebuilt full atlas delta after dual-source flip");
+        assert!(delta.is_whole());
+        if cleartype_subpixel_active() {
+            assert_eq!(delta.options, TextureOptions::NEAREST);
+
+            // Verify tessellate_text snaps fractional galley_pos to integer physical pixels
+            let mut tess = crate::Tessellator::new(
+                1.0,
+                crate::TessellationOptions {
+                    round_text_to_pixels: false,
+                    ..Default::default()
+                },
+                fonts.font_image_size(),
+                vec![],
+            );
+            let mut mesh = crate::Mesh::default();
+            tess.tessellate_text(
+                &crate::TextShape::new(
+                    emath::pos2(10.37, 20.61),
+                    galley,
+                    Color32::BLACK,
+                ),
+                &mut mesh,
+            );
+            assert!(!mesh.vertices.is_empty());
+            for v in &mesh.vertices {
+                assert!(
+                    (v.pos.x - v.pos.x.round()).abs() < 1e-4
+                        && (v.pos.y - v.pos.y.round()).abs() < 1e-4,
+                    "subpixel glyph vertex should snap to physical integer pixels: {:?}",
+                    v.pos
+                );
+            }
+        }
+
+        // Restore previous state
+        set_dual_source_blending_supported(prev);
     }
 }
