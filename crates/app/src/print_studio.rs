@@ -957,9 +957,10 @@ impl SheetApp {
 
                         // 超越 Excel：智能可读性预警（自动缩放过小时给出友好建议与一键修复）
                         if layout.scale < 0.65 {
+                            let pal = crate::theme::palette();
                             egui::Frame::NONE
-                                .fill(Color32::from_rgb(255, 247, 237))
-                                .stroke(Stroke::new(1.0f32, Color32::from_rgb(251, 146, 60)))
+                                .fill(pal.warn_bg)
+                                .stroke(Stroke::new(1.0f32, pal.warn_border()))
                                 .corner_radius(4.0)
                                 .inner_margin(egui::Margin::symmetric(8, 5))
                                 .show(ui, |ui| {
@@ -969,8 +970,8 @@ impl SheetApp {
                                                 "⚠ 当前缩放 {:.0}%，字号偏小",
                                                 layout.scale * 100.0
                                             ))
-                                            .size(11.5)
-                                            .color(Color32::from_rgb(154, 52, 18)),
+                                            .size(12.0)
+                                            .color(pal.warn_fg),
                                         );
                                         if !base_setup.landscape
                                             && ui.small_button("一键切横向").clicked()
@@ -1459,7 +1460,7 @@ impl SheetApp {
                                     eff_setup.paper_label(),
                                     layout.scale * 100.0
                                 ))
-                                .size(11.5)
+                                .size(12.0)
                                 .weak(),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1474,12 +1475,14 @@ impl SheetApp {
                         });
                         ui.add_space(4.0);
 
+                        let pal = crate::theme::palette();
                         let canvas_h = (ui.available_height() - 4.0).max(460.0);
                         ui.horizontal_top(|ui| {
                             // 可选左侧缩略图导航栏（最多展示前 24 页，点击直达）
                             if self.print_studio.show_thumbnails && total > 1 {
                                 egui::Frame::NONE
-                                    .fill(Color32::from_rgb(241, 245, 249))
+                                    .fill(pal.surface_subtle())
+                                    .stroke(Stroke::new(1.0f32, pal.card_border))
                                     .corner_radius(6.0)
                                     .inner_margin(egui::Margin::same(6))
                                     .show(ui, |ui| {
@@ -1515,9 +1518,9 @@ impl SheetApp {
                                                         true,
                                                     );
                                                     let stroke = if active {
-                                                        Stroke::new(2.0f32, ui_kit::ACCENT)
+                                                        Stroke::new(2.0f32, pal.accent)
                                                     } else {
-                                                        Stroke::new(1.0f32, Color32::from_gray(190))
+                                                        Stroke::new(1.0f32, pal.card_border)
                                                     };
                                                     p.rect_stroke(
                                                         r.rect,
@@ -1530,11 +1533,11 @@ impl SheetApp {
                                                     }
                                                     ui.label(
                                                         egui::RichText::new(format!("第 {} 页", ti + 1))
-                                                            .size(10.0)
+                                                            .size(11.0)
                                                             .color(if active {
-                                                                ui_kit::ACCENT
+                                                                pal.accent
                                                             } else {
-                                                                Color32::from_gray(100)
+                                                                pal.text_weak
                                                             }),
                                                     );
                                                     ui.add_space(4.0);
@@ -1546,7 +1549,7 @@ impl SheetApp {
 
                             // 主纸张预览台（单页或双页对开）
                             egui::Frame::NONE
-                                .fill(Color32::from_rgb(226, 232, 240))
+                                .fill(pal.hover_on_page)
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::same(14))
                                 .show(ui, |ui| {
@@ -1590,7 +1593,7 @@ impl SheetApp {
                                                 painter.rect_stroke(
                                                     pr,
                                                     2.0,
-                                                    Stroke::new(1.0f32, Color32::from_gray(165)),
+                                                    Stroke::new(1.0f32, pal.card_border),
                                                     egui::StrokeKind::Inside,
                                                 );
 
@@ -1661,7 +1664,7 @@ impl SheetApp {
                                                                 pos + Vec2::new(10.0, -10.0),
                                                                 Align2::LEFT_BOTTOM,
                                                                 format!("{label}: {:.1} mm", inches * 25.4),
-                                                                FontId::proportional(11.5),
+                                                                FontId::proportional(12.0),
                                                                 Color32::from_rgb(30, 64, 175),
                                                             );
                                                         }
@@ -1694,7 +1697,7 @@ impl SheetApp {
                                                     p2.rect_stroke(
                                                         pr2,
                                                         2.0,
-                                                        Stroke::new(1.0f32, Color32::from_gray(165)),
+                                                        Stroke::new(1.0f32, pal.card_border),
                                                         egui::StrokeKind::Inside,
                                                     );
                                                 }
@@ -1801,7 +1804,7 @@ impl SheetApp {
 
                 // 一键财务预设
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("快捷预设：").size(11.5).weak());
+                    ui.label(egui::RichText::new("快捷预设：").size(12.0).weak());
                     if ui.small_button("标准页码（第 1 页 / 共 N 页）").clicked() {
                         draft.footer = [String::new(), "第 &P 页 / 共 &N 页".into(), String::new()];
                     }
@@ -1821,7 +1824,7 @@ impl SheetApp {
 
                 // 令牌插入芯片栏
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("插入动态字段：").size(11.5).weak());
+                    ui.label(egui::RichText::new("插入动态字段：").size(12.0).weak());
                     for (lbl, tok) in [
                         ("页码 &P", "&P"),
                         ("总页数 &N", "&N"),
@@ -1885,34 +1888,35 @@ impl SheetApp {
 
                 // 实时效果预览条
                 ui.add_space(6.0);
+                let pal = crate::theme::palette();
                 let raw_h = compose_hf_zones(hdr);
                 let raw_f = compose_hf_zones(ftr);
                 let (hl, hc, hr) = header_parts_with_ctx(&raw_h, 1, 5, Some(&hctx));
                 let (fl, fc, fr) = header_parts_with_ctx(&raw_f, 1, 5, Some(&hctx));
                 egui::Frame::NONE
-                    .fill(Color32::from_rgb(248, 250, 252))
-                    .stroke(Stroke::new(1.0f32, Color32::from_gray(215)))
+                    .fill(pal.surface_subtle())
+                    .stroke(Stroke::new(1.0f32, pal.card_border))
                     .corner_radius(4.0)
                     .inner_margin(egui::Margin::symmetric(10, 6))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("实时效果预览（模拟第 1 / 5 页）").size(10.5).weak());
+                        ui.label(egui::RichText::new("实时效果预览（模拟第 1 / 5 页）").size(11.0).weak());
                         ui.columns(3, |c| {
-                            c[0].label(egui::RichText::new(&hl).size(11.5));
+                            c[0].label(egui::RichText::new(&hl).size(12.0));
                             c[1].vertical_centered(|u| {
-                                u.label(egui::RichText::new(&hc).size(11.5));
+                                u.label(egui::RichText::new(&hc).size(12.0));
                             });
                             c[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |u| {
-                                u.label(egui::RichText::new(&hr).size(11.5));
+                                u.label(egui::RichText::new(&hr).size(12.0));
                             });
                         });
                         ui.separator();
                         ui.columns(3, |c| {
-                            c[0].label(egui::RichText::new(&fl).size(11.5));
+                            c[0].label(egui::RichText::new(&fl).size(12.0));
                             c[1].vertical_centered(|u| {
-                                u.label(egui::RichText::new(&fc).size(11.5));
+                                u.label(egui::RichText::new(&fc).size(12.0));
                             });
                             c[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |u| {
-                                u.label(egui::RichText::new(&fr).size(11.5));
+                                u.label(egui::RichText::new(&fr).size(12.0));
                             });
                         });
                     });

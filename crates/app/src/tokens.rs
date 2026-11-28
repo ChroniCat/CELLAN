@@ -29,11 +29,15 @@ pub mod space {
     pub const GROUP_PAD_TOP: f32 = 4.0;
 }
 
-/// 圆角：Office 的控件基本是 2（小控件）/3（输入框）/4（对话框）
+/// 圆角：Office 的控件基本是 2（小控件）/3（输入框）/4（对话框），悬浮卡片 8
 pub mod radius {
     pub const SM: f32 = 2.0;
     pub const MD: f32 = 3.0;
     pub const LG: f32 = 4.0;
+    #[allow(dead_code)]
+    pub const PILL: f32 = 6.0;
+    #[allow(dead_code)]
+    pub const CARD: f32 = 8.0;
 }
 
 /// 描边：1px 常规线；1.5px 焦点圈（在 100% 下能看见又不糊）
@@ -42,11 +46,17 @@ pub mod stroke {
     pub const FOCUS: f32 = 1.5;
 }
 
-/// 字号（逻辑点）：正文 12、次要 11、标题 13
+/// 字号（逻辑点）：全整数阶梯（11 次要 / 12 正文 / 13 强调 / 14 分区标题 / 16 子标题 / 20 主标题）
 pub mod text {
     pub const SMALL: f32 = 11.0;
     pub const BODY: f32 = 12.0;
     pub const TITLE: f32 = 13.0;
+    #[allow(dead_code)]
+    pub const H2: f32 = 14.0;
+    #[allow(dead_code)]
+    pub const H1: f32 = 16.0;
+    #[allow(dead_code)]
+    pub const DISPLAY: f32 = 20.0;
 }
 
 /// 控件尺寸（逻辑点）：按钮/工作表标签这类固定盒子
@@ -102,11 +112,16 @@ mod tests {
         assert_eq!(radius::SM, 2.0);
         assert_eq!(radius::MD, 3.0);
         assert_eq!(radius::LG, 4.0);
+        assert_eq!(radius::PILL, 6.0);
+        assert_eq!(radius::CARD, 8.0);
         assert_eq!(stroke::HAIR, 1.0);
         assert_eq!(stroke::FOCUS, 1.5);
         assert_eq!(text::SMALL, 11.0);
         assert_eq!(text::BODY, 12.0);
         assert_eq!(text::TITLE, 13.0);
+        assert_eq!(text::H2, 14.0);
+        assert_eq!(text::H1, 16.0);
+        assert_eq!(text::DISPLAY, 20.0);
         assert_eq!(size::BTN_MIN_W, 75.0);
         assert_eq!(size::BTN_H, 24.0);
         assert_eq!(size::SHEET_TAB_H, 32.0);

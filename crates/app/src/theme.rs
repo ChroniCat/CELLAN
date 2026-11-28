@@ -103,6 +103,91 @@ impl ThemePalette {
             self.page_bg.lerp_to_gamma(self.card_border, 0.6)
         }
     }
+
+    /// Subtle secondary surface inside floating cards/panels (headers, inset containers, idle inputs).
+    pub fn surface_subtle(self) -> Color32 {
+        match self.theme {
+            AppTheme::Light => Color32::from_rgb(248, 249, 252),
+            AppTheme::EyeCare => Color32::from_rgb(230, 241, 231),
+            AppTheme::Dark => Color32::from_rgb(28, 32, 40),
+            AppTheme::HighContrast => Color32::from_rgb(18, 18, 18),
+        }
+    }
+
+    /// Theme-aware floating card shadow color.
+    pub fn shadow_color(self) -> Color32 {
+        match self.theme {
+            AppTheme::Light => Color32::from_black_alpha(14),
+            AppTheme::EyeCare => Color32::from_rgba_unmultiplied(15, 32, 20, 16),
+            AppTheme::Dark => Color32::from_black_alpha(48),
+            AppTheme::HighContrast => Color32::TRANSPARENT,
+        }
+    }
+
+    /// Soft accent outline for active badges, user bubbles, and callout banners.
+    pub fn accent_border(self) -> Color32 {
+        if self.theme == AppTheme::HighContrast {
+            self.accent
+        } else {
+            self.card_border.lerp_to_gamma(self.accent, 0.45)
+        }
+    }
+
+    /// Semantic callout border for warning banners/cards.
+    pub fn warn_border(self) -> Color32 {
+        if self.theme == AppTheme::HighContrast {
+            self.warn_fg
+        } else {
+            self.warn_bg.lerp_to_gamma(self.warn_fg, 0.45)
+        }
+    }
+
+    /// Semantic callout border for error banners/cards.
+    pub fn err_border(self) -> Color32 {
+        if self.theme == AppTheme::HighContrast {
+            self.err_fg
+        } else {
+            self.err_bg.lerp_to_gamma(self.err_fg, 0.42)
+        }
+    }
+
+    /// Semantic callout border for informational badges/banners.
+    #[allow(dead_code)]
+    pub fn info_border(self) -> Color32 {
+        if self.theme == AppTheme::HighContrast {
+            self.info_fg
+        } else {
+            self.info_bg.lerp_to_gamma(self.info_fg, 0.38)
+        }
+    }
+
+    /// Accessible brand navy/blue ink for assistant accents and context badges across all themes.
+    pub fn brand_ink(self) -> Color32 {
+        match self.theme {
+            AppTheme::Light => crate::ui_kit::BRAND_NAVY,
+            AppTheme::EyeCare => Color32::from_rgb(24, 82, 152),
+            AppTheme::Dark => Color32::from_rgb(122, 174, 255),
+            AppTheme::HighContrast => self.info_fg,
+        }
+    }
+
+    /// High-contrast foreground color for text placed on solid `self.accent` fills.
+    pub fn on_accent(self) -> Color32 {
+        match self.theme {
+            AppTheme::Light | AppTheme::EyeCare => Color32::WHITE,
+            AppTheme::Dark => Color32::from_rgb(10, 24, 18),
+            AppTheme::HighContrast => Color32::BLACK,
+        }
+    }
+
+    /// High-contrast foreground color for text placed on solid `self.err_fg` fills.
+    pub fn on_err(self) -> Color32 {
+        if self.theme.is_dark() {
+            Color32::from_rgb(24, 16, 16)
+        } else {
+            Color32::WHITE
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -140,59 +225,59 @@ pub fn palette_for(theme: AppTheme) -> ThemePalette {
         AppTheme::Light => ThemePalette {
             theme,
             ribbon_bg: Color32::WHITE,
-            page_bg: Color32::from_rgb(245, 246, 248),
+            page_bg: Color32::from_rgb(243, 245, 248),
             card_bg: Color32::WHITE,
-            card_border: Color32::from_rgb(224, 227, 232),
-            title_bg: Color32::from_rgb(240, 243, 248),
-            status_bg: Color32::from_rgb(245, 246, 248),
-            hover: Color32::from_rgb(241, 243, 246),
-            hover_on_page: Color32::from_rgb(233, 236, 242),
-            pressed: Color32::from_rgb(225, 229, 236),
+            card_border: Color32::from_rgb(218, 223, 231),
+            title_bg: Color32::from_rgb(243, 245, 248),
+            status_bg: Color32::from_rgb(245, 247, 250),
+            hover: Color32::from_rgb(238, 242, 247),
+            hover_on_page: Color32::from_rgb(231, 236, 243),
+            pressed: Color32::from_rgb(222, 228, 237),
             accent: crate::ui_kit::ACCENT,
-            accent_hover: Color32::from_rgb(21, 108, 70),
-            accent_tint: Color32::from_rgb(234, 246, 240),
-            text: Color32::from_rgb(31, 35, 41),
-            text_weak: Color32::from_rgb(100, 106, 115),
-            text_muted: Color32::from_rgb(143, 149, 158),
+            accent_hover: Color32::from_rgb(24, 102, 62),
+            accent_tint: Color32::from_rgb(232, 245, 238),
+            text: Color32::from_rgb(26, 31, 39),
+            text_weak: Color32::from_rgb(92, 100, 112),
+            text_muted: Color32::from_rgb(138, 146, 158),
             grid_bg: Color32::WHITE,
-            grid_line: Color32::from_rgb(228, 231, 236),
-            header_bg: Color32::from_rgb(247, 248, 250),
-            header_sel: Color32::from_rgb(226, 242, 234),
-            header_text: Color32::from_rgb(78, 86, 98),
-            default_cell_text: Color32::from_rgb(24, 28, 34),
+            grid_line: Color32::from_rgb(226, 230, 236),
+            header_bg: Color32::from_rgb(247, 248, 251),
+            header_sel: Color32::from_rgb(224, 241, 232),
+            header_text: Color32::from_rgb(76, 84, 96),
+            default_cell_text: Color32::from_rgb(22, 26, 33),
             dialog_bg: Color32::WHITE,
-            dialog_scrim: Color32::from_black_alpha(40),
-            warn_bg: Color32::from_rgb(255, 249, 240),
-            warn_fg: Color32::from_rgb(154, 96, 14),
+            dialog_scrim: Color32::from_black_alpha(38),
+            warn_bg: Color32::from_rgb(255, 248, 235),
+            warn_fg: Color32::from_rgb(154, 88, 12),
             err_bg: Color32::from_rgb(254, 242, 242),
             err_fg: Color32::from_rgb(185, 28, 28),
-            info_bg: Color32::from_rgb(239, 246, 255),
+            info_bg: Color32::from_rgb(238, 245, 255),
             info_fg: Color32::from_rgb(29, 78, 216),
         },
         AppTheme::EyeCare => ThemePalette {
             theme,
-            ribbon_bg: Color32::from_rgb(232, 244, 232),
-            page_bg: Color32::from_rgb(221, 236, 221),
-            card_bg: Color32::from_rgb(236, 246, 236),
-            card_border: Color32::from_rgb(188, 212, 189),
-            title_bg: Color32::from_rgb(214, 232, 215),
-            status_bg: Color32::from_rgb(221, 236, 221),
-            hover: Color32::from_rgb(209, 229, 211),
-            hover_on_page: Color32::from_rgb(202, 224, 204),
-            pressed: Color32::from_rgb(190, 216, 193),
+            ribbon_bg: Color32::from_rgb(236, 245, 236),
+            page_bg: Color32::from_rgb(224, 237, 225),
+            card_bg: Color32::from_rgb(239, 247, 239),
+            card_border: Color32::from_rgb(189, 212, 192),
+            title_bg: Color32::from_rgb(224, 237, 225),
+            status_bg: Color32::from_rgb(226, 238, 227),
+            hover: Color32::from_rgb(212, 230, 214),
+            hover_on_page: Color32::from_rgb(205, 225, 207),
+            pressed: Color32::from_rgb(193, 217, 196),
             accent: Color32::from_rgb(24, 118, 76),
             accent_hover: Color32::from_rgb(19, 98, 63),
-            accent_tint: Color32::from_rgb(203, 232, 212),
-            text: Color32::from_rgb(30, 44, 34),
-            text_weak: Color32::from_rgb(76, 98, 82),
-            text_muted: Color32::from_rgb(112, 134, 118),
-            grid_bg: Color32::from_rgb(236, 247, 236),
-            grid_line: Color32::from_rgb(201, 222, 202),
-            header_bg: Color32::from_rgb(225, 239, 225),
-            header_sel: Color32::from_rgb(195, 227, 204),
-            header_text: Color32::from_rgb(58, 78, 63),
-            default_cell_text: Color32::from_rgb(26, 40, 30),
-            dialog_bg: Color32::from_rgb(236, 246, 236),
+            accent_tint: Color32::from_rgb(206, 234, 215),
+            text: Color32::from_rgb(26, 40, 30),
+            text_weak: Color32::from_rgb(72, 94, 78),
+            text_muted: Color32::from_rgb(108, 130, 114),
+            grid_bg: Color32::from_rgb(238, 248, 238),
+            grid_line: Color32::from_rgb(202, 223, 204),
+            header_bg: Color32::from_rgb(227, 240, 228),
+            header_sel: Color32::from_rgb(197, 228, 206),
+            header_text: Color32::from_rgb(56, 76, 61),
+            default_cell_text: Color32::from_rgb(24, 38, 28),
+            dialog_bg: Color32::from_rgb(239, 247, 239),
             dialog_scrim: Color32::from_rgba_unmultiplied(15, 32, 20, 42),
             warn_bg: Color32::from_rgb(252, 244, 216),
             warn_fg: Color32::from_rgb(142, 88, 12),
@@ -203,32 +288,32 @@ pub fn palette_for(theme: AppTheme) -> ThemePalette {
         },
         AppTheme::Dark => ThemePalette {
             theme,
-            ribbon_bg: Color32::from_rgb(32, 35, 42),
-            page_bg: Color32::from_rgb(24, 27, 33),
-            card_bg: Color32::from_rgb(36, 40, 48),
-            card_border: Color32::from_rgb(56, 62, 74),
+            ribbon_bg: Color32::from_rgb(31, 35, 43),
+            page_bg: Color32::from_rgb(22, 25, 31),
+            card_bg: Color32::from_rgb(33, 37, 46),
+            card_border: Color32::from_rgb(55, 62, 76),
             title_bg: Color32::from_rgb(22, 25, 31),
-            status_bg: Color32::from_rgb(26, 29, 36),
-            hover: Color32::from_rgb(48, 53, 64),
-            hover_on_page: Color32::from_rgb(44, 49, 60),
-            pressed: Color32::from_rgb(58, 64, 78),
-            accent: Color32::from_rgb(46, 178, 118),
-            accent_hover: Color32::from_rgb(60, 196, 134),
-            accent_tint: Color32::from_rgb(28, 62, 48),
-            text: Color32::from_rgb(232, 236, 242),
-            text_weak: Color32::from_rgb(164, 172, 186),
-            text_muted: Color32::from_rgb(120, 128, 142),
-            grid_bg: Color32::from_rgb(28, 31, 38),
-            grid_line: Color32::from_rgb(48, 53, 64),
-            header_bg: Color32::from_rgb(36, 40, 48),
-            header_sel: Color32::from_rgb(34, 74, 56),
-            header_text: Color32::from_rgb(196, 204, 216),
-            default_cell_text: Color32::from_rgb(236, 240, 246),
-            dialog_bg: Color32::from_rgb(34, 38, 46),
-            dialog_scrim: Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-            warn_bg: Color32::from_rgb(64, 48, 18),
+            status_bg: Color32::from_rgb(25, 28, 35),
+            hover: Color32::from_rgb(46, 52, 64),
+            hover_on_page: Color32::from_rgb(39, 44, 55),
+            pressed: Color32::from_rgb(56, 63, 78),
+            accent: Color32::from_rgb(48, 184, 122),
+            accent_hover: Color32::from_rgb(64, 202, 138),
+            accent_tint: Color32::from_rgb(26, 58, 45),
+            text: Color32::from_rgb(236, 240, 246),
+            text_weak: Color32::from_rgb(164, 174, 190),
+            text_muted: Color32::from_rgb(118, 128, 144),
+            grid_bg: Color32::from_rgb(26, 29, 36),
+            grid_line: Color32::from_rgb(46, 52, 63),
+            header_bg: Color32::from_rgb(34, 38, 47),
+            header_sel: Color32::from_rgb(32, 70, 54),
+            header_text: Color32::from_rgb(194, 203, 216),
+            default_cell_text: Color32::from_rgb(238, 242, 248),
+            dialog_bg: Color32::from_rgb(33, 37, 46),
+            dialog_scrim: Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+            warn_bg: Color32::from_rgb(62, 46, 18),
             warn_fg: Color32::from_rgb(252, 211, 77),
-            err_bg: Color32::from_rgb(72, 26, 28),
+            err_bg: Color32::from_rgb(68, 26, 29),
             err_fg: Color32::from_rgb(252, 165, 165),
             info_bg: Color32::from_rgb(24, 46, 76),
             info_fg: Color32::from_rgb(147, 197, 253),
@@ -322,7 +407,7 @@ pub fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.card_border);
         v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
         v.widgets.inactive.bg_fill = if theme == AppTheme::Light {
-            Color32::from_rgb(245, 247, 250)
+            p.surface_subtle()
         } else {
             p.card_bg
         };
@@ -348,4 +433,69 @@ pub fn apply_app_theme(ctx: &egui::Context, theme: AppTheme) {
     } else {
         egui::ThemePreference::Light
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rel_lum(c: Color32) -> f64 {
+        let ch = |v: u8| {
+            let s = v as f64 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (rel_lum(a), rel_lum(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn all_themes_meet_wcag_contrast_and_surface_separation() {
+        let ctx = egui::Context::default();
+        for theme in AppTheme::ALL {
+            apply_app_theme(&ctx, theme);
+            let p = palette_for(theme);
+            assert!(
+                contrast(p.text, p.card_bg) >= 7.0,
+                "{theme:?} text/card_bg contrast too low"
+            );
+            assert!(
+                contrast(p.text, p.dialog_bg) >= 7.0,
+                "{theme:?} text/dialog_bg contrast too low"
+            );
+            assert!(
+                contrast(p.text, p.surface_subtle()) >= 7.0,
+                "{theme:?} text/surface_subtle contrast too low"
+            );
+            assert!(
+                contrast(p.text_weak, p.card_bg) >= 4.5,
+                "{theme:?} text_weak/card_bg contrast too low"
+            );
+            assert!(
+                contrast(p.on_accent(), p.accent) >= 4.5,
+                "{theme:?} on_accent/accent contrast too low"
+            );
+            assert!(
+                contrast(p.on_err(), p.err_fg) >= 4.5,
+                "{theme:?} on_err/err_fg contrast too low"
+            );
+            assert!(
+                contrast(p.brand_ink(), p.card_bg) >= 4.5,
+                "{theme:?} brand_ink/card_bg contrast too low"
+            );
+            let st = ctx.style();
+            assert!(
+                contrast(st.visuals.selection.bg_fill, st.visuals.selection.stroke.color) >= 4.5,
+                "{theme:?} selection contrast too low"
+            );
+        }
+        apply_app_theme(&ctx, AppTheme::Light);
+    }
 }

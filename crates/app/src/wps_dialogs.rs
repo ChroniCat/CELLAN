@@ -407,7 +407,7 @@ impl SheetApp {
                             offset: [0, 4],
                             blur: 12,
                             spread: 0,
-                            color: Color32::from_black_alpha(26),
+                            color: pal.shadow_color(),
                         })
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {
@@ -503,7 +503,7 @@ impl SheetApp {
                             offset: [0, 4],
                             blur: 12,
                             spread: 0,
-                            color: Color32::from_black_alpha(26),
+                            color: pal.shadow_color(),
                         })
                         .inner_margin(egui::Margin::same(6))
                         .show(ui, |ui| {

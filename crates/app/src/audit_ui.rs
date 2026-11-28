@@ -1532,7 +1532,7 @@ impl SheetApp {
                 AuditSeverity::Warning => ("已保护 · 存在提醒事项", pal.warn_fg),
                 AuditSeverity::Tampered => ("⚠ 检测到疑似篡改 / 外部修改 / 回退", pal.err_fg),
             };
-            ui.label(RichText::new(badge).size(12.5).strong().color(col));
+            ui.label(RichText::new(badge).size(13.0).strong().color(col));
             if let Some(log) = self.wb.audit.log.as_ref() {
                 ui.label(
                     RichText::new(format!(
@@ -1544,7 +1544,7 @@ impl SheetApp {
                         ver.embedded_bytes as f64 / 1024.0,
                         log.max_embedded_bytes / 1024,
                     ))
-                    .size(11.5)
+                    .size(11.0)
                     .weak(),
                 );
             }
@@ -1562,13 +1562,13 @@ impl SheetApp {
         } else if self.audit_state.auto_enable_active(&self.wb) {
             ui.label(
                 RichText::new("已默认开启 · 首次保存 .xlsx 时自动生成防篡改签名链")
-                    .size(12.5)
+                    .size(13.0)
                     .strong()
                     .color(pal.accent),
             );
             ui.label(
                 RichText::new("新建工作簿与在 CELLAN 中编辑保存的 .xlsx 默认开启去中心化防篡改审计，随文件内嵌 ECDSA P-256 签名链与单元格溯源（纯只读查看旧文件不会修改原文件）。")
-                    .size(11.5)
+                    .size(11.0)
                     .weak(),
             );
             ui.add_space(4.0);
@@ -1579,7 +1579,7 @@ impl SheetApp {
         } else {
             ui.label(
                 RichText::new("当前文件格式（.xls）不支持内嵌防篡改签名链；如需开启请先另存为 .xlsx。")
-                    .size(11.5)
+                    .size(11.0)
                     .weak(),
             );
             ui.add_space(4.0);
@@ -1658,7 +1658,7 @@ impl SheetApp {
                                         log.max_embedded_bytes / 1024,
                                         ver.blame_count
                                     ))
-                                    .size(10.5)
+                                    .size(11.0)
                                     .color(pal.text_weak),
                                 );
                             }
@@ -1685,7 +1685,7 @@ impl SheetApp {
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new("✓ 防篡改保护已默认开启 · 保存 .xlsx 时将自动生成 ECDSA P-256 不可篡改签名链")
-                            .size(11.5)
+                            .size(12.0)
                             .color(pal.accent),
                     );
                 });
@@ -1698,7 +1698,7 @@ impl SheetApp {
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new("ℹ 当前格式（.xls）不支持内嵌防篡改签名链，仅展示会话修订；另存为 .xlsx 后将自动开启防篡改保护。")
-                            .size(11.5)
+                            .size(12.0)
                             .color(pal.warn_fg),
                     );
                 });
@@ -1807,7 +1807,7 @@ impl SheetApp {
             ui.add_space(3.0);
             ui.label(
                 RichText::new(&self.rev_msg)
-                    .size(11.5)
+                    .size(12.0)
                     .color(if ok { pal.accent } else { pal.err_fg }),
             );
         }
@@ -1815,7 +1815,7 @@ impl SheetApp {
             ui.add_space(3.0);
             ui.label(
                 RichText::new(msg)
-                    .size(11.5)
+                    .size(12.0)
                     .color(if ok { pal.accent } else { pal.err_fg }),
             );
         }
@@ -1825,21 +1825,21 @@ impl SheetApp {
         // 4. P2 风格 5 列表头
         ui.horizontal(|ui| {
             crate::dlg_col(ui, 98.0, |ui| {
-                ui.label(RichText::new("时间").size(10.5).weak());
+                ui.label(RichText::new("时间").size(11.0).weak());
             });
             crate::dlg_col(ui, 112.0, |ui| {
-                ui.label(RichText::new("用户").size(10.5).weak());
+                ui.label(RichText::new("用户").size(11.0).weak());
             });
             crate::dlg_col(ui, 108.0, |ui| {
-                ui.label(RichText::new("动作").size(10.5).weak());
+                ui.label(RichText::new("动作").size(11.0).weak());
             });
             crate::dlg_col(ui, 126.0, |ui| {
-                ui.label(RichText::new("位置").size(10.5).weak());
+                ui.label(RichText::new("位置").size(11.0).weak());
             });
             crate::dlg_col(ui, 250.0, |ui| {
-                ui.label(RichText::new("改动").size(10.5).weak());
+                ui.label(RichText::new("改动").size(11.0).weak());
             });
-            ui.label(RichText::new("状态").size(10.5).weak());
+            ui.label(RichText::new("状态").size(11.0).weak());
         });
         ui.separator();
 
@@ -1901,7 +1901,7 @@ impl SheetApp {
                                     au.fingerprint(),
                                 );
                             }
-                            let mut rt = RichText::new(name_text).strong().size(11.5);
+                            let mut rt = RichText::new(name_text).strong().size(12.0);
                             if let Some(c) = name_color {
                                 rt = rt.color(c);
                             }
@@ -1914,7 +1914,7 @@ impl SheetApp {
                             let rt = if row.pending {
                                 RichText::new(&row.action).size(11.0).color(pal.warn_fg)
                             } else {
-                                RichText::new(&row.action).size(11.5)
+                                RichText::new(&row.action).size(12.0)
                             };
                             let lbl = ui.add(egui::Label::new(rt).truncate());
                             if !row.hover_tip.is_empty() {
@@ -1956,7 +1956,7 @@ impl SheetApp {
                             } else {
                                 pal.accent
                             };
-                            let lbl = ui.label(RichText::new(btxt).size(10.5).color(col));
+                            let lbl = ui.label(RichText::new(btxt).size(11.0).color(col));
                             if !row.hover_tip.is_empty() {
                                 lbl.on_hover_text(&row.hover_tip);
                             }
@@ -1977,7 +1977,8 @@ impl SheetApp {
                             .collect::<Vec<_>>()
                             .join("、");
                         egui::Frame::NONE
-                            .fill(Color32::from_rgba_unmultiplied(120, 130, 145, 16))
+                            .fill(pal.surface_subtle())
+                            .stroke(egui::Stroke::new(1.0, pal.card_border))
                             .corner_radius(5.0)
                             .inner_margin(egui::Margin::symmetric(8, 6))
                             .show(ui, |ui| {
@@ -1990,7 +1991,7 @@ impl SheetApp {
                                         sheetcore::audit::format_local_ms(rollup.to_ts_ms),
                                     ))
                                     .strong()
-                                    .size(11.5),
+                                    .size(12.0),
                                 );
                                 ui.label(
                                     RichText::new(format!(
@@ -1998,7 +1999,7 @@ impl SheetApp {
                                         rollup.total_cell_changes,
                                         &rollup.commit_merkle_root[..rollup.commit_merkle_root.len().min(14)],
                                     ))
-                                    .size(10.5)
+                                    .size(11.0)
                                     .weak(),
                                 );
                                 if let Some((ref res, ref arch)) = self.audit_state.verified_cold_archive
@@ -2008,7 +2009,7 @@ impl SheetApp {
                                     ui.label(
                                         RichText::new(format!("✓ 已加载冷归档包：{}", res.summary))
                                             .size(11.0)
-                                            .color(Color32::from_rgb(16, 124, 65)),
+                                            .color(pal.accent),
                                     );
                                     for hc in arch.commits.iter().rev().take(30) {
                                         let who = arch
@@ -2025,7 +2026,7 @@ impl SheetApp {
                                                 hc.action,
                                                 hc.total_cell_changes
                                             ))
-                                            .size(10.5),
+                                            .size(11.0),
                                         );
                                     }
                                 }
@@ -2092,7 +2093,8 @@ impl SheetApp {
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0])
                 .show(ctx, |ui| {
-                    ui.label(RichText::new(format!("当前内容：{cur_summary}")).strong().size(12.5));
+                    let pal = crate::theme::palette();
+                    ui.label(RichText::new(format!("当前内容：{cur_summary}")).strong().size(13.0));
                     ui.add_space(6.0);
                     if let Some(log) = self.wb.audit.log.as_ref() {
                         let live_sheet = self.wb.sheets.iter().find(|s| s.name == sheet_name);
@@ -2114,7 +2116,6 @@ impl SheetApp {
                             _ => None,
                         };
                         if let Some(blame) = blame_opt {
-                            let pal = crate::theme::palette();
                             let badge = audit_store::trust_badge_for_author(&blame.author, my_pk.as_deref());
                             let (bt, bc) = match badge {
                                 AuthorTrustBadge::SelfDevice => ("本机签名", pal.accent),
@@ -2163,14 +2164,14 @@ impl SheetApp {
                         ui.label(RichText::new(format!("近期详细修改记录（{} 条）", history.len())).strong().size(12.0));
                         ui.separator();
                         if history.is_empty() {
-                            ui.label(RichText::new("当前详细窗口内无逐格变动明细（早期修改已归档折叠，但上方 Blame 仍保留最后修改人）。").size(11.5).weak());
+                            ui.label(RichText::new("当前详细窗口内无逐格变动明细（早期修改已归档折叠，但上方 Blame 仍保留最后修改人）。").size(11.0).weak());
                         } else {
                             egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                                 for h in &history {
                                     ui.horizontal(|ui| {
-                                        ui.label(RichText::new(format!("#{}", h.seq)).strong().color(ui_kit::ACCENT));
+                                        ui.label(RichText::new(format!("#{}", h.seq)).strong().color(pal.accent));
                                         ui.label(RichText::new(sheetcore::audit::format_local_ms(h.ts_ms)).size(11.0).weak());
-                                        ui.label(RichText::new(h.author.short_label()).strong().size(11.5));
+                                        ui.label(RichText::new(h.author.short_label()).strong().size(12.0));
                                         ui.label(format!("{} → {}", h.before.summary(), h.after.summary()));
                                     });
                                 }
